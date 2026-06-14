@@ -180,22 +180,22 @@ impl Client {
         }
 
         // Top up any issue whose relations overflowed the inline page cap, so
-        // the graph never silently drops edges for heavily-linked issues.
+        // the graph never silently drops edges for heavily-linked issues. Only
+        // page on a real `Some(cursor)`: `hasNextPage` with a null cursor carries
+        // nothing to page from, and `relations(after: null)` would restart from
+        // page 1 and re-fetch duplicates — the same guard the project/issue
+        // pagination uses.
         for ri in &mut raw {
-            if ri.relations.page_info.has_next_page {
-                let more = self.page_relations(
-                    &ri.identifier,
-                    false,
-                    ri.relations.page_info.end_cursor.clone(),
-                )?;
+            // Clone the trigger out first so the post-fetch `extend` doesn't
+            // overlap the borrow of `page_info`.
+            let rel_cursor = page_cursor(&ri.relations.page_info, &ri.identifier);
+            if let Some(cursor) = rel_cursor {
+                let more = self.page_relations(&ri.identifier, false, Some(cursor))?;
                 ri.relations.nodes.extend(more);
             }
-            if ri.inverse_relations.page_info.has_next_page {
-                let more = self.page_relations(
-                    &ri.identifier,
-                    true,
-                    ri.inverse_relations.page_info.end_cursor.clone(),
-                )?;
+            let inv_cursor = page_cursor(&ri.inverse_relations.page_info, &ri.identifier);
+            if let Some(cursor) = inv_cursor {
+                let more = self.page_relations(&ri.identifier, true, Some(cursor))?;
                 ri.inverse_relations.nodes.extend(more);
             }
         }
@@ -244,6 +244,26 @@ impl Client {
             }
         }
         Ok(out)
+    }
+}
+
+/// The cursor to top up a relation connection from, or `None` if there is
+/// nothing reliable to page. `hasNextPage` with a real `Some(cursor)` yields it;
+/// `hasNextPage` with a null cursor carries nothing to page from — paging with
+/// `after: null` would restart at page 1 and re-fetch duplicates — so it warns
+/// (overflow edges are never dropped silently) and returns `None`. The same
+/// `(true, Some)` guard the project/issue pagination uses.
+fn page_cursor(info: &PageInfo, identifier: &str) -> Option<String> {
+    match (info.has_next_page, &info.end_cursor) {
+        (true, Some(cursor)) => Some(cursor.clone()),
+        (true, None) => {
+            eprintln!(
+                "lindep: warning: could not page all relations for {identifier} \
+                 (no cursor); some dependency edges may be missing"
+            );
+            None
+        }
+        (false, _) => None,
     }
 }
 
@@ -547,5 +567,33 @@ mod tests {
         let projects = [proj("1", "Core PMS")];
         let err = resolve_in(&projects, "zzz").unwrap_err();
         assert!(err.contains("--list"));
+    }
+
+    fn page_info(has_next: bool, cursor: Option<&str>) -> PageInfo {
+        PageInfo {
+            has_next_page: has_next,
+            end_cursor: cursor.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn page_cursor_yields_a_real_cursor() {
+        let info = page_info(true, Some("cur-42"));
+        assert_eq!(page_cursor(&info, "ENG-1"), Some("cur-42".to_string()));
+    }
+
+    #[test]
+    fn page_cursor_stops_when_there_is_no_next_page() {
+        // The common case: relations fit inline. No top-up, regardless of cursor.
+        assert_eq!(page_cursor(&page_info(false, None), "ENG-1"), None);
+        assert_eq!(page_cursor(&page_info(false, Some("x")), "ENG-1"), None);
+    }
+
+    #[test]
+    fn page_cursor_does_not_restart_from_page_one_on_a_null_cursor() {
+        // The bug guarded here: `hasNextPage: true` with `endCursor: null` must
+        // NOT page (which would `after: null` → re-fetch page 1 and duplicate
+        // every relation). Returning None leaves the inline page as-is.
+        assert_eq!(page_cursor(&page_info(true, None), "ENG-1"), None);
     }
 }
