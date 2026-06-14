@@ -1,0 +1,16 @@
+[package]
+name = "lindep"
+version = "0.1.0"
+edition = "2024"
+description = "Interactive terminal view of a Linear project's issue dependency graph"
+# Edition 2024 plus `if … && let …` let-chains (stabilised in 1.88) set the floor.
+rust-version = "1.88"
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+dotenvy = "0.15.7"
+ratatui = "0.30.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+unicode-width = "0.2.2"
+ureq = { version = "3.3.0", features = ["json"] }
