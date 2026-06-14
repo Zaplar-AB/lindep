@@ -100,6 +100,58 @@ node in a tree to *re-root* the lens on it and walk the graph one hop at a time.
 - `⇗ … [ext]` a cross-project blocker, shown as a terminal leaf
 - `↺ … back-edge` where a tree would loop; `↗ shown above` where a node re-appears
 
+## Multi-agent cockpit
+
+Inside a git repo, lindep doubles as a **cockpit that launches and supervises
+real `claude` (Claude Code) agents** — one per issue, each in its own git
+worktree + branch. Linear stays the source of truth; lindep is the visibility +
+orchestration layer (it spawns the real `claude`, it does not reimplement it).
+
+| Key | Action |
+|-----|--------|
+| `a` | Launch a Claude agent on the focused issue (its own worktree + branch) |
+| `t` | Attach to that agent's live terminal — every key goes to the agent |
+| `F10` | Detach back to the dashboard (the agent keeps running) |
+| `x` | Stop the agent on the focused issue |
+| `n` | Jump to the next issue whose agent needs you |
+
+Each issue node is annotated with its agent's state: `◌` spawning · `▸` running ·
+`⚑` needs you · `◦` idle · `✓` done · `✗` failed; the header shows a fleet
+summary (`3 agents · 1 needs you`). Agents that raise a permission prompt or go
+idle light up live via Claude **hooks** posted to a loopback endpoint — no
+polling. Sessions are durable: lindep persists each agent's `session_id` and
+`--resume`s it on relaunch, so the *process* is disposable but the *conversation*
+is not. All cockpit state lives under `.lindep/` (gitignored); outside a git
+repo (or with `--demo`) lindep is just the graph viewer.
+
+### Rebinding keys
+
+Every key above (and the graph-navigation keys) is remappable in a `[keys]`
+table, read from `<repo>/.lindep/config.toml` then `~/.config/lindep/config.toml`
+(personal wins) — the same two-location pattern as `.env`. Useful when a
+function key is missing or your terminal grabs it:
+
+```toml
+[keys]
+detach = "f8"                      # default f10; the key that varies by keyboard
+# detach = "ctrl-a d"              # …or a tmux-style leader sequence (see below)
+launch-agent = "a"
+jump-needs-you = ["n", "ctrl-g"]   # an action may take several keys
+```
+
+Keys: single chars (`a`, `/`), `f1`–`f12`, the named keys (`enter` `tab` `space`
+`up` `down` `left` `right` `home` `end` `pageup` `pagedown` `backspace` `delete`
+`insert`), and `ctrl-<letter>` / `alt-<key>`. (`esc` is reserved.) Press `?` in
+the cockpit to see the *live* bindings; the attach pane always shows the current
+detach key. Bad entries warn on stderr at startup and fall back to the default.
+
+**Leader sequences for detach.** A value with a space — e.g. `detach = "ctrl-a d"`
+— is a tmux-style leader: press the leader (`Ctrl-A`), then the next key (`d`).
+This is the robust choice when no function key is available, since `Ctrl-<letter>`
+works on every keyboard and terminal. Pressing the leader twice while attached
+sends it through to the agent, so it's never wholly unreachable. Only `detach`
+can be a sequence — that's the one place a key must be reserved from the agent.
+
 ## Notes
 
 - **Cycles** are detected up front and rendered safely — a back-edge becomes a
@@ -114,8 +166,19 @@ node in a tree to *re-root* the lens on it and walk the graph one hop at a time.
 cargo test          # graph algorithms, navigation, headless render snapshots
 cargo clippy
 cargo run -- --demo --snapshot 118x32   # see a frame without a terminal
+cargo doc --open    # per-module / per-item API docs
 ```
+
+For how the cockpit fits together — the six layers, the concurrency model, the
+agent lifecycle, the `.lindep/` state layout and the operating guide — see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The tui-term feasibility verdict
+is in [`docs/ENG-392-pty-spike-verdict.md`](docs/ENG-392-pty-spike-verdict.md).
 
 Modules: `model` (graph + cycle/level algorithms, pure), `linear` (GraphQL
 client), `app` (state + input), `ui` (ratatui rendering), `theme` (palette),
-`demo` (synthetic graph).
+`demo` (synthetic graph). Cockpit spine: `event` (tokio runtime + `AppEvent`
+channel), `worktree` (one git worktree/branch per issue), `session` (durable
+issue↔session-id state), `backend` (the `AgentBackend` trait + PTY-hosted Claude
+backend), `notify` (Claude hooks → loopback endpoint → events), `supervisor`
+(launch / cancel / shutdown of the agent fleet), `keymap` (remappable bindings
+from `config.toml`).

@@ -9,6 +9,7 @@
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::model::{Priority, Status};
+use crate::session::AgentStatus;
 
 // ── Racing green — selection / active affordances only ──────────────────────
 pub const GREEN_100: Color = Color::Rgb(0xEA, 0xF1, 0xED);
@@ -57,6 +58,20 @@ pub fn status_glyph(status: Status) -> (&'static str, Color) {
         Status::Triage => ("◇", AMBER_400),
         Status::Canceled => ("⊘", MUTED),
         Status::Unknown => ("·", MUTED),
+    }
+}
+
+/// Glyph + colour for an agent's state on its issue node. Racing green marks a
+/// live agent (the house rule: green = the agent / active); amber pulls the eye
+/// to the one state that needs the human.
+pub fn agent_glyph(status: AgentStatus) -> (&'static str, Color) {
+    match status {
+        AgentStatus::Spawning => ("◌", GREEN_400),
+        AgentStatus::Running => ("▸", GREEN_500),
+        AgentStatus::NeedsYou => ("⚑", AMBER_400),
+        AgentStatus::Idle => ("◦", GREEN_400),
+        AgentStatus::Done => ("✓", STATUS_400),
+        AgentStatus::Failed => ("✗", AMBER_500),
     }
 }
 

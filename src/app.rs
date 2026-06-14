@@ -4,12 +4,18 @@
 //! lives in [`crate::ui`]; this module never touches the terminal.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::widgets::ListState;
 
+use crate::backend::{self, AgentBackend, Lifecycle};
+use crate::event::AppEvent;
+use crate::keymap::{Action, Keymap};
 use crate::model::{Direction, Graph, Issue};
+use crate::session::AgentStatus;
+use crate::supervisor::SupervisorHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
@@ -122,6 +128,28 @@ pub struct App {
     pub show_help: bool,
     pub status_msg: Option<String>,
 
+    /// Per-issue agent status, driven by the supervisor + notification bus.
+    /// Absence of an entry means "no agent" — the fleet view's resting state.
+    pub fleet: HashMap<String, AgentStatus>,
+    /// Backend handles for agents we launched, keyed by issue. Used to render
+    /// and drive an agent's PTY when attached.
+    pub backends: HashMap<String, Arc<dyn AgentBackend>>,
+    /// The issue whose PTY the cockpit is currently attached to (`None` = the
+    /// dashboard). While attached, all input is forwarded to that agent.
+    pub attached: Option<String>,
+    /// Size (rows, cols) the attached agent was last resized to, so we only
+    /// push a resize when the pane actually changes.
+    pub attached_size: Option<(u16, u16)>,
+    /// While attached with a leader-sequence detach key, the leader chord that's
+    /// been pressed and is awaiting its completion (e.g. `Ctrl-A`, waiting for
+    /// `d`). `None` the rest of the time.
+    pub pending_leader: Option<KeyEvent>,
+    /// Handle to the agent supervisor, when the cockpit is running with one
+    /// (absent in `--demo`, snapshots and unit tests).
+    pub supervisor: Option<SupervisorHandle>,
+    /// Active key bindings (defaults, overridden by `config.toml`).
+    pub keymap: Keymap,
+
     pub should_quit: bool,
 }
 
@@ -160,6 +188,13 @@ impl App {
             search_active: false,
             show_help: false,
             status_msg: None,
+            fleet: HashMap::new(),
+            backends: HashMap::new(),
+            attached: None,
+            attached_size: None,
+            pending_leader: None,
+            supervisor: None,
+            keymap: Keymap::default(),
             should_quit: false,
         };
         app.rebuild_order();
@@ -456,12 +491,45 @@ impl App {
         self.set_root(key, true);
     }
 
+    /// Jump to the next issue whose agent needs you, in display order, wrapping
+    /// from wherever the lens currently sits — the fleet-view analogue of the
+    /// cycle jump (`c`).
+    fn jump_to_needs_you(&mut self) {
+        let members: Vec<String> = self
+            .graph
+            .keys()
+            .iter()
+            .filter(|k| self.fleet.get(*k).is_some_and(AgentStatus::needs_you))
+            .cloned()
+            .collect();
+        if members.is_empty() {
+            self.status_msg = Some("no agents need you right now".into());
+            return;
+        }
+        let next = match members.iter().position(|k| *k == self.root) {
+            Some(i) => (i + 1) % members.len(),
+            None => 0,
+        };
+        let key = members[next].clone();
+        self.status_msg = Some(format!("needs you {}/{} — {key}", next + 1, members.len()));
+        self.set_root(key, true);
+    }
+
     // ── Key handling ─────────────────────────────────────────────────────────
 
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
         }
+
+        // While attached, the agent owns the keyboard — every key is forwarded
+        // to its PTY except the detach chord. Handled before anything else so
+        // the cockpit's own bindings (q, /, …) don't shadow the agent's input.
+        if self.attached.is_some() {
+            self.on_attached_key(key);
+            return;
+        }
+
         self.status_msg = None;
 
         if self.search_active {
@@ -469,51 +537,274 @@ impl App {
             return;
         }
 
-        match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc => self.on_escape(),
-            _ if self.show_help => self.show_help = false,
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Left | KeyCode::Char('h') => self.focus = Pane::List,
-            KeyCode::Right | KeyCode::Char('l') => {
+        // Any key dismisses the help overlay (except a Quit binding, which still
+        // quits). The overlay sits above the keymap so a typo can't trap you.
+        if self.show_help {
+            if self.keymap.action_for(key) == Some(Action::Quit) {
+                self.should_quit = true;
+            } else {
+                self.show_help = false;
+            }
+            return;
+        }
+
+        // Esc is a fixed, context-sensitive key (close overview / clear search /
+        // quit) — deliberately not remappable.
+        if key.code == KeyCode::Esc {
+            self.on_escape();
+            return;
+        }
+
+        if let Some(action) = self.keymap.action_for(key) {
+            self.dispatch(action);
+        }
+    }
+
+    /// Run a cockpit action (resolved from the keymap, or a direct call).
+    fn dispatch(&mut self, action: Action) {
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::MoveDown => self.move_selection(1),
+            Action::MoveUp => self.move_selection(-1),
+            Action::FocusList => self.focus = Pane::List,
+            Action::CyclePane => {
                 self.focus = match self.focus {
                     Pane::List | Pane::Downstream => Pane::Upstream,
                     Pane::Upstream => Pane::Downstream,
                 }
             }
-            KeyCode::Tab => {
+            Action::CycleFocus => {
                 self.focus = match self.focus {
                     Pane::List => Pane::Upstream,
                     Pane::Upstream => Pane::Downstream,
                     Pane::Downstream => Pane::List,
                 }
             }
-            KeyCode::Enter => self.enter(),
-            KeyCode::Char(' ') => self.toggle_collapse(),
-            KeyCode::Backspace | KeyCode::Char('b') => self.go_back(),
-            KeyCode::Char('c') => self.jump_to_cycle(),
-            KeyCode::Char('f') => {
+            Action::Enter => self.enter(),
+            Action::ToggleCollapse => self.toggle_collapse(),
+            Action::Back => self.go_back(),
+            Action::JumpCycle => self.jump_to_cycle(),
+            Action::JumpNeedsYou => self.jump_to_needs_you(),
+            Action::LaunchAgent => self.launch_agent(),
+            Action::CancelAgent => self.cancel_agent(),
+            Action::Attach => self.attach(),
+            // Only meaningful while attached (handled in on_attached_key).
+            Action::Detach => {}
+            Action::CycleFilter => {
                 self.filter = self.filter.next();
                 self.rebuild_order();
             }
-            KeyCode::Char('s') => {
+            Action::CycleSort => {
                 self.sort = self.sort.next();
                 self.rebuild_order();
             }
-            KeyCode::Char('g') => {
+            Action::ToggleGraph => {
                 self.mode = match self.mode {
                     Mode::Lens => Mode::Overview,
                     Mode::Overview => Mode::Lens,
                 }
             }
-            KeyCode::Char('/') => {
+            Action::StartSearch => {
                 self.search_active = true;
                 self.focus = Pane::List;
             }
-            KeyCode::Char('?') => self.show_help = !self.show_help,
-            _ => {}
+            Action::ToggleHelp => self.show_help = !self.show_help,
         }
+    }
+
+    /// Apply a background [`AppEvent`] to view state, returning whether the
+    /// screen must repaint as a result. The render loop is the single writer of
+    /// `App`, so every off-thread update funnels through here — keeping
+    /// rendering a pure function of state.
+    pub fn apply_event(&mut self, ev: AppEvent) -> bool {
+        match ev {
+            AppEvent::Notification(text) => {
+                self.status_msg = Some(text);
+                true
+            }
+            AppEvent::AgentSpawned { issue, backend } => {
+                self.fleet.insert(issue.clone(), AgentStatus::Spawning);
+                self.backends.insert(issue.clone(), backend);
+                self.status_msg = Some(format!("agent launched on {issue} — t to attach"));
+                true
+            }
+            // Repaint only when the output belongs to the agent we're attached
+            // to; off-screen agents' output changes nothing visible.
+            AppEvent::AgentOutput { issue } => self.attached.as_deref() == Some(issue.as_str()),
+            AppEvent::AgentExited { issue, code } => {
+                // The supervisor's agent task is authoritative for fleet status
+                // (via AgentStatusChanged) — a cancel reads as Idle, a self-exit
+                // as Done/Failed. Here we only surface a footer line and reclaim
+                // the render handle now the PTY is gone, unless the user is still
+                // attached and looking at its final screen.
+                self.status_msg = Some(match code {
+                    Some(0) | None => format!("agent on {issue} finished"),
+                    Some(c) => format!("agent on {issue} exited ({c})"),
+                });
+                if self.attached.as_deref() != Some(issue.as_str()) {
+                    self.backends.remove(&issue);
+                }
+                true
+            }
+            AppEvent::AgentNeedsYou { issue, reason } => {
+                self.fleet.insert(issue.clone(), AgentStatus::NeedsYou);
+                self.status_msg = Some(format!("⚑ {issue} needs you — {reason}"));
+                true
+            }
+            AppEvent::AgentStatusChanged { issue, status } => {
+                self.fleet.insert(issue, status);
+                true
+            }
+            AppEvent::AgentAction { issue, action } => {
+                self.fleet.insert(issue.clone(), AgentStatus::Running);
+                self.status_msg = Some(format!("{issue}: {action}"));
+                true
+            }
+        }
+    }
+
+    /// Launch an agent on the focused issue (the `a` key). Surfaces a reason in
+    /// the footer when it can't.
+    fn launch_agent(&mut self) {
+        let Some(issue) = self.focused_issue() else {
+            self.status_msg = Some("no issue selected".into());
+            return;
+        };
+        if issue.external {
+            let key = issue.key.clone();
+            self.status_msg = Some(format!("{key} is external — launch it in its own project"));
+            return;
+        }
+        let (key, title) = (issue.key.clone(), issue.title.clone());
+        // Clone the handle out so we can also touch `status_msg` without a
+        // borrow conflict; the clone is cheap (an mpsc sender).
+        match self.supervisor.clone() {
+            Some(supervisor) => {
+                supervisor.launch(key.clone(), title);
+                self.status_msg = Some(format!("launching agent on {key}…"));
+            }
+            None => self.status_msg = Some("agent control plane unavailable".into()),
+        }
+    }
+
+    /// Stop the agent on the focused issue (the `x` key), leaving others running.
+    fn cancel_agent(&mut self) {
+        let Some(issue) = self.focused_issue().map(|i| i.key.clone()) else {
+            return;
+        };
+        if !self.fleet.contains_key(&issue) {
+            self.status_msg = Some(format!("no agent running on {issue}"));
+            return;
+        }
+        match self.supervisor.clone() {
+            Some(supervisor) => {
+                supervisor.cancel(issue.clone());
+                self.status_msg = Some(format!("cancelling agent on {issue}…"));
+            }
+            None => self.status_msg = Some("agent control plane unavailable".into()),
+        }
+    }
+
+    /// `(agents, needs-you)` counts for the header summary.
+    pub fn fleet_summary(&self) -> (usize, usize) {
+        let needs_you = self.fleet.values().filter(|s| s.needs_you()).count();
+        (self.fleet.len(), needs_you)
+    }
+
+    /// The label of the currently-bound detach key (e.g. `F10`), so the attach
+    /// pane always shows the real key even after a rebind.
+    pub fn detach_key_label(&self) -> String {
+        self.keymap.label_for(Action::Detach)
+    }
+
+    /// Attach to the focused issue's agent, taking over its PTY (the `t` key).
+    fn attach(&mut self) {
+        let Some(issue) = self.focused_issue().map(|i| i.key.clone()) else {
+            return;
+        };
+        if !self.backends.contains_key(&issue) {
+            self.status_msg = Some(format!("no agent on {issue} to attach to"));
+            return;
+        }
+        self.attached = Some(issue.clone());
+        self.attached_size = None; // force a resize to the pane on first render
+        self.pending_leader = None;
+        let detach = self.keymap.label_for(Action::Detach);
+        self.status_msg = Some(format!("attached to {issue} · {detach} to detach"));
+    }
+
+    /// Detach back to the dashboard, leaving the agent running. If the agent
+    /// exited while we were attached, reclaim its render handle on the way out.
+    fn detach(&mut self) {
+        self.pending_leader = None;
+        if let Some(issue) = self.attached.take() {
+            self.attached_size = None;
+            let still_running = self
+                .backends
+                .get(&issue)
+                .is_some_and(|b| matches!(b.status(), Lifecycle::Running));
+            if still_running {
+                self.status_msg = Some(format!("detached from {issue} (still running)"));
+            } else {
+                self.backends.remove(&issue);
+                self.status_msg = Some(format!("detached from {issue}"));
+            }
+        }
+    }
+
+    /// Handle a key while attached: the detach key returns to the dashboard;
+    /// everything else is encoded and written to the agent's PTY.
+    fn on_attached_key(&mut self, key: KeyEvent) {
+        // The detach gesture returns to the dashboard; everything else is
+        // forwarded to the agent. Detach is F10 by default (a function key works
+        // on every layout and never collides with claude's line editing), but can
+        // be rebound — including to a tmux-style leader sequence like `Ctrl-A d`,
+        // which works even on keyboards/terminals without usable function keys.
+
+        // Mid-sequence: a leader was pressed and we're waiting for the rest.
+        if let Some(leader) = self.pending_leader.take() {
+            if self.keymap.detach_completes(leader, key) {
+                self.detach();
+            } else if self.keymap.same_chord(leader, key) {
+                // Leader pressed twice — send a single leader chord to the agent,
+                // so a chosen leader is never wholly unreachable.
+                self.forward_to_agent(key);
+            } else {
+                // Not a completion: the leader was a no-op; forward this key.
+                self.forward_to_agent(key);
+            }
+            return;
+        }
+
+        // A single-key detach (e.g. the default F10).
+        if self.keymap.action_for(key) == Some(Action::Detach) {
+            self.detach();
+            return;
+        }
+        // Arm a leader sequence; the next key completes or cancels it.
+        if self.keymap.is_detach_leader(key) {
+            self.pending_leader = Some(key);
+            return;
+        }
+        self.forward_to_agent(key);
+    }
+
+    /// Encode a key and write it to the attached agent's PTY.
+    fn forward_to_agent(&self, key: KeyEvent) {
+        let bytes = backend::key_to_bytes(key);
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(issue) = self.attached.clone()
+            && let Some(backend) = self.backends.get(&issue)
+        {
+            let _ = backend.send_input(&bytes);
+        }
+    }
+
+    /// Whether a detach leader has been pressed and we're awaiting completion.
+    pub fn detach_armed(&self) -> bool {
+        self.pending_leader.is_some()
     }
 
     fn on_escape(&mut self) {
@@ -784,6 +1075,164 @@ mod tests {
         }
         press(&mut app, KeyCode::Char('q'));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn jump_to_needs_you_visits_each_flagged_issue_then_reports_when_none() {
+        let mut app = app();
+        // No agents yet → the jump is a no-op that says so.
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.status_msg.as_deref().unwrap().contains("no agents"));
+
+        app.fleet.insert("ZAP-205".into(), AgentStatus::NeedsYou);
+        app.fleet.insert("ZAP-240".into(), AgentStatus::NeedsYou);
+        app.fleet.insert("ZAP-201".into(), AgentStatus::Running); // not "needs you"
+
+        press(&mut app, KeyCode::Char('n'));
+        let first = app.root.clone();
+        assert!(app.fleet.get(&first).is_some_and(AgentStatus::needs_you));
+        press(&mut app, KeyCode::Char('n'));
+        assert_ne!(
+            app.root, first,
+            "each press advances to a different flagged issue"
+        );
+        assert!(app.fleet.get(&app.root).is_some_and(AgentStatus::needs_you));
+        // Running agents are never visited.
+        assert_ne!(app.root, "ZAP-201");
+    }
+
+    #[test]
+    fn attach_forwards_keys_to_the_agent_then_detaches() {
+        let mut app = app();
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.backends
+            .insert("ZAP-204".into(), fake.clone() as Arc<dyn AgentBackend>);
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        app.root = "ZAP-204".into();
+
+        press(&mut app, KeyCode::Char('t')); // attach
+        assert_eq!(app.attached.as_deref(), Some("ZAP-204"));
+
+        // A normal key now drives the agent, not the cockpit (note 'q' would
+        // otherwise quit — proof the agent owns the keyboard).
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.should_quit, "q goes to the agent while attached");
+        assert_eq!(fake.inputs.lock().unwrap().last().unwrap(), b"q");
+
+        // F10 detaches, leaving the agent running.
+        press(&mut app, KeyCode::F(10));
+        assert!(app.attached.is_none());
+        // The detach key itself is not sent to the agent.
+        assert_eq!(fake.inputs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agent_exited_frees_the_backend_but_leaves_fleet_status_to_the_supervisor() {
+        let mut app = app();
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.backends
+            .insert("ZAP-204".into(), fake as Arc<dyn AgentBackend>);
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+
+        // A nonzero exit must NOT itself flip the node to Failed — the
+        // supervisor's AgentStatusChanged is the authority (so a cancel reads
+        // as Idle, not Failed). AgentExited only reclaims the dead PTY handle.
+        app.apply_event(AppEvent::AgentExited {
+            issue: "ZAP-204".into(),
+            code: Some(1),
+        });
+        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Running));
+        assert!(
+            !app.backends.contains_key("ZAP-204"),
+            "dead PTY handle reclaimed"
+        );
+
+        // The supervisor's status event is what actually moves the node.
+        app.apply_event(AppEvent::AgentStatusChanged {
+            issue: "ZAP-204".into(),
+            status: AgentStatus::Failed,
+        });
+        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Failed));
+    }
+
+    #[test]
+    fn agent_exited_keeps_the_backend_while_attached() {
+        let mut app = app();
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.backends
+            .insert("ZAP-204".into(), fake as Arc<dyn AgentBackend>);
+        app.attached = Some("ZAP-204".into());
+        app.apply_event(AppEvent::AgentExited {
+            issue: "ZAP-204".into(),
+            code: Some(0),
+        });
+        assert!(
+            app.backends.contains_key("ZAP-204"),
+            "kept so the attached user can read its final screen; freed on detach"
+        );
+    }
+
+    #[test]
+    fn leader_sequence_detach_arms_completes_and_passes_through() {
+        let mut app = app();
+        app.keymap
+            .apply(&[("detach".to_string(), vec!["ctrl-a d".to_string()])]);
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.backends
+            .insert("ZAP-204".into(), fake.clone() as Arc<dyn AgentBackend>);
+        app.root = "ZAP-204".into();
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+        // Attach, then press the leader: it arms without detaching or forwarding.
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.attached.as_deref(), Some("ZAP-204"));
+        app.on_key(ctrl_a);
+        assert!(app.detach_armed(), "leader arms the sequence");
+        assert!(app.attached.is_some());
+        assert!(
+            fake.inputs.lock().unwrap().is_empty(),
+            "leader isn't forwarded"
+        );
+
+        // Completion detaches.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.attached.is_none());
+        assert!(!app.detach_armed());
+
+        // Re-attach (the agent is still running, so its backend was kept).
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.attached.as_deref(), Some("ZAP-204"));
+
+        // Double-tapping the leader sends one Ctrl-A (0x01) through, not detach.
+        app.on_key(ctrl_a);
+        app.on_key(ctrl_a);
+        assert!(app.attached.is_some(), "double-tap doesn't detach");
+        assert_eq!(fake.inputs.lock().unwrap().last().unwrap(), &vec![0x01]);
+
+        // Arm, then a non-completion key cancels and is forwarded.
+        app.on_key(ctrl_a);
+        assert!(app.detach_armed());
+        press(&mut app, KeyCode::Char('z'));
+        assert!(!app.detach_armed());
+        assert!(app.attached.is_some());
+        assert_eq!(fake.inputs.lock().unwrap().last().unwrap(), b"z");
+    }
+
+    #[test]
+    fn attach_without_an_agent_is_a_no_op_with_a_reason() {
+        let mut app = app(); // no backends registered
+        press(&mut app, KeyCode::Char('t'));
+        assert!(app.attached.is_none());
+        assert!(app.status_msg.as_deref().unwrap().contains("no agent"));
+    }
+
+    #[test]
+    fn fleet_summary_counts_agents_and_attention() {
+        let mut app = app();
+        assert_eq!(app.fleet_summary(), (0, 0));
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        app.fleet.insert("ZAP-205".into(), AgentStatus::NeedsYou);
+        assert_eq!(app.fleet_summary(), (2, 1));
     }
 
     #[test]

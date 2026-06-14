@@ -6,11 +6,19 @@
 
 mod app;
 mod demo;
+mod event;
+mod keymap;
 mod linear;
 mod model;
 mod picker;
 mod theme;
 mod ui;
+// Multi-agent spine.
+mod backend;
+mod notify;
+mod session;
+mod supervisor;
+mod worktree;
 
 use std::io;
 use std::path::Path;
@@ -21,9 +29,11 @@ use clap::Parser;
 use ratatui::DefaultTerminal;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event as term_event;
+use ratatui::crossterm::event::Event;
 
 use app::App;
+use event::AppEventRx;
 use linear::{Client, ProjectRef};
 
 #[derive(Parser)]
@@ -53,6 +63,12 @@ struct Cli {
     /// size, e.g. --snapshot 120x40.
     #[arg(long, num_args = 0..=1, default_missing_value = "120x40", value_name = "WxH")]
     snapshot: Option<String>,
+
+    /// Internal: read a Claude hook's JSON from stdin and POST it to the
+    /// cockpit's endpoint on the given loopback port, then exit. This is how
+    /// `lindep` wires itself as its own hook forwarder; not for direct use.
+    #[arg(long, hide = true, value_name = "PORT")]
+    hook_forward: Option<u16>,
 }
 
 fn main() -> ExitCode {
@@ -68,6 +84,12 @@ fn main() -> ExitCode {
 fn real_main() -> Result<(), String> {
     load_env();
     let cli = Cli::parse();
+
+    // Hook-forwarder fast path: no TUI, no Linear — just relay stdin to the
+    // cockpit's loopback endpoint and exit. `claude` invokes this for us.
+    if let Some(port) = cli.hook_forward {
+        return notify::forward(port).map_err(|e| e.to_string());
+    }
 
     // --list is a quick, key-only path.
     if cli.list {
@@ -194,10 +216,110 @@ fn render_snapshot(app: &mut App, w: u16, h: u16) -> Result<String, String> {
 }
 
 fn run_tui(mut app: App) -> io::Result<()> {
+    // Load the keymap from config (repo `.lindep/config.toml`, then personal
+    // `~/.config/lindep/config.toml`), surfacing any problems on stderr before
+    // we enter the alternate screen. Bad config never aborts — defaults stand in.
+    let (km, warnings) = keymap::load(std::env::current_dir().ok().as_deref());
+    for w in &warnings {
+        eprintln!("lindep: config: {w}");
+    }
+    app.keymap = km;
+
+    // The runtime carries every background subsystem (supervisor, hook endpoint,
+    // PTY pumps); the render loop stays synchronous and on this thread.
+    let runtime = event::runtime()?;
+    let (tx, rx) = event::channel();
+
+    // Stand up the agent control plane. It's best-effort: lindep also runs as a
+    // plain graph viewer (--demo, a non-git directory), so if this can't start
+    // the cockpit still works — just without launching agents.
+    let control_plane = start_control_plane(&runtime, tx.clone());
+    if let Some((handle, _)) = &control_plane {
+        app.supervisor = Some(handle.clone());
+    }
+
+    // Greet the user via the event path so the footer shows the cockpit is live.
+    {
+        let banner = format!(
+            "cockpit live · {} · {} issues — a: launch agent · ? help",
+            app.graph.project,
+            app.graph.len()
+        );
+        let tx = tx.clone();
+        runtime.spawn(async move {
+            let _ = tx.send(event::AppEvent::Notification(banner));
+        });
+    }
+
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut app);
+    let result = event_loop(&mut terminal, &mut app, rx);
+
+    // Stop every agent before restoring the terminal, so no PTY process group
+    // outlives the cockpit.
+    if let Some((handle, join)) = control_plane {
+        handle.shutdown();
+        let _ = runtime.block_on(join);
+    }
     ratatui::restore();
     result
+}
+
+/// Build and start the agent control plane: worktree manager, session store
+/// (reconciled against live worktrees), hook endpoint, and the supervisor.
+/// Returns `None` (degrading to a read-only viewer) outside a git repo or if the
+/// loopback endpoint can't bind.
+fn start_control_plane(
+    runtime: &tokio::runtime::Runtime,
+    events: event::AppEventTx,
+) -> Option<(supervisor::SupervisorHandle, tokio::task::JoinHandle<()>)> {
+    use std::sync::{Arc, Mutex};
+
+    let repo_root = std::env::current_dir().ok()?;
+    let worktree = worktree::WorktreeManager::new(&repo_root).ok()?;
+    let store = Arc::new(Mutex::new(
+        session::SessionStore::load(session::SessionStore::state_path(&repo_root)).ok()?,
+    ));
+
+    // On startup, drop session records whose worktree vanished while we were off.
+    {
+        let live: Vec<String> = worktree
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|w| w.issue)
+            .collect();
+        if let Ok(mut store) = store.lock() {
+            store.reconcile(live);
+            let _ = store.save();
+        }
+    }
+
+    // The hook endpoint must bind before agents launch so their settings can
+    // point at it. block_on is safe here — we're on the synchronous main thread.
+    let hook_port = runtime
+        .block_on(notify::serve(events.clone(), Arc::clone(&store)))
+        .ok()?;
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("lindep").to_path_buf());
+    let (cols, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+
+    let config = supervisor::SupervisorConfig {
+        worktree,
+        store,
+        events,
+        spawn: backend::pty_spawn(),
+        exe,
+        hook_port,
+        hooks_dir: repo_root.join(".lindep").join("hooks"),
+        base: "HEAD".to_string(),
+        rows,
+        cols,
+        max_concurrent: 6,
+        // Interactive agents use the normal permission flow; budget/turn caps
+        // are a headless (phase-3) concern and only apply with `--print`.
+        guardrails: vec!["--permission-mode".to_string(), "default".to_string()],
+    };
+    Some(supervisor::Supervisor::start(config, runtime.handle()))
 }
 
 fn install_panic_hook() {
@@ -208,22 +330,53 @@ fn install_panic_hook() {
     }));
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
-    // The view is a pure function of state, and state only changes on a key or a
-    // resize — so repaint only after one of those, never on the idle poll timeout.
-    // (Without this the frame re-rendered ~5×/s forever, recomputing graph metrics
-    // and keeping a core warm while the user did nothing.)
+fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx) -> io::Result<()> {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    // The view is a pure function of state. State changes from two sources now:
+    // terminal input (key/resize) and background `AppEvent`s drained from the
+    // channel. We repaint only when one of those actually changed something —
+    // so a fully idle cockpit, with no input and no agents talking, still never
+    // busy-repaints (the property the original key-only loop guaranteed).
     terminal.draw(|frame| ui::draw(app, frame))?;
     while !app.should_quit {
-        if !event::poll(Duration::from_millis(250))? {
-            continue;
+        let mut dirty = false;
+
+        // Bound input latency with a poll timeout; this also paces how often we
+        // check the event channel. The poll itself is cheap and never repaints.
+        // While attached we poll fast so keystrokes and PTY output feel live;
+        // otherwise we idle at 250 ms to keep a quiet cockpit truly quiet.
+        let timeout = if app.attached.is_some() {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(250)
+        };
+        if term_event::poll(timeout)? {
+            match term_event::read()? {
+                Event::Key(key) => {
+                    app.on_key(key);
+                    dirty = true;
+                }
+                Event::Resize(_, _) => dirty = true,
+                _ => {} // mouse / focus / paste change nothing on screen
+            }
         }
-        match event::read()? {
-            Event::Key(key) => app.on_key(key),
-            Event::Resize(_, _) => {}
-            _ => continue, // mouse / focus / paste change nothing on screen
+
+        // Drain every queued background event in one batch; repaint once if any
+        // of them mutated visible state.
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => dirty |= app.apply_event(ev),
+                Err(TryRecvError::Empty) => break,
+                // All senders gone: no more background events will arrive, but
+                // the user may still be driving the UI, so keep looping.
+                Err(TryRecvError::Disconnected) => break,
+            }
         }
-        terminal.draw(|frame| ui::draw(app, frame))?;
+
+        if dirty {
+            terminal.draw(|frame| ui::draw(app, frame))?;
+        }
     }
     Ok(())
 }
@@ -252,6 +405,85 @@ mod tests {
         assert!(out.contains("GRAPH OVERVIEW"));
         assert!(out.contains("L0"));
         assert!(out.contains("INFRA-77"), "external blocker missing");
+    }
+
+    #[test]
+    fn fleet_overlay_marks_agents_in_header_and_list() {
+        let mut app = App::new(demo::graph());
+        app.fleet
+            .insert("ZAP-204".into(), crate::session::AgentStatus::NeedsYou);
+        app.fleet
+            .insert("ZAP-201".into(), crate::session::AgentStatus::Running);
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(out.contains("2 agents"), "header counts agents:\n{out}");
+        assert!(out.contains("needs you"), "header flags attention");
+        assert!(
+            out.contains('⚑'),
+            "needs-you flag is visible in the overlay"
+        );
+    }
+
+    #[test]
+    fn attached_view_renders_the_agent_pane_without_panic() {
+        let mut app = App::new(demo::graph());
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.backends.insert(
+            "ZAP-204".into(),
+            fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
+        );
+        app.attached = Some("ZAP-204".into());
+        let out = render_snapshot(&mut app, 100, 30).expect("render");
+        assert!(out.contains("ATTACHED"), "attach header shown:\n{out}");
+        assert!(out.contains("detach"), "detach hint shown");
+    }
+
+    #[test]
+    fn help_overlay_shows_live_bindings_and_the_config_hint() {
+        let mut app = App::new(demo::graph());
+        app.show_help = true;
+        let out = render_snapshot(&mut app, 90, 30).expect("render");
+        assert!(
+            out.contains("F10"),
+            "help shows the (default) detach key:\n{out}"
+        );
+        assert!(
+            out.contains("config.toml"),
+            "help points at the config file"
+        );
+    }
+
+    #[test]
+    fn attach_pane_reflects_a_rebound_detach_key() {
+        let mut app = App::new(demo::graph());
+        // Rebind detach F10 → F8, as a config file would.
+        app.keymap
+            .apply(&[("detach".to_string(), vec!["f8".to_string()])]);
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.backends.insert(
+            "ZAP-204".into(),
+            fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
+        );
+        app.attached = Some("ZAP-204".into());
+        let out = render_snapshot(&mut app, 100, 30).expect("render");
+        assert!(
+            out.contains("F8 to detach"),
+            "attach pane shows the rebound key:\n{out}"
+        );
+        assert!(!out.contains("F10"), "the old default key is gone");
+    }
+
+    #[test]
+    fn attached_view_survives_adversarial_sizes() {
+        for (w, h) in [(0u16, 0u16), (1, 1), (3, 2), (5, 3), (44, 4), (100, 30)] {
+            let mut app = App::new(demo::graph());
+            let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+            app.backends.insert(
+                "ZAP-204".into(),
+                fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
+            );
+            app.attached = Some("ZAP-204".into());
+            render_snapshot(&mut app, w, h).expect("attach pane must not panic");
+        }
     }
 
     #[test]

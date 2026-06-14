@@ -8,16 +8,25 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, HighlightSpacing, List, ListItem, Paragraph};
+use tui_term::widget::PseudoTerminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Mode, NodeKind, Pane, TreeRow};
+use crate::backend::Lifecycle;
 use crate::model::{Direction, Graph, Status};
+use crate::session::AgentStatus;
 use crate::theme::{self, *};
 
 const LIST_WIDTH: u16 = 44;
 const MAX_TITLE: usize = 64;
 
 pub fn draw(app: &mut App, frame: &mut Frame) {
+    // Attached to an agent: its PTY takes over the whole screen.
+    if app.attached.is_some() {
+        render_attached(app, frame);
+        return;
+    }
+
     let [header, body, detail, hints] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -35,8 +44,101 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     render_hints(app, frame, hints);
 
     if app.show_help {
-        render_help(frame);
+        render_help(app, frame);
     }
+}
+
+// ── Attach pane (live agent PTY) ─────────────────────────────────────────────
+
+/// Full-screen takeover rendering one agent's live terminal via tui-term, with
+/// a racing-green frame and a detach hint so "attached" is unmistakable.
+fn render_attached(app: &mut App, frame: &mut Frame) {
+    let [header, body, hints] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+
+    let Some(issue) = app.attached.clone() else {
+        return;
+    };
+    // Clone the Arc out so we can both read its parser and mutate `app` (the
+    // resize bookkeeping) without overlapping borrows.
+    let Some(backend) = app.backends.get(&issue).cloned() else {
+        // The agent vanished from under us — drop back to the dashboard.
+        app.attached = None;
+        return;
+    };
+
+    // A dead agent is shown as a frozen, amber EXITED pane rather than a live
+    // racing-green one, so "this agent is gone" is unmistakable.
+    let key = app
+        .graph
+        .get(&issue)
+        .map_or(issue.clone(), |i| i.key.clone());
+    let detach = app.detach_key_label();
+    let exited = matches!(backend.status(), Lifecycle::Exited(_));
+    let (title, header_style, border) = if let Lifecycle::Exited(code) = backend.status() {
+        let code = code.map_or_else(|| "signal".to_string(), |c| c.to_string());
+        (
+            format!(" ○ EXITED ({code})  {key}  · {detach} to leave "),
+            Style::new().fg(INK).bg(AMBER_500).bold(),
+            AMBER_400,
+        )
+    } else {
+        let label = match app.graph.get(&issue) {
+            Some(i) => format!(" ● ATTACHED  {}  {} ", i.key, truncate(&i.title, MAX_TITLE)),
+            None => format!(" ● ATTACHED  {issue} "),
+        };
+        (
+            label,
+            Style::new().fg(GREEN_100).bg(GREEN_700).bold(),
+            GREEN_500,
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(title, header_style))),
+        header,
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(border))
+        .title(Line::from(Span::styled(
+            " agent ",
+            Style::new().fg(border).bold(),
+        )));
+    let inner = block.inner(body);
+    frame.render_widget(block, body);
+
+    // Keep a live agent's terminal sized to its pane (parser + PTY master both),
+    // but only when it actually changed — this covers attach and live resize. A
+    // dead agent keeps its final screen, so we don't resize it.
+    let size = (inner.height, inner.width);
+    if !exited && inner.area() > 0 && app.attached_size != Some(size) {
+        let _ = backend.resize(inner.height, inner.width);
+        app.attached_size = Some(size);
+    }
+
+    if inner.area() > 0
+        && let Ok(parser) = backend.parser().read()
+    {
+        frame.render_widget(PseudoTerminal::new(parser.screen()), inner);
+    }
+
+    let hint = if exited {
+        format!(" agent has exited · {detach} to return to the dashboard")
+    } else if app.detach_armed() {
+        format!(" detach: finish the chord ({detach}) · repeat the leader to send it through")
+    } else {
+        format!(" keys go to the agent · {detach} to detach · resize reflows")
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, Style::new().fg(MUTED))))
+            .style(Style::new().bg(WELL)),
+        hints,
+    );
 }
 
 // ── Header ──────────────────────────────────────────────────────────────────
@@ -58,6 +160,20 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
             format!("{} cycles ↺", g.cycle_count()),
             Style::new().fg(AMBER_400),
         ));
+    }
+    let (agents, needs_you) = app.fleet_summary();
+    if agents > 0 {
+        spans.push(Span::styled(" · ", Style::new().fg(BORDER)));
+        spans.push(Span::styled(
+            format!("{agents} agent{}", if agents == 1 { "" } else { "s" }),
+            Style::new().fg(GREEN_400),
+        ));
+        if needs_you > 0 {
+            spans.push(Span::styled(
+                format!(" · {needs_you} needs you ⚑"),
+                Style::new().fg(AMBER_400).bold(),
+            ));
+        }
     }
 
     let right = if app.search_active || !app.search_query.is_empty() {
@@ -116,7 +232,7 @@ fn render_issue_list(app: &mut App, frame: &mut Frame, area: Rect) {
     let items: Vec<ListItem> = app
         .order
         .iter()
-        .map(|k| ListItem::new(issue_line(&app.graph, k)))
+        .map(|k| ListItem::new(issue_line(&app.graph, k, app.fleet.get(k).copied())))
         .collect();
 
     let list = List::new(items)
@@ -269,7 +385,15 @@ fn render_overview(app: &App, frame: &mut Frame, area: Rect) {
                     Style::new().fg(INK)
                 };
                 spans.push(Span::styled(format!("{glyph} "), Style::new().fg(color)));
-                spans.push(Span::styled(format!("{key}  "), key_style));
+                spans.push(Span::styled(key.to_string(), key_style));
+                if let Some(status) = app.fleet.get(key) {
+                    let (mark, mark_color) = theme::agent_glyph(*status);
+                    spans.push(Span::styled(
+                        format!(" {mark}"),
+                        Style::new().fg(mark_color).bold(),
+                    ));
+                }
+                spans.push(Span::raw("  "));
             }
             if row == 0 {
                 spans.push(Span::styled(
@@ -389,9 +513,9 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
     let text = if app.search_active {
         " type to filter · ⏎ accept · esc clear"
     } else if app.mode == Mode::Overview {
-        " ↑↓ move · g lens · c cycles · f filter · s sort · / find · ? help · q quit"
+        " ↑↓ move · a agent · t attach · x stop · n needs-you · g lens · c cycles · f filter · s sort · / find · ? help · q quit"
     } else {
-        " ↑↓ move · ←→/tab pane · ⏎ focus · b back · space collapse · / find · f filter · s sort · c cycles · g graph · ? help · q quit"
+        " ↑↓ move · ←→/tab pane · ⏎ focus · a agent · t attach · x stop · n needs-you · b back · space collapse · / find · f filter · s sort · c cycles · g graph · ? help · q quit"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(text, Style::new().fg(MUTED))))
@@ -400,36 +524,63 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
     );
 }
 
-fn render_help(frame: &mut Frame) {
-    let area = centered_rect(64, 19, frame.area());
+fn render_help(app: &App, frame: &mut Frame) {
+    use crate::keymap::Action::*;
+    let area = centered_rect(70, 26, frame.area());
     frame.render_widget(Clear, area);
-    let rows = [
-        ("↑ ↓ / k j", "move within the active pane"),
-        ("← → / h l", "switch pane (list ↔ upstream ↔ downstream)"),
-        ("tab", "cycle focus through the three panes"),
+
+    let k = |action| app.keymap.label_for(action);
+    // Key column built live from the active keymap, so a rebind shows correctly.
+    let rows: [(String, &str); 16] = [
         (
-            "enter",
-            "focus the list → trees; on a node, re-root the lens",
+            format!("{} {}", k(MoveUp), k(MoveDown)),
+            "move within the active pane",
         ),
-        ("b / backspace", "back to the previously focused issue"),
-        ("space", "collapse / expand the selected subtree"),
-        ("/", "fuzzy-find issues by id or title"),
-        ("f", "cycle filter: all / blocked / has-deps"),
-        ("s", "cycle sort: ready / blocked / status / priority / id"),
-        ("c", "jump through issues that sit on a cycle"),
-        ("g", "toggle the layered graph overview"),
-        ("q / esc", "quit (esc first closes overlays)"),
+        (
+            format!("{} {}", k(FocusList), k(CyclePane)),
+            "switch pane (list ↔ up ↔ down)",
+        ),
+        (k(CycleFocus), "cycle focus through the three panes"),
+        (k(Enter), "focus list → trees; on a node, re-root the lens"),
+        (k(LaunchAgent), "launch a Claude agent on the focused issue"),
+        (
+            format!("{} / {}", k(Attach), k(Detach)),
+            "attach to the agent / detach (while attached)",
+        ),
+        (k(CancelAgent), "stop the agent on the focused issue"),
+        (k(JumpNeedsYou), "jump to the next agent that needs you"),
+        (k(Back), "back to the previously focused issue"),
+        (k(ToggleCollapse), "collapse / expand the selected subtree"),
+        (k(StartSearch), "fuzzy-find issues by id or title"),
+        (k(CycleFilter), "cycle filter: all / blocked / has-deps"),
+        (
+            k(CycleSort),
+            "cycle sort: ready / blocked / status / priority / id",
+        ),
+        (k(JumpCycle), "jump through issues that sit on a cycle"),
+        (k(ToggleGraph), "toggle the layered graph overview"),
+        (
+            format!("{} / Esc", k(Quit)),
+            "quit (esc first closes overlays)",
+        ),
     ];
+
     let mut lines = vec![
         Line::from(Span::styled(" Keys", Style::new().fg(GREEN_100).bold())),
         Line::raw(""),
     ];
-    for (k, d) in rows {
+    for (key, desc) in &rows {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {k:<14}"), Style::new().fg(GREEN_400).bold()),
-            Span::styled(d, Style::new().fg(INK)),
+            Span::styled(format!("  {key:<16}"), Style::new().fg(GREEN_400).bold()),
+            Span::styled(*desc, Style::new().fg(INK)),
         ]));
     }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  rebind any of these in ~/.config/lindep/config.toml  [keys]",
+        Style::new().fg(MUTED),
+    )));
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(GREEN_600))
@@ -443,8 +594,8 @@ fn render_help(frame: &mut Frame) {
 // ── Line builders ─────────────────────────────────────────────────────────
 
 /// One issue row for the left list: status · priority · KEY · title (· blocked
-/// · cycle markers).
-fn issue_line<'a>(graph: &Graph, key: &str) -> Line<'a> {
+/// · cycle · agent markers).
+fn issue_line<'a>(graph: &Graph, key: &str, agent: Option<AgentStatus>) -> Line<'a> {
     let Some(issue) = graph.get(key) else {
         return Line::from(key.to_string());
     };
@@ -461,6 +612,13 @@ fn issue_line<'a>(graph: &Graph, key: &str) -> Line<'a> {
     }
     if graph.in_cycle(key) {
         spans.push(Span::styled(" ↺", Style::new().fg(AMBER_400)));
+    }
+    if let Some(status) = agent {
+        let (mark, color) = theme::agent_glyph(status);
+        spans.push(Span::styled(
+            format!(" {mark}"),
+            Style::new().fg(color).bold(),
+        ));
     }
     Line::from(spans)
 }
