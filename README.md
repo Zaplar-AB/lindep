@@ -50,34 +50,45 @@ a `Bearer` OAuth token).
 
 ## How it reads
 
-The left pane lists every issue in the project, sorted **ready-first** by default
-— unblocked, ready-to-start work on top (press <kbd>s</kbd> to re-sort). The right
-pane is a **lens** on the selected issue:
+The **spine** — the permanent left column — lists every issue in the project,
+sorted **ready-first** by default — unblocked, ready-to-start work on top (press
+<kbd>s</kbd> to re-sort). Press <kbd>d</kbd> to open a **dependency window**: a
+**lens** on the selected issue:
 
 - **Upstream** — its blockers, transitively. What must finish first.
 - **Downstream** — what it blocks, transitively. What it's holding up.
 
-Press <kbd>g</kbd> for the **overview**: a top-down map of *every* issue laid out
-in dependency layers (roots with no blockers at L0, flowing down to leaves), with
-cycles and external blockers called out. The view scrolls to keep your selection
-in sight.
+Press <kbd>g</kbd> for the **overview** (the Fleet window): a top-down map of
+*every* issue laid out in dependency layers (roots with no blockers at L0, flowing
+down to leaves), with cycles and external blockers called out. The view scrolls to
+keep your selection in sight.
 
-Move the selection and the lens re-aims instantly. Press <kbd>Enter</kbd> on any
-node in a tree to *re-root* the lens on it and walk the graph one hop at a time.
+Move the selection on the spine and an open dependency window re-aims instantly.
+Focus a dependency window (<kbd>Ctrl-A</kbd> <kbd>→</kbd>) and press
+<kbd>Enter</kbd> on any node to *re-root* the lens on it and walk the graph one hop
+at a time; <kbd>Tab</kbd> flips between its upstream and downstream trees.
+
+When the **spine** is focused:
 
 | key | action |
 |-----|--------|
-| <kbd>↑</kbd>/<kbd>↓</kbd> · <kbd>k</kbd>/<kbd>j</kbd> | move within the active pane |
-| <kbd>←</kbd>/<kbd>→</kbd> · <kbd>h</kbd>/<kbd>l</kbd> · <kbd>Tab</kbd> | switch pane (list ↔ upstream ↔ downstream) |
-| <kbd>Enter</kbd> | focus the list → trees; on a tree node, re-root the lens |
-| <kbd>b</kbd> / <kbd>Backspace</kbd> | back to the previously focused issue |
-| <kbd>Space</kbd> | collapse / expand the selected subtree |
+| <kbd>↑</kbd>/<kbd>↓</kbd> · <kbd>k</kbd>/<kbd>j</kbd> | move the selection |
+| <kbd>Enter</kbd> | open / focus an agent on the selection |
+| <kbd>d</kbd> | open a dependency window for the selection |
+| <kbd>g</kbd> | open the layered top-down overview (Fleet) window |
 | <kbd>/</kbd> | fuzzy-find issues by id or title |
 | <kbd>f</kbd> | filter: all / blocked / has-deps |
 | <kbd>s</kbd> | sort: ready / blocked / status / priority / id |
 | <kbd>c</kbd> | jump through issues that sit on a cycle |
-| <kbd>g</kbd> | toggle the layered top-down overview (every issue, roots → leaves) |
-| <kbd>?</kbd> | help · <kbd>q</kbd>/<kbd>Esc</kbd> quit |
+| <kbd>r</kbd> | flip the spine: issue list ↔ agents roster |
+| <kbd>?</kbd> | help (quit is <kbd>Ctrl-A</kbd> <kbd>q</kbd> — see the cockpit, below) |
+
+When a **dependency window** is focused: <kbd>↑</kbd>/<kbd>↓</kbd> move,
+<kbd>←</kbd>/<kbd>→</kbd> · <kbd>Tab</kbd> switch the active tree (upstream ↔
+downstream), <kbd>Enter</kbd> re-root onto the selected node, <kbd>Space</kbd>
+collapse / expand, <kbd>b</kbd>/<kbd>Backspace</kbd> back to the previous root.
+Window management (focus, zoom, pin, close, layout) lives behind the
+<kbd>Ctrl-A</kbd> prefix — see the cockpit section.
 
 ### What the marks mean
 
@@ -94,29 +105,41 @@ real `claude` (Claude Code) agents** — one per issue, each in its own git
 worktree + branch. Linear stays the source of truth; lindep is the visibility +
 orchestration layer (it spawns the real `claude`, it does not reimplement it).
 
+The cockpit is a **tiling window manager**: a horizontal strip of focusable
+columns — the permanent **spine** (issue list / agents roster), live **agent**
+PTYs (one per issue), and **dependency** windows. The focused window takes every
+keystroke; **`Ctrl-A` is the prefix** that escapes to window commands (press it
+twice to send a literal `Ctrl-A` through to the agent).
+
 | Key | Action |
 |-----|--------|
-| `a` | Launch a Claude agent on the focused issue (its own worktree + branch) |
-| `t` | Attach to that agent's live terminal — every key goes to the agent |
-| `F10` | Detach back to the dashboard (the agent keeps running) |
-| `x` | Stop the agent on the focused issue |
-| `n` | Jump to the next issue whose agent needs you |
-| `v` | Right pane: dependency trees ↔ the live **chat wall** |
-| `r` | Left pane: the issue list ↔ the **agents roster** |
-| `p` | Pin / unpin a chat so it stays on the wall while you browse |
-| `i` | **Write to** the selected agent — message it without a full attach |
-| <code>&#124;</code> | Cycle the chat wall's split: stacked rows → side-by-side columns → grid |
-| `]` / `[` | Step the lens to the next / previous agent's chat |
+| <kbd>Enter</kbd> | On the spine: launch / open an agent on the focused issue (its own worktree + branch) |
+| <kbd>Ctrl-A</kbd> <kbd>←</kbd>/<kbd>→</kbd> · <kbd>h</kbd>/<kbd>l</kbd> | Focus the window left / right |
+| <kbd>Ctrl-A</kbd> <kbd>Enter</kbd> | Open / focus an agent on the selection (from any window) |
+| <kbd>Ctrl-A</kbd> <kbd>z</kbd> | Zoom the focused window full-screen (non-destructive) |
+| <kbd>Ctrl-A</kbd> <kbd>p</kbd> | Pin / unpin the focused window — pinned windows persist and auto-resume on restart |
+| <kbd>Ctrl-A</kbd> <kbd>w</kbd> | Close = undock the focused window (the agent keeps running) |
+| <kbd>Ctrl-A</kbd> <kbd>x</kbd> | Kill the focused agent (confirmed) |
+| <kbd>Ctrl-A</kbd> <code>&#124;</code> | Toggle the layout: filmstrip ⇄ mosaic |
+| <kbd>Ctrl-A</kbd> <kbd>q</kbd> | Quit the cockpit |
+| <kbd>n</kbd> | Jump to the next issue whose agent needs you |
+| <kbd>r</kbd> | Flip the spine: issue list ↔ agents roster |
 
 Each issue **row** carries its agent's state two ways: a whole-row colour tint
 plus a trailing marker — `◌` spawning · `▸` running · `⚑` needs you (the row
 breathes) · `◦` idle · `✓` done · `✗` failed; the header shows a fleet summary
 (`3 agents · 1 needs you`). The **agents roster** (`r`) is a salience-sorted tab
-— needs-you first, then live work, then idle, then finished — so triage is one
-glance and the cursor drives the chat wall as you step it. The **chat wall** (`v`)
-previews several agents' live screens at once; press `i` to type a line straight
-to the agent under the cursor (answer a prompt, nudge it) without the full-screen
-attach, or `t` to take it over completely.
+on the spine — needs-you first, then live work, then idle, then finished — so
+triage is one glance.
+
+Open as many **agent windows** as fit side by side and drive each live `claude`
+directly — the focused window gets every keystroke, so answering a prompt or
+nudging an agent is just focusing its column and typing. Tile them as a scrolling
+**filmstrip** or a **mosaic** (<kbd>Ctrl-A</kbd> <code>&#124;</code>); zoom one
+full-screen (<kbd>Ctrl-A</kbd> <kbd>z</kbd>); **pin** the ones worth keeping
+(<kbd>Ctrl-A</kbd> <kbd>p</kbd>) — pinned windows and the layout persist to
+`.lindep/cockpit.json` and **auto-resume** on the next launch (`--no-resume`
+opts out).
 
 Agents that raise a permission prompt or go idle light up live via Claude
 **hooks** posted to a loopback endpoint — no polling. Sessions are durable:
@@ -127,31 +150,56 @@ just the graph viewer.
 
 ### Rebinding keys
 
-Every key above (and the graph-navigation keys) is remappable in a `[keys]`
-table, read from `<repo>/.lindep/config.toml` then `~/.config/lindep/config.toml`
-(personal wins) — the same two-location pattern as `.env`. Useful when a
-function key is missing or your terminal grabs it:
+Every key is remappable from `<repo>/.lindep/config.toml` then
+`~/.config/lindep/config.toml` (personal wins) — the same two-location pattern as
+`.env`. Direct keys (the spine / dependency windows) go under `[keys]`; the
+window **verbs** reached behind the prefix go under `[verbs]`; the prefix chord
+itself is `prefix`:
 
 ```toml
+prefix = "ctrl-a"                  # the escape to window commands (default)
+
 [keys]
-detach = "f8"                      # default f10; the key that varies by keyboard
-# detach = "ctrl-a d"              # …or a tmux-style leader sequence (see below)
-launch-agent = "a"
-jump-needs-you = ["n", "ctrl-g"]   # an action may take several keys
+deps = "D"                         # open a dependency window (default d)
+filter = ["f", "ctrl-f"]           # an action may take several keys
+sort = "s"
+
+[verbs]
+kill = "k"                         # Ctrl-A k to kill the focused agent (default x)
+close = "ctrl-w"
+layout = "|"
 ```
+
+Direct-key action names: `move-up` `move-down` `switch-side` `enter`
+`toggle-collapse` `back` `deps` `fleet` `jump-cycle` `jump-needs-you` `agents`
+`filter` `sort` `search` `help`. Verb names: `focus-left` `focus-right` `zoom`
+`pin` `close` `kill` `layout` `open` `quit` `search` `help` `roster`
+`jump-needs-you`.
 
 Keys: single chars (`a`, `/`), `f1`–`f12`, the named keys (`enter` `tab` `space`
 `up` `down` `left` `right` `home` `end` `pageup` `pagedown` `backspace` `delete`
-`insert`), and `ctrl-<letter>` / `alt-<key>`. (`esc` is reserved.) Press `?` in
-the cockpit to see the *live* bindings; the attach pane always shows the current
-detach key. Bad entries warn on stderr at startup and fall back to the default.
+`insert`), and `ctrl-<letter>` / `alt-<key>`. (`esc` is reserved — it always goes
+to the focused window.) Press `?` in the cockpit to see the *live* bindings. Bad
+entries — an unknown action, an unparseable or reserved key, or a chord already
+taken by another action — warn on stderr at startup and leave that action at its
+default.
 
-**Leader sequences for detach.** A value with a space — e.g. `detach = "ctrl-a d"`
-— is a tmux-style leader: press the leader (`Ctrl-A`), then the next key (`d`).
-This is the robust choice when no function key is available, since `Ctrl-<letter>`
-works on every keyboard and terminal. Pressing the leader twice while attached
-sends it through to the agent, so it's never wholly unreachable. Only `detach`
-can be a sequence — that's the one place a key must be reserved from the agent.
+**The prefix.** Window commands sit behind `Ctrl-A` so they never collide with
+`claude`'s own line editing — `Ctrl-<letter>` works on every keyboard and
+terminal. Press the prefix twice to send a literal `Ctrl-A` through to the focused
+agent, so it's never wholly unreachable. Pick any chord for `prefix`; if it
+shadows a direct key or verb, lindep warns at startup.
+
+### Agent limits
+
+The supervisor hosts up to **12** live agents at once by default; docking is
+uncapped above that — extra docked agents wait as "resuming…" cards until a slot
+frees. Override the ceiling in the same `config.toml`:
+
+```toml
+[agents]
+max_concurrent = 16
+```
 
 ## Notes
 

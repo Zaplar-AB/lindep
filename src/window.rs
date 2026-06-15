@@ -1,12 +1,13 @@
 //! The cockpit's window model — the sole owner of every window type.
 //!
-//! Cockpit v3 is a tmux-style tiling window manager whose panes ("windows") are
-//! live, focusable columns: the permanent **Spine** (issue list / agents
-//! roster), N live **Agent** PTYs, and **Deps** trees (a per-issue dependency
-//! lens, or the project-wide Fleet map). Every other module consumes the types
-//! defined here rather than minting its own — there is exactly one `WindowKind`,
-//! one `WindowId`, one `WindowSet`. (The v2 split that invented three
-//! incompatible `Window` types is what this charter exists to prevent.)
+//! Cockpit v3.2 is a tmux-style tiling window manager whose panes ("windows") are
+//! live, focusable columns: the permanent **Spine** (issue list / agents roster),
+//! N **Coin** windows, and the single chatless **Fleet** overview. A *coin* is one
+//! issue with two faces — its live `claude` screen (chat) and its dependency tree
+//! (deps) — flipped by `Tab`; the single *unpinned* coin is the transient preview
+//! that follows the Spine selection, and pinning it graduates it to a permanent
+//! docked tab **in place** (its PTY + [`WindowId`] survive). Every other module
+//! consumes the types defined here rather than minting its own.
 //!
 //! The control plane (supervisor / backends / sessions) is untouched by any of
 //! this: v3 is a UI/keymap reshape over a proven process layer.
@@ -25,55 +26,88 @@ use crate::model::{Direction, Graph};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowId(pub u64);
 
-/// What a [`WindowKind::Deps`] window is rooted on: a single issue's dependency
-/// tree, or the project-wide Fleet overview (the old graph map). Kept a distinct
-/// enum (rather than two `WindowKind` variants) so persistence and the renderer
-/// can pattern-match the deps *family* in one arm. An `Issue` window's live root
-/// (which re-rooting moves) lives in its [`DepsCursor`] — the single source of
-/// truth, doubling as the window's persistence identity — so this carries no
-/// payload and never drifts from the cursor.
+/// Which face of a [`WindowKind::Coin`] is showing: the issue's live agent screen
+/// (chat), or its dependency tree (deps). The two sides of one coin, flipped by
+/// `Tab`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DepsRoot {
-    /// A per-issue upstream/downstream lens (root in the window's `deps` cursor).
-    Issue,
-    /// The layered, edge-free overview of the whole project.
-    Fleet,
+pub enum CoinMode {
+    /// The issue's live `claude` screen (the "chat-first" default when it has a
+    /// live-or-imminent agent).
+    Chat,
+    /// The issue's upstream/downstream dependency tree (the resting default for an
+    /// issue with no live agent).
+    Deps,
 }
 
-/// The kind of a window. The Spine is permanent and always sits at index 0;
-/// Agent and Deps windows are opened, pinned, closed and killed by the user.
+impl CoinMode {
+    /// The other face — for the `Tab` flip.
+    pub const fn toggled(self) -> Self {
+        match self {
+            CoinMode::Chat => CoinMode::Deps,
+            CoinMode::Deps => CoinMode::Chat,
+        }
+    }
+}
+
+/// The kind of a window. The Spine is permanent and always sits at index 0. A
+/// **Coin** is one issue with two faces — its live agent screen (`Chat`) and its
+/// dependency tree (`Deps`), flipped by `Tab`; the single *unpinned* coin is the
+/// transient preview at index 1 that follows the Spine selection, and pinning it
+/// (graduation) makes it a permanent docked tab in place. **Fleet** is the single
+/// chatless project-overview tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowKind {
     /// The navigation spine: the issue list or the agents roster (the `r` tab
     /// toggle lives on it). Permanent — never closed, always window 0.
     Spine,
-    /// A live `claude` PTY, keyed by its issue. The old single "attached" pane,
-    /// now one of N simultaneous columns.
-    Agent(String),
-    /// A dependency view — a per-issue tree, or the Fleet map.
-    Deps(DepsRoot),
+    /// One issue, two faces (`Chat` / `Deps`), flipped by `Tab`. The unpinned coin
+    /// is the preview (one, follows the selection); a pinned coin is a docked tab.
+    /// It carries a live PTY (in `App.backends`, keyed by issue) on its chat face
+    /// and a [`DepsCursor`] (in `Window.deps`) on its deps face.
+    Coin { issue: String, mode: CoinMode },
+    /// The layered, edge-free project-wide overview (the old graph map). Chatless;
+    /// always at most one.
+    Fleet,
 }
 
 impl WindowKind {
-    /// The issue an Agent window renders, if this is one.
+    /// The issue whose live agent screen this window renders, if it currently
+    /// shows one — a `Coin` in `Chat` mode. A deps-face coin (no PTY on screen)
+    /// returns `None`. Used by the idle-quiet visibility plumbing.
     pub fn agent_issue(&self) -> Option<&str> {
         match self {
-            WindowKind::Agent(issue) => Some(issue.as_str()),
+            WindowKind::Coin {
+                issue,
+                mode: CoinMode::Chat,
+            } => Some(issue.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The `(issue, mode)` of a coin, if this is one (pinned or the preview).
+    pub fn coin(&self) -> Option<(&str, CoinMode)> {
+        match self {
+            WindowKind::Coin { issue, mode } => Some((issue.as_str(), *mode)),
             _ => None,
         }
     }
 }
 
-/// How the strip tiles its windows.
+/// How the strip arranges its windows. Chosen automatically from the docked-coin
+/// count (see [`WindowSet::auto_layout`]) unless the user forces one with
+/// `Ctrl-a |`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
-    /// Spine pinned left; non-spine windows are fixed-width columns, only the
-    /// ones that fully fit are drawn, the strip scrolls horizontally. The
-    /// headline v3 layout.
-    Filmstrip,
-    /// Every window tiled near-square to fill the viewport (reuses the chat
-    /// wall's `split_grid`). Proven first because it sidesteps the tui-term
-    /// horizontal-clipping problem entirely.
+    /// Spine pinned left, one **big pane** (the focused window, or the preview
+    /// when the Spine is focused), and a thin right-hand **rail** of compact
+    /// status cards for every other docked window. Only the big pane hosts a live
+    /// PTY — cards are text, so the rail sidesteps tui-term's horizontal-clipping
+    /// limit and preserves the idle-quiet property. The "Open Editors overflow"
+    /// layout, used once more than [`MOSAIC_MAX`] coins are docked.
+    Rail,
+    /// Spine pinned left, every coin tiled near-square in the rest (reuses
+    /// `split_grid`). The full-attention layout: every pane is live at once. Used
+    /// while the docked coins still fit (≤ [`MOSAIC_MAX`]).
     Mosaic,
 }
 
@@ -81,21 +115,28 @@ impl LayoutMode {
     /// The other layout — for the `|` toggle.
     pub const fn toggled(self) -> Self {
         match self {
-            LayoutMode::Filmstrip => LayoutMode::Mosaic,
-            LayoutMode::Mosaic => LayoutMode::Filmstrip,
+            LayoutMode::Rail => LayoutMode::Mosaic,
+            LayoutMode::Mosaic => LayoutMode::Rail,
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
-            LayoutMode::Filmstrip => "filmstrip",
+            LayoutMode::Rail => "rail",
             LayoutMode::Mosaic => "mosaic",
         }
     }
 }
 
+/// How many docked (pinned, non-Spine) windows tile before the rail appears. The
+/// preview doesn't count toward this — so up to `MOSAIC_MAX` pinned coins plus the
+/// preview tile, and the `MOSAIC_MAX + 1`-th docked coin flips to the rail (which
+/// also caps live PTYs to the focused one). Tunable; "more than ~4 chats" per the
+/// v3.2 design.
+pub const MOSAIC_MAX: usize = 4;
+
 /// Which dependency pane a [`DepsCursor`] currently drives. The v2 lens cycled
-/// List → Upstream → Downstream; the List is now the Spine, so a Deps window
+/// List → Upstream → Downstream; the List is now the Spine, so a coin's deps face
 /// only toggles between its two trees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepsSide {
@@ -131,12 +172,10 @@ pub struct TreeRow {
     pub collapsed: bool,
 }
 
-/// The independent navigation state of one Deps(Issue) window: its live root,
-/// its back-history, the flattened upstream/downstream trees, the per-tree
-/// selection, the per-root collapse set, and which tree is active. Extended from
-/// the parallel-design draft's `{side, up, down}` to the full
-/// `{side, up, down, root, history, collapsed}` so every Deps window keeps v2's
-/// re-root / Back / collapse gestures — independently of every other window.
+/// The independent navigation state of one coin's deps face: its live root, its
+/// back-history, the flattened upstream/downstream trees, the per-tree selection,
+/// the per-root collapse set, and which tree is active. Each coin keeps v2's
+/// re-root / Back / collapse gestures independently of every other window.
 #[derive(Debug, Clone)]
 pub struct DepsCursor {
     /// The issue currently at the root of this lens. `Enter` on a node moves it;
@@ -270,51 +309,74 @@ impl DepsCursor {
 pub struct Window {
     pub id: WindowId,
     pub kind: WindowKind,
-    /// Pinned windows persist (docked, in pin order) and are restored on
-    /// restart; an unpinned window is a transient preview, dropped on `close`
-    /// and never persisted.
+    /// Pinned windows persist (docked, in pin order) and are restored on restart.
+    /// The Spine is always pinned; the preview coin is never pinned (pinning it
+    /// *graduates* it). A coin becomes pinned the moment it graduates from the
+    /// preview; the docked-coin count drives the layout.
     pub pinned: bool,
-    /// Per-window dependency navigation — `Some` exactly for `Deps(Issue)`
-    /// windows, `None` for Spine / Agent / Deps(Fleet).
+    /// Per-window dependency navigation — `Some` for a coin whose deps face has
+    /// been built (Deps mode, or a dormant cursor kept across a flip to chat so a
+    /// re-root survives), `None` otherwise.
     pub deps: Option<DepsCursor>,
 }
 
 impl Window {
-    /// A short, human label for the window's status line / persistence — not the
-    /// rendered title (which the renderer composes with live agent state). For a
-    /// Deps(Issue) window this is the cursor's live root.
+    /// The issue a coin is about — its *identity* (`None` for the Spine / Fleet).
+    /// This is the coin's identity, not its deps cursor's current root (which
+    /// re-rooting moves for exploration); persistence and merge key off this.
     pub fn issue(&self) -> Option<&str> {
         match &self.kind {
-            WindowKind::Agent(issue) => Some(issue.as_str()),
-            WindowKind::Deps(DepsRoot::Issue) => self.deps.as_ref().map(|c| c.root.as_str()),
+            WindowKind::Coin { issue, .. } => Some(issue.as_str()),
             _ => None,
         }
     }
+
+    /// Whether this is the single transient preview — an *unpinned* coin.
+    pub fn is_preview(&self) -> bool {
+        matches!(self.kind, WindowKind::Coin { .. }) && !self.pinned
+    }
+}
+
+/// The result of pinning (graduating) the preview coin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraduateOutcome {
+    /// The preview became a new permanent coin (keeping its id).
+    Graduated(WindowId),
+    /// A pinned coin of the same identity already existed; the preview was dropped
+    /// and that coin focused instead (a *merge*).
+    Merged(WindowId),
+    /// The focused window wasn't the preview — nothing graduated.
+    NotPreview,
 }
 
 /// The ordered strip of windows plus all view-wide window state: which one is
-/// focused, the horizontal scroll (filmstrip), the layout mode, and the zoom
-/// toggle. The single source of truth for "what's on screen" once v3 lands —
-/// replacing v2's `attached` / `mode` / `right_view` / `chat_split` / `pinned`.
+/// focused, the layout mode, and the zoom toggle. The single source of truth for
+/// "what's on screen" — `windows[0]` is always the Spine and `windows[1]` (when
+/// present) is always the single transient preview coin.
 #[derive(Debug, Clone)]
 pub struct WindowSet {
-    /// All columns in display order. `windows[0]` is always the Spine.
+    /// All columns in display order. `windows[0]` is always the Spine; the preview
+    /// coin, when present, is always `windows[1]`.
+    ///
+    /// INVARIANT: every window's `id` is minted by [`Self::next_window_id`] and
+    /// never reused — preview_size keys depend on it. Read this field freely, but
+    /// add windows only through the typed mutators (`ensure_preview` / `push` /
+    /// `open_fleet`); never `windows.push(Window { id, .. })` with a hand-rolled id.
     pub windows: Vec<Window>,
     /// Index into `windows` of the focused column.
     pub focus: usize,
     /// Source of the next [`WindowId`]. Monotonic; never reused.
     next_id: u64,
+    /// The *effective* layout, recomputed from the docked-coin count on every
+    /// structural change (see [`Self::refresh_layout`]) — unless the user forced a
+    /// mode with `Ctrl-a |`, which sets `layout_manual`.
     pub layout: LayoutMode,
-    /// Horizontal scroll offset, in *columns* (filmstrip): how many non-spine
-    /// windows are scrolled off the left. Only ever mutated by focus-move /
-    /// resize handlers, never by `draw` — preserving the render-mutation
-    /// contract.
-    pub scroll_x: usize,
-    /// `true` while a single window is zoomed to fill the viewport.
+    /// `true` once the user forced the layout with `Ctrl-a |`; suppresses the
+    /// count-driven auto-recompute for the rest of the session.
+    pub layout_manual: bool,
+    /// `true` while the big pane is zoomed to fill the whole viewport (hiding the
+    /// Spine and the rail).
     pub zoomed: bool,
-    /// The `scroll_x` saved when zoom was entered, restored on unzoom so the
-    /// strip returns to exactly where it was.
-    pre_zoom_scroll: usize,
 }
 
 impl Default for WindowSet {
@@ -324,9 +386,11 @@ impl Default for WindowSet {
 }
 
 impl WindowSet {
-    /// A fresh set: just the permanent Spine, focused.
+    /// A fresh set: just the permanent Spine, focused. The caller seeds the
+    /// transient preview coin at index 1 (via [`Self::ensure_preview`]) once it
+    /// knows the default selection.
     pub fn new() -> Self {
-        WindowSet {
+        let mut set = WindowSet {
             windows: vec![Window {
                 id: WindowId(0),
                 kind: WindowKind::Spine,
@@ -335,11 +399,12 @@ impl WindowSet {
             }],
             focus: 0,
             next_id: 1,
-            layout: LayoutMode::Filmstrip,
-            scroll_x: 0,
+            layout: LayoutMode::Mosaic,
+            layout_manual: false,
             zoomed: false,
-            pre_zoom_scroll: 0,
-        }
+        };
+        set.refresh_layout();
+        set
     }
 
     fn next_window_id(&mut self) -> WindowId {
@@ -361,35 +426,37 @@ impl WindowSet {
         &self.windows[self.focus].kind
     }
 
-    /// Index of the Agent window for `issue`, if one is open.
-    pub fn agent_window(&self, issue: &str) -> Option<usize> {
-        self.windows
-            .iter()
-            .position(|w| w.kind.agent_issue() == Some(issue))
-    }
-
-    /// Whether any window references `issue`'s backend — an Agent window for it.
-    /// Used by the backend-reclaim predicate (generalising v2's `attached`).
+    /// Whether any window keeps `issue`'s backend alive — a chat-face coin for it,
+    /// or **any pinned coin** for it (a pinned coin can flip back to its chat face,
+    /// so its agent must survive even while its deps face is showing). Used by the
+    /// backend-reclaim predicate (generalising v2's `attached`).
     pub fn references_agent(&self, issue: &str) -> bool {
-        self.windows
-            .iter()
-            .any(|w| w.kind.agent_issue() == Some(issue))
+        self.windows.iter().any(|w| match &w.kind {
+            WindowKind::Coin { issue: i, mode } => {
+                i.as_str() == issue && (w.pinned || *mode == CoinMode::Chat)
+            }
+            _ => false,
+        })
     }
 
-    /// The lone unpinned window of a given family (the transient "preview"), if
-    /// one is open. Used to keep at most one unpinned Agent and one unpinned Deps
-    /// preview at a time: opening another replaces it (the agent keeps running —
-    /// the roster is the refind net), so unpinned windows never accumulate.
-    fn unpinned_agent(&self) -> Option<usize> {
-        self.windows
-            .iter()
-            .position(|w| !w.pinned && matches!(w.kind, WindowKind::Agent(_)))
+    /// Index of the single transient preview coin (always at index 1 when present
+    /// — the Spine is index 0).
+    pub fn preview_index(&self) -> Option<usize> {
+        self.windows.iter().position(Window::is_preview)
     }
 
-    fn unpinned_deps(&self) -> Option<usize> {
-        self.windows
-            .iter()
-            .position(|w| !w.pinned && matches!(w.kind, WindowKind::Deps(DepsRoot::Issue)))
+    /// Index of a *pinned* coin for `issue`, if one exists (either face).
+    pub fn pinned_coin_index(&self, issue: &str) -> Option<usize> {
+        self.windows.iter().position(|w| {
+            w.pinned && matches!(&w.kind, WindowKind::Coin { issue: i, .. } if i.as_str() == issue)
+        })
+    }
+
+    /// Whether a *pinned* coin already exists for `issue` — so the preview's
+    /// chat-first default can fall back to Deps (no point previewing a coin that's
+    /// already a permanent tab).
+    pub fn has_pinned_coin(&self, issue: &str) -> bool {
+        self.pinned_coin_index(issue).is_some()
     }
 
     /// Remove the window at `idx` (never the Spine) and fix focus. Returns it so
@@ -404,49 +471,123 @@ impl WindowSet {
         } else if self.focus > idx {
             self.focus -= 1;
         }
+        self.refresh_layout();
         Some(removed)
     }
 
-    /// Open (or focus, if already open) an Agent window for `issue`. A new window
-    /// is the unpinned Agent *preview*: it replaces any prior unpinned Agent
-    /// window (whose agent keeps running). Returns `(focused id, displaced
-    /// preview)` so the caller can reclaim the displaced agent's backend.
-    pub fn open_or_focus_agent(&mut self, issue: &str) -> (WindowId, Option<Window>) {
-        if let Some(i) = self.agent_window(issue) {
-            self.focus = i;
-            return (self.windows[i].id, None);
-        }
-        let displaced = self.unpinned_agent().and_then(|i| self.remove(i));
-        let id = self.next_window_id();
-        self.windows.push(Window {
-            id,
-            kind: WindowKind::Agent(issue.to_string()),
-            pinned: false,
-            deps: None,
-        });
-        self.focus = self.windows.len() - 1;
-        (id, displaced)
-    }
-
-    /// Open a per-issue Deps window rooted at `root`, or re-root the existing
-    /// unpinned Deps preview onto it — so browsing deps doesn't spawn a window
-    /// per issue. Returns the focused window's id.
-    pub fn open_or_reroot_deps(&mut self, root: String, graph: &Graph) -> WindowId {
-        if let Some(i) = self.unpinned_deps() {
-            let cursor = DepsCursor::new(root, graph);
-            self.windows[i].deps = Some(cursor);
-            self.focus = i;
+    /// Create-or-re-aim the single transient preview coin at index 1 to mirror
+    /// `issue` in `mode`. The Spine selection drives this every time it moves; it
+    /// never steals focus (an insert bumps an existing focus index so it keeps
+    /// pointing at the same window). A `Deps`-mode preview carries a freshly built
+    /// [`DepsCursor`] rooted at `issue`; a `Chat`-mode one carries none (a flip to
+    /// Deps builds it on demand). Returns the preview's id — stable across re-aims,
+    /// so its `preview_size` / live PTY survive.
+    pub fn ensure_preview(&mut self, issue: &str, mode: CoinMode, graph: &Graph) -> WindowId {
+        let deps = (mode == CoinMode::Deps).then(|| DepsCursor::new(issue.to_string(), graph));
+        if let Some(i) = self.preview_index() {
+            self.windows[i].kind = WindowKind::Coin {
+                issue: issue.to_string(),
+                mode,
+            };
+            self.windows[i].deps = deps;
             return self.windows[i].id;
         }
         let id = self.next_window_id();
-        self.windows.push(Window {
-            id,
-            kind: WindowKind::Deps(DepsRoot::Issue),
-            pinned: false,
-            deps: Some(DepsCursor::new(root, graph)),
-        });
-        self.focus = self.windows.len() - 1;
+        self.windows.insert(
+            1,
+            Window {
+                id,
+                kind: WindowKind::Coin {
+                    issue: issue.to_string(),
+                    mode,
+                },
+                pinned: false,
+                deps,
+            },
+        );
+        // Inserting ahead of the focus keeps it on the same window.
+        if self.focus >= 1 {
+            self.focus += 1;
+        }
+        self.refresh_layout();
         id
+    }
+
+    /// The preview coin's current `(issue, mode)`, if it exists.
+    pub fn preview(&self) -> Option<(String, CoinMode)> {
+        self.preview_index().and_then(|i| {
+            self.windows[i]
+                .kind
+                .coin()
+                .map(|(issue, mode)| (issue.to_string(), mode))
+        })
+    }
+
+    /// Focus the preview coin (used by the attach/spawn button).
+    pub fn focus_preview(&mut self) {
+        if let Some(i) = self.preview_index() {
+            self.focus = i;
+        }
+    }
+
+    /// Drop the transient preview coin if present — e.g. the selection is now a
+    /// pinned coin, which *is* the active view, so a duplicate preview would just
+    /// clutter. Returns it so the caller can reclaim a dead backend. Focus is fixed
+    /// like any removal (and is never the preview here — the caller guards that).
+    pub fn clear_preview(&mut self) -> Option<Window> {
+        let i = self.preview_index()?;
+        self.remove(i)
+    }
+
+    /// Flip the coin at `idx` between its chat and deps faces (`Tab`), building its
+    /// deps cursor on demand. A dormant cursor is kept across a flip to chat, so a
+    /// pinned coin's re-root exploration survives. No-op if `idx` isn't a coin.
+    pub fn flip_coin_face(&mut self, idx: usize, graph: &Graph) {
+        let Some((issue, mode)) = self
+            .windows
+            .get(idx)
+            .and_then(|w| w.kind.coin())
+            .map(|(i, m)| (i.to_string(), m))
+        else {
+            return;
+        };
+        let next = mode.toggled();
+        if next == CoinMode::Deps && self.windows[idx].deps.is_none() {
+            self.windows[idx].deps = Some(DepsCursor::new(issue.clone(), graph));
+        }
+        self.windows[idx].kind = WindowKind::Coin { issue, mode: next };
+    }
+
+    /// Pin = **graduate** the focused preview coin into a permanent docked coin. If
+    /// a pinned coin of the same identity already exists, the redundant preview is
+    /// dropped and that coin focused (a *merge*) — so one issue is never split
+    /// across two pinned coins. Otherwise the preview is pinned **in place**,
+    /// keeping its [`WindowId`] (so a live PTY / `preview_size` / deps cursor
+    /// survive untouched). The caller re-seeds a fresh preview via
+    /// [`Self::ensure_preview`] afterwards.
+    pub fn pin_preview(&mut self) -> GraduateOutcome {
+        let Some(p) = self.preview_index() else {
+            return GraduateOutcome::NotPreview;
+        };
+        if self.focus != p {
+            return GraduateOutcome::NotPreview;
+        }
+        let Some(issue) = self.windows[p].issue().map(str::to_string) else {
+            return GraduateOutcome::NotPreview;
+        };
+        if let Some(t) = self.pinned_coin_index(&issue) {
+            // Already pinned: drop the redundant preview, focus the existing coin.
+            let twin_id = self.windows[t].id;
+            self.windows.remove(p);
+            self.focus = if p < t { t - 1 } else { t };
+            self.refresh_layout();
+            return GraduateOutcome::Merged(twin_id);
+        }
+        // Pin in place, preserving the WindowId (and any live PTY / deps cursor).
+        self.windows[p].pinned = true;
+        let id = self.windows[p].id;
+        self.refresh_layout();
+        GraduateOutcome::Graduated(id)
     }
 
     /// Open (or focus) the single Fleet overview window — there's only ever one.
@@ -454,7 +595,7 @@ impl WindowSet {
         if let Some(i) = self
             .windows
             .iter()
-            .position(|w| matches!(w.kind, WindowKind::Deps(DepsRoot::Fleet)))
+            .position(|w| matches!(w.kind, WindowKind::Fleet))
         {
             self.focus = i;
             return self.windows[i].id;
@@ -462,29 +603,28 @@ impl WindowSet {
         let id = self.next_window_id();
         self.windows.push(Window {
             id,
-            kind: WindowKind::Deps(DepsRoot::Fleet),
-            pinned: false,
+            kind: WindowKind::Fleet,
+            pinned: true,
             deps: None,
         });
         self.focus = self.windows.len() - 1;
+        self.refresh_layout();
         id
     }
 
-    /// Close the focused window (undock). The Spine can't be closed — closing it
-    /// is a no-op. Focus falls back to the previous window. Returns the closed
-    /// window so the caller can reclaim its backend handle / drop its geometry.
+    /// Close the focused window (undock). The Spine and the preview coin can't be
+    /// closed (both are structural) — the caller guards those. Focus falls back to
+    /// the previous window. Returns the closed window so the caller can reclaim its
+    /// backend handle / drop its geometry.
     pub fn close_focused(&mut self) -> Option<Window> {
         let removed = self.remove(self.focus)?;
-        if self.zoomed {
-            self.zoomed = false;
-            self.scroll_x = self.pre_zoom_scroll;
-        }
+        self.zoomed = false;
         Some(removed)
     }
 
-    /// Append a window with the next id, focusing it. Used by persistence
-    /// restore and the auto-resume placeholders, where the kind/pin state are
-    /// already decided by the caller. `pinned` is honoured as given.
+    /// Append a window with the next id, focusing it. Used by persistence restore
+    /// and the auto-resume placeholders, where the kind/pin state are already
+    /// decided by the caller. `pinned` is honoured as given.
     pub fn push(&mut self, kind: WindowKind, pinned: bool, deps: Option<DepsCursor>) -> WindowId {
         let id = self.next_window_id();
         self.windows.push(Window {
@@ -494,32 +634,12 @@ impl WindowSet {
             deps,
         });
         self.focus = self.windows.len() - 1;
+        self.refresh_layout();
         id
     }
 
-    /// The focused window's 0-based position among the *non-spine* windows, or
-    /// `None` when the Spine is focused — for keeping it in view while scrolling.
-    pub fn focus_column(&self) -> Option<usize> {
-        (self.focus > 0).then(|| self.focus - 1)
-    }
-
-    /// Count of non-spine windows.
-    pub fn non_spine_count(&self) -> usize {
-        self.windows.len().saturating_sub(1)
-    }
-
-    /// Toggle the focused window's pin (persistence). The Spine is always pinned.
-    pub fn toggle_pin_focused(&mut self) -> bool {
-        if self.focus == 0 {
-            return true;
-        }
-        let w = &mut self.windows[self.focus];
-        w.pinned = !w.pinned;
-        w.pinned
-    }
-
-    /// Move focus one window left/right (no wrap), keeping focus on a real
-    /// window. Scroll follows in [`crate::layout`]; this only moves the index.
+    /// Move focus one window left/right (no wrap). The focused non-spine window is
+    /// always the big pane, so there's nothing to scroll into view.
     pub fn focus_left(&mut self) {
         self.focus = self.focus.saturating_sub(1);
     }
@@ -528,17 +648,54 @@ impl WindowSet {
         self.focus = (self.focus + 1).min(self.windows.len() - 1);
     }
 
-    /// Non-destructive zoom toggle: remember/restore the scroll so the strip
-    /// snaps back to where it was. Zoom follows focus (the renderer reads the
-    /// focused window), so there's no captured index to go stale.
+    /// Jump focus straight home to the Spine in one hop — the dedicated
+    /// "back to nav" gesture (so you never step through the deps pane to return).
+    pub fn focus_nav(&mut self) {
+        self.focus = 0;
+    }
+
+    /// Non-destructive zoom toggle: the big pane fills the whole viewport. Zoom
+    /// follows the big pane (the renderer reads it), so there's no captured index
+    /// to go stale.
     pub fn toggle_zoom(&mut self) {
-        if self.zoomed {
-            self.zoomed = false;
-            self.scroll_x = self.pre_zoom_scroll;
+        self.zoomed = !self.zoomed;
+    }
+
+    // ── Count-driven layout ─────────────────────────────────────────────────
+
+    /// Non-Spine *pinned* windows — the docked coins + Fleet. The preview is
+    /// unpinned, so it never counts toward the rail threshold.
+    pub fn docked_count(&self) -> usize {
+        self.windows
+            .iter()
+            .filter(|w| w.pinned && !matches!(w.kind, WindowKind::Spine))
+            .count()
+    }
+
+    /// The count-driven layout: tiled (mosaic) while the docked coins fit, rail
+    /// beyond [`MOSAIC_MAX`].
+    pub fn auto_layout(docked: usize) -> LayoutMode {
+        if docked > MOSAIC_MAX {
+            LayoutMode::Rail
         } else {
-            self.zoomed = true;
-            self.pre_zoom_scroll = self.scroll_x;
+            LayoutMode::Mosaic
         }
+    }
+
+    /// Recompute the effective layout from the docked count, unless the user
+    /// pinned a choice with `Ctrl-a |`. Called after every structural change.
+    fn refresh_layout(&mut self) {
+        if self.layout_manual {
+            return;
+        }
+        self.layout = Self::auto_layout(self.docked_count());
+    }
+
+    /// Force a layout mode (the `Ctrl-a |` override), suppressing auto-recompute
+    /// for the rest of the session.
+    pub fn force_layout(&mut self, layout: LayoutMode) {
+        self.layout = layout;
+        self.layout_manual = true;
     }
 }
 
@@ -546,7 +703,7 @@ impl WindowSet {
 
 /// Build the flattened upstream/downstream forest for `root`, honouring the
 /// per-root `collapsed` set. A faithful port of the v2 `App::build_forest` /
-/// `walk`, now a free function so every Deps window can build its own.
+/// `walk`, now a free function so every coin can build its own.
 fn build_forest(
     graph: &Graph,
     root: &str,
@@ -687,51 +844,165 @@ mod tests {
     }
 
     #[test]
-    fn opening_an_agent_twice_focuses_the_same_window() {
+    fn ensure_preview_creates_one_coin_at_index_1_and_reaims_in_place() {
+        let graph = demo::graph();
         let mut ws = WindowSet::new();
-        let (first, _) = ws.open_or_focus_agent("ZAP-204");
-        assert_eq!(ws.windows.len(), 2);
-        // A second open of the same issue focuses the existing window, no dupe.
-        ws.focus = 0;
-        let (again, displaced) = ws.open_or_focus_agent("ZAP-204");
-        assert_eq!(ws.windows.len(), 2, "no duplicate window for one issue");
-        assert_eq!(first, again);
-        assert!(
-            displaced.is_none(),
-            "focusing an existing agent displaces nothing"
-        );
-        assert_eq!(ws.focus, 1, "focus returns to the existing window");
-    }
-
-    #[test]
-    fn a_new_agent_preview_displaces_the_old_unpinned_one() {
-        let mut ws = WindowSet::new();
-        ws.open_or_focus_agent("ZAP-1");
-        // Opening a second, different agent replaces the unpinned preview.
-        let (_, displaced) = ws.open_or_focus_agent("ZAP-2");
-        assert_eq!(ws.windows.len(), 2, "the spine + one preview");
+        let id = ws.ensure_preview("ZAP-204", CoinMode::Deps, &graph);
+        assert_eq!(ws.windows.len(), 2, "spine + the single preview coin");
+        assert_eq!(ws.preview_index(), Some(1), "the preview lives at index 1");
         assert_eq!(
-            displaced.and_then(|w| w.kind.agent_issue().map(str::to_string)),
-            Some("ZAP-1".to_string()),
-            "the old preview is displaced (its agent keeps running)"
+            ws.focus, 0,
+            "creating the preview never steals focus from the spine"
         );
-        // …but a pinned agent window is never displaced.
-        ws.toggle_pin_focused(); // pin ZAP-2
-        ws.open_or_focus_agent("ZAP-3");
-        assert_eq!(ws.windows.len(), 3, "pinned ZAP-2 survives, ZAP-3 added");
+        // Re-aiming mutates the SAME window (no accumulation) and keeps its id,
+        // so a live PTY / preview_size survive across nav moves.
+        let again = ws.ensure_preview("ZAP-210", CoinMode::Deps, &graph);
+        assert_eq!(again, id, "the preview keeps its WindowId across re-aims");
+        assert_eq!(ws.windows.len(), 2, "still exactly one preview coin");
+        assert_eq!(ws.preview().unwrap().0, "ZAP-210");
     }
 
     #[test]
-    fn close_undocks_a_window_but_never_the_spine() {
+    fn flipping_a_coin_toggles_chat_and_deps() {
+        let graph = demo::graph();
         let mut ws = WindowSet::new();
-        ws.open_or_focus_agent("ZAP-204");
-        let closed = ws.close_focused().expect("an agent window closes");
+        ws.ensure_preview("ZAP-204", CoinMode::Chat, &graph);
+        let p = ws.preview_index().unwrap();
+        assert_eq!(ws.preview().unwrap().1, CoinMode::Chat);
+        assert!(
+            ws.windows[p].deps.is_none(),
+            "a chat-face coin carries no cursor"
+        );
+        ws.flip_coin_face(p, &graph);
+        assert_eq!(ws.preview().unwrap().1, CoinMode::Deps);
+        assert!(
+            ws.windows[p].deps.is_some(),
+            "flipping to deps builds the cursor on demand"
+        );
+    }
+
+    #[test]
+    fn pin_graduates_the_preview_to_a_permanent_coin_keeping_its_id() {
+        let graph = demo::graph();
+        let mut ws = WindowSet::new();
+        let id = ws.ensure_preview("ZAP-204", CoinMode::Chat, &graph);
+        ws.focus_preview();
+        let outcome = ws.pin_preview();
+        assert_eq!(
+            outcome,
+            GraduateOutcome::Graduated(id),
+            "graduation preserves the WindowId (so a live PTY survives)"
+        );
+        let g = &ws.windows[ws.focus];
+        assert!(g.pinned, "the graduated coin is pinned");
+        assert_eq!(g.kind.agent_issue(), Some("ZAP-204"));
+        assert!(
+            ws.preview_index().is_none(),
+            "the preview is consumed by graduation (the caller re-seeds one)"
+        );
+    }
+
+    #[test]
+    fn pin_merges_when_a_coin_of_the_same_identity_already_exists() {
+        let graph = demo::graph();
+        let mut ws = WindowSet::new();
+        let first = ws.ensure_preview("ZAP-204", CoinMode::Chat, &graph);
+        ws.focus_preview();
+        assert_eq!(ws.pin_preview(), GraduateOutcome::Graduated(first));
+        // A fresh preview aimed at the same issue, pinned again → merge, no dupe.
+        ws.ensure_preview("ZAP-204", CoinMode::Chat, &graph);
+        ws.focus_preview();
+        assert_eq!(
+            ws.pin_preview(),
+            GraduateOutcome::Merged(first),
+            "the redundant preview merges into the existing coin"
+        );
+        assert_eq!(
+            ws.windows
+                .iter()
+                .filter(|w| w.issue() == Some("ZAP-204"))
+                .count(),
+            1,
+            "one issue is never split across two pinned coins"
+        );
+    }
+
+    #[test]
+    fn close_undocks_a_graduated_coin_but_never_the_spine() {
+        let graph = demo::graph();
+        let mut ws = WindowSet::new();
+        ws.ensure_preview("ZAP-204", CoinMode::Chat, &graph);
+        ws.focus_preview();
+        ws.pin_preview(); // a pinned coin at index 1, focused
+        let closed = ws.close_focused().expect("a graduated coin closes");
         assert_eq!(closed.kind.agent_issue(), Some("ZAP-204"));
-        assert_eq!(ws.windows.len(), 1);
         assert_eq!(ws.focus, 0);
         // Closing the spine is a no-op.
         assert!(ws.close_focused().is_none());
-        assert_eq!(ws.windows.len(), 1);
+        assert!(matches!(ws.windows[0].kind, WindowKind::Spine));
+    }
+
+    #[test]
+    fn layout_auto_switches_to_rail_past_the_threshold() {
+        let mut ws = WindowSet::new();
+        assert_eq!(ws.layout, LayoutMode::Mosaic, "few coins tile");
+        // Dock MOSAIC_MAX + 1 coins → past the threshold, the rail appears.
+        for i in 0..=MOSAIC_MAX {
+            ws.push(
+                WindowKind::Coin {
+                    issue: format!("Z-{i}"),
+                    mode: CoinMode::Chat,
+                },
+                true,
+                None,
+            );
+        }
+        assert_eq!(
+            ws.layout,
+            LayoutMode::Rail,
+            "more than MOSAIC_MAX docked coins → rail"
+        );
+        let _ = ws.close_focused();
+        assert_eq!(
+            ws.layout,
+            LayoutMode::Mosaic,
+            "dropping back under the threshold re-tiles"
+        );
+    }
+
+    #[test]
+    fn a_forced_layout_survives_a_structural_change() {
+        let mut ws = WindowSet::new();
+        ws.force_layout(LayoutMode::Rail);
+        assert_eq!(ws.layout, LayoutMode::Rail);
+        // A structural change must NOT auto-recompute over a manual choice.
+        ws.push(
+            WindowKind::Coin {
+                issue: "Z-1".into(),
+                mode: CoinMode::Chat,
+            },
+            true,
+            None,
+        );
+        assert_eq!(ws.layout, LayoutMode::Rail, "the manual override sticks");
+    }
+
+    #[test]
+    fn a_pinned_coin_keeps_its_backend_referenced_across_a_face_flip() {
+        let graph = demo::graph();
+        let mut ws = WindowSet::new();
+        ws.ensure_preview("ZAP-204", CoinMode::Chat, &graph);
+        ws.focus_preview();
+        ws.pin_preview(); // a pinned chat coin
+        assert!(ws.references_agent("ZAP-204"));
+        // Flip it to its deps face — the agent must still be referenced, since the
+        // coin can flip back to chat.
+        let f = ws.focus;
+        ws.flip_coin_face(f, &graph);
+        assert!(
+            ws.references_agent("ZAP-204"),
+            "a pinned coin keeps its backend alive on its deps face"
+        );
     }
 
     #[test]
@@ -764,14 +1035,12 @@ mod tests {
     }
 
     #[test]
-    fn zoom_round_trips_the_scroll_offset() {
+    fn zoom_toggles() {
         let mut ws = WindowSet::new();
-        ws.scroll_x = 3;
+        assert!(!ws.zoomed);
         ws.toggle_zoom();
         assert!(ws.zoomed);
-        ws.scroll_x = 9; // some scrolling happened while zoomed
         ws.toggle_zoom();
         assert!(!ws.zoomed);
-        assert_eq!(ws.scroll_x, 3, "unzoom restores the pre-zoom scroll");
     }
 }

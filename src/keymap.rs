@@ -42,6 +42,9 @@ pub enum Action {
     MoveDown,
     /// In a Deps window, flip the active tree (upstream ↔ downstream).
     SwitchSide,
+    /// Flip the context (active) window between chat and deps. Bare `Tab` when
+    /// the Spine or a Deps pane is focused; `Ctrl-a Tab` from inside a chat.
+    ContextToggle,
     /// Spine: the attach/spawn button. Deps: re-root onto the selected node.
     Enter,
     /// Deps: collapse / expand the selected subtree. Spine: also the button.
@@ -65,10 +68,15 @@ pub enum Action {
     /// Fuzzy-find issues (Spine list).
     StartSearch,
     ToggleHelp,
+    /// Pop a dismissable overlay summarising the selected issue (details + deps).
+    ToggleSummary,
 
     // ── Prefix verbs (any focus, behind the prefix) ───────────────────────
     FocusLeft,
     FocusRight,
+    /// Jump focus straight home to the Spine in one hop — the dedicated
+    /// "back to nav" gesture, so you never step through the deps pane to return.
+    FocusNav,
     /// Non-destructive zoom of the focused window to fill the strip.
     ZoomToggle,
     /// Pin / unpin the focused window (persistence).
@@ -77,7 +85,7 @@ pub enum Action {
     CloseWindow,
     /// Kill the focused agent (confirmed) — separate from close.
     KillWindow,
-    /// Toggle filmstrip ⇄ mosaic.
+    /// Toggle rail ⇄ mosaic.
     LayoutToggle,
     /// Open (or focus) an agent on the spine selection — the button, reachable
     /// from any window via the prefix.
@@ -93,8 +101,12 @@ const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (
         Action::SwitchSide,
         "switch-side",
-        &["left", "h", "right", "l", "tab"],
+        &["left", "h", "right", "l"],
     ),
+    // Bare `Tab` flips the active window chat⇄deps when the Spine or a Deps pane
+    // is focused (an Agent pane forwards Tab to its PTY — reach it via Ctrl-a Tab,
+    // the verb below).
+    (Action::ContextToggle, "context", &["tab"]),
     (Action::Enter, "enter", &["enter"]),
     (Action::ToggleCollapse, "toggle-collapse", &["space"]),
     (Action::Back, "back", &["backspace", "b"]),
@@ -107,6 +119,7 @@ const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::CycleSort, "sort", &["s"]),
     (Action::StartSearch, "search", &["/"]),
     (Action::ToggleHelp, "help", &["?"]),
+    (Action::ToggleSummary, "summary", &["i"]),
 ];
 
 /// `(action, config name, default keys)` for the **prefix** verbs, reached as
@@ -114,6 +127,8 @@ const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
 const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::FocusLeft, "focus-left", &["left", "h"]),
     (Action::FocusRight, "focus-right", &["right", "l"]),
+    // `Ctrl-a g` / `Ctrl-a 0` (tmux's "window 0") jump straight home to the nav.
+    (Action::FocusNav, "focus-nav", &["g", "0"]),
     (Action::ZoomToggle, "zoom", &["z"]),
     (Action::PinWindow, "pin", &["p"]),
     (Action::CloseWindow, "close", &["w"]),
@@ -123,8 +138,12 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::Quit, "quit", &["q"]),
     (Action::StartSearch, "search", &["/"]),
     (Action::ToggleHelp, "help", &["?"]),
+    (Action::ToggleSummary, "summary", &["i"]),
     (Action::ToggleRoster, "roster", &["r"]),
     (Action::JumpNeedsYou, "jump-needs-you", &["n"]),
+    // `Ctrl-a Tab` flips the active window chat⇄deps from any focus — notably
+    // from inside a chat, where a bare Tab would go to the agent's PTY.
+    (Action::ContextToggle, "context", &["tab"]),
 ];
 
 /// The default prefix chord — tmux's `Ctrl-A`, which never collides with
@@ -335,6 +354,13 @@ impl Keymap {
         join_labels(&self.singles, action)
     }
 
+    /// Joined *bare* key labels of the verb keys bound to `action` — no prefix
+    /// shown, e.g. `W` — for the compact armed-hint footer (where the prefix is
+    /// already armed). `—` when unbound.
+    pub fn verb_key_label(&self, action: Action) -> String {
+        join_labels(&self.verbs, action)
+    }
+
     /// Joined labels of the verb keys bound to `action`, each shown with the
     /// prefix — e.g. `Ctrl-A W`. `—` when unbound.
     pub fn verb_label(&self, action: Action) -> String {
@@ -355,8 +381,10 @@ impl Keymap {
 
     /// Apply config overrides. Each named action's bindings in the chosen table
     /// (`direct` = `[keys]`, else `[verbs]`) are *replaced* by the given keys.
-    /// Returns warnings for unknown actions, bad/reserved keys and conflicts; a
-    /// bad entry leaves that action at its default.
+    /// Returns warnings for unknown actions, bad/reserved keys and conflicts. A
+    /// bad entry — an unknown action, an unparseable or reserved key, or a rebind
+    /// whose every requested key is already taken — leaves that action at its
+    /// default rather than unbinding it.
     fn apply_table(
         map: &mut HashMap<Binding, Action>,
         defaults: &[(Action, &str, &[&str])],
@@ -387,18 +415,27 @@ impl Keymap {
             if !ok {
                 continue; // keep the default for this action
             }
-            // Replace this action's bindings, refusing to steal another's.
-            map.retain(|_, a| *a != action);
+            // Resolve conflicts BEFORE touching `map`, so an all-conflicting rebind
+            // leaves the action at its default (per this method's contract) instead
+            // of unbinding it. A chord already owned by THIS action isn't a conflict
+            // — we're about to replace its bindings anyway.
+            let mut free = Vec::new();
             for chord in parsed {
                 match map.get(&chord) {
-                    Some(other) => warnings.push(format!(
+                    Some(other) if *other != action => warnings.push(format!(
                         "'{name}': {} is already bound to {other:?}; ignored",
                         chord.label()
                     )),
-                    None => {
-                        map.insert(chord, action);
-                    }
+                    _ => free.push(chord),
                 }
+            }
+            if free.is_empty() {
+                continue; // every requested key was taken — keep the defaults
+            }
+            // At least one new chord survives: now replace this action's bindings.
+            map.retain(|_, a| *a != action);
+            for chord in free {
+                map.insert(chord, action);
             }
         }
         warnings
@@ -423,7 +460,24 @@ impl Keymap {
             }
             Ok(b) => {
                 self.prefix = b;
-                Vec::new()
+                // The prefix swallows this chord, so any direct key or verb bound
+                // to the same chord can no longer fire as a normal key — warn (the
+                // default `Ctrl-A` collides with nothing, so this is silent unless
+                // the user picked a prefix that shadows a binding).
+                let mut warnings = Vec::new();
+                if let Some(a) = self.singles.get(&b) {
+                    warnings.push(format!(
+                        "'prefix': {} is also the direct key for {a:?}; that binding is now shadowed",
+                        b.label()
+                    ));
+                }
+                if let Some(a) = self.verbs.get(&b) {
+                    warnings.push(format!(
+                        "'prefix': {} is also a verb ({a:?}); that binding is now shadowed",
+                        b.label()
+                    ));
+                }
+                warnings
             }
             Err(e) => vec![format!("'prefix': {e}")],
         }
@@ -456,6 +510,26 @@ struct ConfigFile {
     /// Prefix verbs (any focus).
     #[serde(default)]
     verbs: HashMap<String, KeySpec>,
+    /// The `[agents]` table — non-keybinding settings.
+    #[serde(default)]
+    agents: AgentsConfig,
+}
+
+/// The `[agents]` table of `config.toml`.
+#[derive(Debug, Default, Deserialize)]
+struct AgentsConfig {
+    /// Override the live-backend ceiling. Docking is uncapped regardless; this
+    /// bounds how many agents run at once (Cockpit v3 default is 12).
+    max_concurrent: Option<usize>,
+}
+
+/// Non-keymap settings parsed from the same `config.toml` as the keymap, so the
+/// single load reads the whole file once. Absent fields stay `None` and the
+/// caller substitutes its compiled-in defaults.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Settings {
+    /// `[agents] max_concurrent` override, if the user set one.
+    pub max_concurrent: Option<usize>,
 }
 
 /// A binding value: one key or several.
@@ -478,8 +552,9 @@ impl KeySpec {
 /// Load the keymap: defaults, then `<repo>/.lindep/config.toml`, then
 /// `~/.config/lindep/config.toml` (personal wins). Returns the map plus any
 /// warnings to surface (bad config never aborts startup — defaults stand in).
-pub fn load(repo_root: Option<&Path>) -> (Keymap, Vec<String>) {
+pub fn load(repo_root: Option<&Path>) -> (Keymap, Settings, Vec<String>) {
     let mut keymap = Keymap::default();
+    let mut settings = Settings::default();
     let mut warnings = Vec::new();
 
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -518,11 +593,15 @@ pub fn load(repo_root: Option<&Path>) -> (Keymap, Vec<String>) {
                 for w in keymap.apply_verbs(&collect(cfg.verbs)) {
                     warnings.push(format!("{}: {w}", path.display()));
                 }
+                // Personal config (read last) wins over the repo's.
+                if let Some(mc) = cfg.agents.max_concurrent {
+                    settings.max_concurrent = Some(mc);
+                }
             }
             Err(e) => warnings.push(format!("{}: invalid TOML: {e}", path.display())),
         }
     }
-    (keymap, warnings)
+    (keymap, settings, warnings)
 }
 
 #[cfg(test)]
@@ -543,6 +622,30 @@ mod tests {
         assert_eq!(
             km.action_for(ev(KeyCode::Char('j'), KeyModifiers::NONE)),
             Some(Action::MoveDown)
+        );
+    }
+
+    #[test]
+    fn tab_toggles_the_context_window_not_the_tree_side() {
+        let km = Keymap::default();
+        // Bare Tab (Spine / Deps focus) flips the active window chat⇄deps…
+        assert_eq!(
+            km.action_for(ev(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Action::ContextToggle)
+        );
+        // …and Ctrl-a Tab does the same from any focus (notably inside a chat).
+        assert_eq!(
+            km.verb_for(ev(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Action::ContextToggle)
+        );
+        // SwitchSide (up↔down tree) is still reachable, just not via Tab.
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Some(Action::SwitchSide)
+        );
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('l'), KeyModifiers::NONE)),
+            Some(Action::SwitchSide)
         );
     }
 
@@ -654,6 +757,19 @@ mod tests {
     }
 
     #[test]
+    fn a_prefix_that_shadows_a_binding_warns() {
+        let mut km = Keymap::default();
+        // 'd' is the direct key for OpenDeps; choosing it as the prefix swallows
+        // that chord, so the rebind must warn the binding is now shadowed.
+        let warnings = km.set_prefix("d");
+        assert!(
+            warnings.iter().any(|w| w.contains("shadowed")),
+            "a prefix colliding with an existing binding warns: {warnings:?}"
+        );
+        assert!(km.is_prefix(ev(KeyCode::Char('d'), KeyModifiers::NONE)));
+    }
+
+    #[test]
     fn esc_is_reserved_everywhere() {
         let mut km = Keymap::default();
         assert!(!km.set_prefix("esc").is_empty());
@@ -671,11 +787,16 @@ mod tests {
         let w = km.apply(&[("filter".into(), vec!["r".into()])]);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("already bound"));
-        // 'r' still toggles the roster; filter lost its 's'… no — filter lost
-        // its own 'f' (replaced) but didn't steal 'r'.
+        // 'r' still toggles the roster (the rebind was refused, not stolen)…
         assert_eq!(
             km.action_for(ev(KeyCode::Char('r'), KeyModifiers::NONE)),
             Some(Action::ToggleRoster)
+        );
+        // …and because every requested key conflicted, filter KEEPS its default
+        // 'f' rather than being left unbound.
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('f'), KeyModifiers::NONE)),
+            Some(Action::CycleFilter)
         );
     }
 

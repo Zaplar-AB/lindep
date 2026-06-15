@@ -588,7 +588,8 @@ pub struct PersistedWindow {
 pub struct CockpitState {
     #[serde(default = "default_cockpit_version")]
     pub version: u32,
-    /// `"filmstrip"` or `"mosaic"`; empty/unknown restores the default.
+    /// `"rail"` or `"mosaic"`; empty/unknown (incl. the legacy `"filmstrip"`)
+    /// restores the default rail layout.
     #[serde(default)]
     pub layout: String,
     #[serde(default)]

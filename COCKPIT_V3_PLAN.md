@@ -2,7 +2,7 @@
 
 **"Everything is a focusable column."** Replace the cockpit's mode-based shell (single full-screen attach + read-only chat wall + composer + Deps/Chat toggle) with a tmux-style tiling window manager whose panes are live, interactive agents.
 
-Status: design agreed (grill session 2026-06-15) + architected/critiqued via multi-agent workflow. Not yet implemented. Branch baseline: `feat/v1-multi-agent-spine`.
+Status: v3.0 + v3.1 implemented on `feat/cockpit-v3-windowing`. **v3.2 ("one coin, count-driven layout") agreed 2026-06-15 (grill round 2) — see §7 for the delta; it supersedes the parts of §1–§6 it touches.** Branch baseline: `feat/v1-multi-agent-spine`.
 
 ---
 
@@ -38,7 +38,7 @@ Five subsystems were designed in parallel (window-model, layout-engine, input-pr
    → **Fix: snap-to-whole-column scrolling.** Show only columns that fit *entirely*; never render a partial PTY column (the width-0 DROP rule, generalized to "any column not fully inside the strip is dropped"). This is how tmux window-lists behave anyway, and it eliminates the partial-clip and Clear-overlap problems in one rule.
 
 2. **`auto-resume ALL` is unsound in policy.** Mechanism is fine (`claude --resume` is wired), but it collides with `max_concurrent=6` (the 7th `launch()` silently no-ops) and would re-spawn `Done`/`Failed` conversations.
-   → **Fix:** resume only **docked ∩ was-live** sessions (never Done/Failed); eager-resume the focused window + up to `max_concurrent-1` pinned, lazy-resume the rest on first focus; render not-yet-spawned docked windows as **"resuming…" cards** (no parser/resize); ship behind **`--no-resume` (default until verified)**.
+   → **Fix:** resume only **docked ∩ was-live** sessions (never Done/Failed); eager-resume the focused window + up to `max_concurrent-1` pinned, lazy-resume the rest on first focus; render not-yet-spawned docked windows as **"resuming…" cards** (no parser/resize). **Update (2026-06-15): promoted to default-ON** — the verification preconditions are in place (lazy >cap stagger via `resume_one`'s capacity guard, the None-backend cards, and a per-resume grace bound), so `--no-resume` is now the opt-out, not the default.
 
 ### Cross-cutting decisions locked before any code (the "type charter")
 
@@ -97,9 +97,9 @@ The unavoidable coupled change — everything before kept the build green so thi
 
 ### Phase 6 — Auto-resume-all (additive, gated `--no-resume` from day one)
 - In `start_control_plane`, after `Supervisor::start` + the rehydration loop: resume **docked ∩ was-live** only; eager focused + up to `max_concurrent-1` pinned, **lazy-resume the rest on first focus**.
-- `AppEvent::Resuming { remaining }` → "resuming N…" header spinner; `is_animating()` true while `resuming_count>0` (hard-clear on a grace bound so a stuck resume can't pin the cockpit awake).
+- "resuming N…" header spinner; `is_animating()` true while any resume is in flight. Implemented as a per-issue `resuming: HashMap<issue, deadline>` (not the originally-planned `AppEvent::Resuming { remaining }` + bare counter): each resume carries its **own** grace deadline so a wedged one self-clears without a trickle of later resumes pushing a shared deadline forward, and so a launch the supervisor no-ops can't pin the loop.
 - Titles from `app.graph.get(key)`, fall back to worktree branch (Session has no title).
-- Ships **dark** behind `--no-resume`; enable once the >6 stagger + None-backend path are verified together.
+- **Update (2026-06-15): shipped default-ON** (`--no-resume` opts out) once the >cap stagger + None-backend path were verified together — see §2.2.
 
 ---
 
@@ -139,3 +139,105 @@ Control plane (`supervisor.rs`, `backend.rs`, `worktree.rs`, `notify.rs`) — **
 - **Preserve (must not break):** late-hook/tombstone invariants (`a_late_hook_cannot_resurrect_*`, reaped/`is_terminal` guards at `app.rs:865/879/908`); session reconcile; `agent_order` salience sort; the resize geometry-guard discipline.
 - **Rewrite (expected):** single-attach, compose, `chat_panes`-cap, `PIN_CAP`, `chat_layout` stack/side/grid cycle, mode-toggle (`g`), `enter_on_a_blocker_re_roots_and_back_returns` (→ per-window), overview centering.
 - **Add:** `scroll_offset`/`place_windows` pure unit tests (snap-to-whole-column, lone-window letterbox, focus-keeps-in-view); prefix state-machine tests (verb dispatch, double-tap `0x01`, kill-confirm precedence vs PTY); None-backend card render; persistence round-trip + prune-on-restore.
+
+---
+
+## 7. v3.2 — "one coin, count-driven layout" (grill round 2, 2026-06-15)
+
+A walk-through reframed the model as an **IDE**: the Spine is the file explorer; each
+issue is one **coin** (chat ⇄ deps, flipped by `Tab`); pinned coins are the open
+editors; the rail is the "Open Editors" overflow that only appears past a threshold;
+a running-but-unpinned agent shows **only** as the animated marker on its Spine row.
+Five user-agreed decisions, each with its code delta:
+
+1. **One coin window, pinned or not.** Collapse `WindowKind::{Context, Agent,
+   Deps(Issue)}` into a single `WindowKind::Coin { issue, mode: CoinMode }`. The
+   *unpinned* coin **is** the preview (one, follows the Spine selection); pinning
+   flips `pinned=true` **in place** (the PTY + `WindowId` survive). `Deps(Fleet)`
+   becomes `WindowKind::Fleet`; `DepsRoot` is deleted. `Tab` flips the **focused**
+   coin's face — preview or pinned — building the deps cursor on demand. Graduation
+   (`pin_preview`) just sets `pinned`; merge stays (one coin per issue).
+
+2. **Count-driven layout (was the manual `|` toggle).** ≤ `MOSAIC_MAX` (4) non-Spine
+   windows → **mosaic** (tiled, all live); more → **rail** (focused coin big + the
+   rest as overflow cards). The threshold also caps live PTYs. `Ctrl-a |` becomes a
+   sticky session override; auto otherwise. `WindowSet` keeps an *effective* `layout`
+   field, refreshed on every structural change via `refresh_layout()`.
+
+3. **Live preview, replaced as you browse.** The single unpinned coin keeps mirroring
+   the Spine selection (chat-first when live, else deps). Pin to keep. Unchanged from
+   v3.1 except it's now the same kind as a pinned coin.
+
+4. **Preview never a card.** `layout::rail` excludes the preview index from the cards;
+   it's drawn only when it's the big/tiled pane (Spine or preview focused). Focused
+   into a pinned coin, the preview isn't drawn at all — so an unpinned agent's only
+   signal is the Spine-row marker.
+
+5. **A dedicated "home to nav" verb.** `Tab` stays a strict chat⇄deps flip; a new
+   `Action::FocusNav` prefix verb (`Ctrl-a g` / `Ctrl-a 0`) jumps focus straight to
+   the Spine in one hop, so you never step through the deps pane to get back.
+
+**Persistence format unchanged (v1):** a pinned coin persists by its current face
+(`PersistedKind::Agent`=chat, `Deps`=deps, `Fleet`), restoring into a `Coin{mode}` /
+`Fleet`. `references_agent` is broadened so a pinned coin keeps its backend alive
+across face flips (a deps-face coin can flip back to chat). A pinned coin restored in
+chat face auto-resumes (Phase 6); flipping a docked coin to chat lazy-resumes it.
+**Control plane: still no changes.**
+
+**Not a bug — the "switching a chat idles it" report (2026-06-15):** investigated and
+ruled out. Each agent has its own `pty-read-{issue}` OS thread draining its PTY
+continuously, independent of focus/visibility; the visibility gating
+(`is_index_visible`) suppresses only *repaints* (idle-quiet), never reads. `Idle` is
+set **solely** by claude's own `Stop` hook (notify.rs). So switching never stops an
+agent — an off-screen chat just isn't painted live (carded, or the transient preview
+vanishes) until you return. v3.2's tiled ≤4 layout makes concurrent live chats
+visible, which should dissolve the perception.
+
+---
+
+## 8. v3.2 followups (dogfooding round, 2026-06-15)
+
+Implemented on top of §7 after hands-on use; all green (204 tests, clippy+fmt clean).
+
+1. **Resume self-heal (`supervisor.rs`).** Every relaunch used `claude --resume <id>`
+   once a session record existed, which hard-fails "No conversation found" when the
+   conversation has been deleted — looping forever, "can't open a new one."
+   `supervise()` now wraps spawn→run→grade in a loop: on a resume launch's own
+   non-zero self-exit whose screen shows that banner (`missing_conversation`, polled
+   ~1 s — false-positive implausible, false-negative degrades to the pre-fix Failed,
+   which is relaunchable), it retries ONCE with a fresh `--session-id` (the
+   deterministic id recreates the conversation) before grading. The failed attempt is
+   never graded Failed, so no tombstone strands the issue. Control plane otherwise
+   untouched.
+
+2. **Pinned coin is the active view — no duplicate preview (#2).** `reaim_preview`
+   now SUPPRESSES the preview (`WindowSet::clear_preview`) when the selection already
+   has a pinned coin, so navigating to a pinned issue surfaces that coin instead of a
+   parallel preview. New `App::active_index()` = the selection's pinned coin, else the
+   preview; it's the rail's big pane when the Spine is focused. `layout::rail` now
+   takes `active_idx` (big pane) **and** `preview_idx` (card exclusion).
+
+3. **Preview no longer vanishes on focus (#3).** `layout::mosaic` tiles **every**
+   non-Spine window (dropped the focus-dependent `preview_shown`), so focusing a
+   pinned coin keeps the active-view tile on screen. `mosaic_visible` is now width-only.
+
+4. **Needs-you jump lands on the pinned coin (#4).** `Ctrl-a n` to an issue that has
+   a pinned coin focuses it on its chat face (`App::focus_pinned_chat`, also backing
+   the attach/spawn button).
+
+5. **`reaim_preview` re-aims a *focused* preview.** Dropped the vestigial "skip while
+   the preview is focused" guard (in-place deps nav goes through `dispatch_deps`,
+   never `reaim_preview`), so a verb-driven jump (`Ctrl-a n`) while the preview is
+   focused updates the focused pane, not just the selection. Regression test added.
+   *(Bug surfaced by the adversarial review.)*
+
+6. **Issue summary overlay (`i` / `Ctrl-a i`).** A dismissable details card for the
+   selected/focused issue — status · priority · assignee · team · blocked/cycle flags,
+   plus its direct blockers and blocked work with statuses. Pure local-graph read (no
+   Linear fetch); any key closes it. `Action::ToggleSummary`, `App.show_summary`,
+   `ui::render_summary`.
+
+**Process note.** The adversarial review's write-capable workflow agents reverted
+`src/layout.rs` via `git checkout` (recovered from the session transcript). Future
+reviews must sandbox reviewers — read-only `Explore` agentType and/or
+`isolation: 'worktree'` — and `git status` should be checked after any review run.

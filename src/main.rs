@@ -238,11 +238,17 @@ fn run_tui(mut app: App, demo: bool, no_resume: bool) -> io::Result<()> {
     // Load the keymap from config (repo `.lindep/config.toml`, then personal
     // `~/.config/lindep/config.toml`), surfacing any problems on stderr before
     // we enter the alternate screen. Bad config never aborts — defaults stand in.
-    let (km, warnings) = keymap::load(std::env::current_dir().ok().as_deref());
+    let (km, settings, warnings) = keymap::load(std::env::current_dir().ok().as_deref());
     for w in &warnings {
         eprintln!("lindep: config: {w}");
     }
     app.keymap = km;
+    // Resolve the live-backend ceiling: a validated `[agents] max_concurrent`
+    // override, else the compiled-in default.
+    let (max_concurrent, mc_warning) = resolve_max_concurrent(settings.max_concurrent);
+    if let Some(w) = mc_warning {
+        eprintln!("lindep: config: {w}");
+    }
 
     // The runtime carries every background subsystem (supervisor, hook endpoint,
     // PTY pumps); the render loop stays synchronous and on this thread.
@@ -262,7 +268,7 @@ fn run_tui(mut app: App, demo: bool, no_resume: bool) -> io::Result<()> {
     // instead — exactly the non-git degradation path. When armed it also restores
     // the saved window layout and (unless `--no-resume`) brings docked agents back.
     let control_plane = if control_plane_enabled(demo) {
-        start_control_plane(&runtime, tx.clone(), &mut app, no_resume)
+        start_control_plane(&runtime, tx.clone(), &mut app, no_resume, max_concurrent)
     } else {
         None
     };
@@ -361,15 +367,33 @@ fn control_plane_enabled(demo: bool) -> bool {
     !demo
 }
 
-/// Most agents the supervisor will host at once. Cockpit v3 raised this from 6
-/// (config-tunability is a follow-up); docking is uncapped above it, with extra
-/// docked agents shown as "resuming…" cards until a slot frees.
+/// Default ceiling on live agents the supervisor hosts at once. Cockpit v3 raised
+/// this from 6 and made it overridable via `[agents] max_concurrent` in
+/// `config.toml`; docking is uncapped above it, with extra docked agents shown as
+/// "resuming…" cards until a slot frees.
 const MAX_CONCURRENT_AGENTS: usize = 12;
+
+/// Resolve the live-backend ceiling from an optional `[agents] max_concurrent`
+/// override. A nonsensical `0` is rejected (it would let the supervisor host no
+/// agents at all) and clamped up to the default, with a warning for the caller to
+/// surface; absent or valid values pass through.
+fn resolve_max_concurrent(setting: Option<usize>) -> (usize, Option<String>) {
+    match setting {
+        Some(0) => (
+            MAX_CONCURRENT_AGENTS,
+            Some(format!(
+                "agents.max_concurrent must be ≥ 1; using default {MAX_CONCURRENT_AGENTS}"
+            )),
+        ),
+        Some(n) => (n, None),
+        None => (MAX_CONCURRENT_AGENTS, None),
+    }
+}
 
 /// Build and start the agent control plane: worktree manager, session store
 /// (reconciled against live worktrees), hook endpoint, and the supervisor. Also
 /// wires the supervisor handle into `app`, restores the saved window layout
-/// (pruned against the reconcile survivors), and — unless `no_resume` — brings
+/// (pruned against the was-live resumable set), and — unless `no_resume` — brings
 /// docked agents back. Returns `None` (degrading to a read-only viewer) outside a
 /// git repo or if the loopback endpoint can't bind.
 fn start_control_plane(
@@ -377,6 +401,7 @@ fn start_control_plane(
     events: event::AppEventTx,
     app: &mut App,
     no_resume: bool,
+    max_concurrent: usize,
 ) -> Option<(supervisor::SupervisorHandle, tokio::task::JoinHandle<()>)> {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
@@ -442,20 +467,19 @@ fn start_control_plane(
         }
     }
 
-    // The post-reconcile survivor set (for pruning the restored window layout) and
-    // the was-live sessions (the auto-resume candidates — never Done/Failed/
-    // Stopped, which aren't `is_live`). Captured from the durable store, not the
-    // fleet (whose rehydration events haven't been drained yet).
-    let (survivors, resumable): (HashSet<String>, HashSet<String>) = match store.lock() {
-        Ok(store) => (
-            store.sessions().map(|s| s.issue.clone()).collect(),
-            store
-                .sessions()
-                .filter(|s| s.status.is_live())
-                .map(|s| s.issue.clone())
-                .collect(),
-        ),
-        Err(_) => (HashSet::new(), HashSet::new()),
+    // The was-live sessions: both the auto-resume candidates AND the set the
+    // restored window layout is pruned against — a docked agent only comes back
+    // (its window *and* its resume) if it was live, never Done/Failed/Stopped
+    // (which aren't `is_live`), so a terminal agent can't restore to a permanent
+    // "resuming…" card. Captured from the durable store, not the fleet (whose
+    // rehydration events haven't been drained yet).
+    let resumable: HashSet<String> = match store.lock() {
+        Ok(store) => store
+            .sessions()
+            .filter(|s| s.status.is_live())
+            .map(|s| s.issue.clone())
+            .collect(),
+        Err(_) => HashSet::new(),
     };
 
     // The hook endpoint must bind before agents launch so their settings can
@@ -486,9 +510,9 @@ fn start_control_plane(
         rows,
         cols,
         // Cockpit v3 uncaps docking, but live backends are still bounded by the
-        // supervisor — bumped 6→12 (the practical ceiling is now machine
-        // resources + how many ≥80-col columns fit).
-        max_concurrent: MAX_CONCURRENT_AGENTS,
+        // supervisor — default 12, overridable via `[agents] max_concurrent` (the
+        // practical ceiling is machine resources + how many ≥80-col columns fit).
+        max_concurrent,
         // Interactive agents use the normal permission flow; budget/turn caps
         // are a headless (phase-3) concern and only apply with `--print`.
         guardrails: vec!["--permission-mode".to_string(), "default".to_string()],
@@ -496,25 +520,42 @@ fn start_control_plane(
     let (handle, join) = supervisor::Supervisor::start(config, runtime.handle());
     app.supervisor = Some(handle.clone());
 
-    // Restore the saved window layout (pruned against the survivors), then point
-    // the cockpit at the file so the render thread persists future changes.
+    // Restore the saved window layout (pruned against the resumable set), then
+    // point the cockpit at the file so the render thread persists future changes.
     let cockpit_path = session::CockpitState::path(&repo_root);
     match session::CockpitState::load(&cockpit_path) {
-        Ok(state) => app.apply_cockpit(&state, &survivors),
+        Ok(state) => {
+            app.apply_cockpit(&state, &resumable);
+            app.cockpit_path = Some(cockpit_path);
+        }
+        // Symmetric with the state.json guard above: a cockpit layout written by a
+        // NEWER lindep must not be clobbered with our older format. Leave
+        // cockpit_path None so the render thread's save sites stay inert and the
+        // file is left untouched (honouring CockpitState::load's documented promise).
+        Err(e @ session::StateError::Version { .. }) => {
+            let _ = events_back.send(event::AppEvent::Notification(format!(
+                "cockpit layout is from a newer lindep; leaving it untouched ({e})"
+            )));
+        }
+        // Corrupt/unreadable (not a version bump): start fresh and let the next
+        // structural change overwrite the bad file.
         Err(e) => {
             let _ = events_back.send(event::AppEvent::Notification(format!(
                 "cockpit layout unreadable ({e}); starting fresh"
             )));
+            app.cockpit_path = Some(cockpit_path);
         }
     }
-    app.cockpit_path = Some(cockpit_path);
 
     // Auto-resume docked agents that were live before the restart — eager for the
-    // focused one + up to cap-1 others, lazy (on first focus) for the rest. Ships
-    // behind `--no-resume`; the lazy path + the None-backend "resuming…" cards
-    // make a >cap fleet come back gracefully.
+    // focused one + up to cap-1 others, lazy (on first focus) for the rest.
+    // Default-ON: the plan gated this behind `--no-resume` ("ships dark until
+    // verified"), but the verification preconditions are now in place — the lazy
+    // >cap stagger (resume_one's capacity guard), the None-backend "resuming…"
+    // cards, and the per-resume grace bound — so it's promoted to the default and
+    // `--no-resume` is the opt-out.
     if !no_resume {
-        app.begin_resume(&resumable, MAX_CONCURRENT_AGENTS);
+        app.begin_resume(&resumable, max_concurrent);
     }
 
     Some((handle, join))
@@ -629,7 +670,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
 mod tests {
     use super::*;
     use crate::session::AgentStatus;
-    use crate::window::LayoutMode;
+    use crate::window::{CoinMode, LayoutMode, WindowKind};
     use std::sync::Arc;
 
     fn fake(app: &mut App, issue: &str) {
@@ -681,7 +722,14 @@ mod tests {
     #[test]
     fn an_agent_window_renders_its_status_and_key() {
         let mut app = App::new(demo::graph());
-        app.windows.open_or_focus_agent("ZAP-204");
+        app.windows.push(
+            WindowKind::Coin {
+                issue: "ZAP-204".into(),
+                mode: CoinMode::Chat,
+            },
+            true,
+            None,
+        ); // a focused agent tab
         fake(&mut app, "ZAP-204");
         app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
         let out = render_snapshot(&mut app, 120, 40).expect("render");
@@ -697,7 +745,14 @@ mod tests {
         // A finished agent's window reads DONE (the supervisor's verdict), never
         // the transient amber EXITED, and doesn't inflate the header count.
         let mut app = App::new(demo::graph());
-        app.windows.open_or_focus_agent("ZAP-201");
+        app.windows.push(
+            WindowKind::Coin {
+                issue: "ZAP-201".into(),
+                mode: CoinMode::Chat,
+            },
+            true,
+            None,
+        );
         let backend = crate::backend::fake::FakeBackend::new("ZAP-201");
         backend.finish(Some(0));
         app.backends.insert(
@@ -718,7 +773,7 @@ mod tests {
     fn agent_windows_survive_adversarial_sizes_in_both_layouts() {
         // A strip of several windows (spine + deps + agents) must not panic at any
         // size, in either layout — the snap-to-whole-column / mosaic geometry.
-        for layout in [LayoutMode::Filmstrip, LayoutMode::Mosaic] {
+        for layout in [LayoutMode::Rail, LayoutMode::Mosaic] {
             for (w, h) in [
                 (0u16, 0u16),
                 (1, 1),
@@ -731,9 +786,16 @@ mod tests {
                 (200, 60),
             ] {
                 let mut app = App::new(demo::graph());
-                app.windows.layout = layout;
+                app.windows.force_layout(layout);
                 for key in ["ZAP-204", "ZAP-201", "ZAP-205"] {
-                    app.windows.open_or_focus_agent(key);
+                    app.windows.push(
+                        WindowKind::Coin {
+                            issue: key.into(),
+                            mode: CoinMode::Chat,
+                        },
+                        true,
+                        None,
+                    );
                     fake(&mut app, key);
                     app.fleet.insert(key.into(), AgentStatus::Running);
                 }
@@ -747,7 +809,14 @@ mod tests {
         // A restored docked agent (Phase 5/6) has no backend until it resumes —
         // it must paint a calm card (never touch a parser/resize) and survive.
         let mut app = App::new(demo::graph());
-        app.windows.open_or_focus_agent("ZAP-204");
+        app.windows.push(
+            WindowKind::Coin {
+                issue: "ZAP-204".into(),
+                mode: CoinMode::Chat,
+            },
+            true,
+            None,
+        );
         app.fleet.insert("ZAP-204".into(), AgentStatus::Idle); // rehydrated was-live
         let out = render_snapshot(&mut app, 120, 40).expect("render");
         assert!(out.contains("ZAP-204"));
@@ -760,12 +829,96 @@ mod tests {
     #[test]
     fn the_resuming_header_spinner_shows_while_resuming() {
         let mut app = App::new(demo::graph());
-        app.resuming_count = 3;
+        app.mark_resuming_for_test("ZAP-1");
+        app.mark_resuming_for_test("ZAP-2");
+        app.mark_resuming_for_test("ZAP-3");
         let out = render_snapshot(&mut app, 120, 40).expect("render");
         assert!(
             out.contains("resuming 3"),
             "the resume spinner shows:\n{out}"
         );
+    }
+
+    #[test]
+    fn the_hint_footer_follows_a_keymap_rebind() {
+        // Regression: render_hints must read live keys, not hardcoded ones, or it
+        // lies after a rebind (plan §3 Phase 2). Rebind kill x→k and check the
+        // armed footer shows the new key, not the old.
+        let mut app = App::new(demo::graph());
+        let warnings = app.keymap.apply_verbs(&[("kill".into(), vec!["k".into()])]);
+        assert!(warnings.is_empty(), "rebind kill→k is clean: {warnings:?}");
+        app.prefix_armed = true; // show the armed cheat-line
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(
+            out.contains("K kill"),
+            "the armed footer shows the rebound kill key:\n{out}"
+        );
+        assert!(
+            !out.contains("X kill"),
+            "…and not the stale default:\n{out}"
+        );
+    }
+
+    #[test]
+    fn draw_is_pure_under_the_rail() {
+        // The render-mutation contract (plan §2): draw mutates ONLY ListState
+        // offsets + preview_size — never the window vector, focus, layout, or the
+        // context window's mode. Render the rail (Spine + big pane + cards) and
+        // assert that structural state is byte-for-byte unchanged.
+        let mut app = App::new(demo::graph());
+        app.set_viewport(Rect::new(0, 0, 200, 40));
+        for k in ["ZAP-1", "ZAP-2", "ZAP-3"] {
+            app.windows.push(
+                WindowKind::Coin {
+                    issue: k.into(),
+                    mode: CoinMode::Chat,
+                },
+                true,
+                None,
+            );
+        }
+        app.windows.force_layout(LayoutMode::Rail); // exercise the rail explicitly
+        let n = app.windows.windows.len();
+        let focus = app.windows.focus;
+        let layout = app.windows.layout;
+        let ctx = app.windows.preview();
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| ui::draw(&mut app, frame))
+            .expect("draw");
+        assert_eq!(
+            app.windows.windows.len(),
+            n,
+            "draw must not add/remove windows"
+        );
+        assert_eq!(app.windows.focus, focus, "draw must not move focus");
+        assert_eq!(
+            app.windows.layout, layout,
+            "draw must not change the layout"
+        );
+        assert_eq!(
+            app.windows.preview(),
+            ctx,
+            "draw must not flip the preview's face"
+        );
+    }
+
+    #[test]
+    fn max_concurrent_resolves_override_and_rejects_zero() {
+        assert_eq!(
+            resolve_max_concurrent(None),
+            (MAX_CONCURRENT_AGENTS, None),
+            "no override → the compiled-in default, silently"
+        );
+        assert_eq!(
+            resolve_max_concurrent(Some(20)),
+            (20, None),
+            "a valid override is honoured"
+        );
+        let (value, warning) = resolve_max_concurrent(Some(0));
+        assert_eq!(value, MAX_CONCURRENT_AGENTS, "0 clamps up to the default");
+        assert!(warning.is_some(), "0 is rejected with a warning");
     }
 
     #[test]

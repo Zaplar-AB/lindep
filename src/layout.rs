@@ -2,33 +2,37 @@
 //! `App`, no I/O, so every rule here is unit-testable in isolation (like the v2
 //! `tail_fit` / `split` helpers it sits beside).
 //!
-//! Two layouts share this module:
-//! * **Mosaic** tiles every window near-square via [`split_grid`] — the proven
-//!   layout that sidesteps tui-term's horizontal-clipping limitation.
-//! * **Filmstrip** pins the Spine left and lays non-spine windows out as
-//!   fixed-width columns, drawing **only the columns that fully fit** and
-//!   dropping any that would be partially clipped. tui-term 0.3.4 paints the
-//!   top-left `w×h` subgrid of the vt100 parser with no horizontal offset, so a
-//!   partially-scrolled-in 80-col PTY column would show its *left* N cols
-//!   sliced, not windowed — and `PseudoTerminal::render` `Clear`s first, so
-//!   overlapping Rects erase each other. Snap-to-whole-column avoids both: a
-//!   column is either fully placed or not placed at all.
+//! Both layouts pin the **Spine** left at a fixed width; which one is in force is
+//! chosen by the docked-coin count (see [`crate::window::WindowSet::auto_layout`]),
+//! not a manual toggle:
+//! * **Mosaic** (≤ `MOSAIC_MAX` docked coins) tiles every non-Spine window
+//!   near-square via [`split_grid`] in the area right of the Spine — the
+//!   full-attention layout where every coin (including the preview, when it
+//!   exists) is live at once. No duplicate ever appears, because the preview is
+//!   suppressed upstream for a selection that already has a pinned coin.
+//! * **Rail** (more docked coins) gives the focused window — or the active window
+//!   (the selection's pinned coin, else the preview) when the Spine is focused — a
+//!   single **big pane**, and lists every *other docked* window as a compact
+//!   **card** down a thin right-hand rail. The preview is **never** a card; it
+//!   shows only as the big pane. Only the big pane hosts a live PTY, so the rail
+//!   sidesteps tui-term 0.3.4's horizontal-clipping limit (it paints only the
+//!   top-left `w×h` subgrid of the vt100 parser, with no horizontal offset) and
+//!   preserves the idle-quiet property.
 
 use ratatui::layout::Rect;
 
-/// The Spine's fixed width in the filmstrip (matches the v2 left-list width).
+/// The Spine's fixed width (matches the v2 left-list width).
 pub const SPINE_WIDTH: u16 = 44;
-/// A `claude` PTY below this inner width is unreadable, so non-spine columns
-/// never render narrower than this — they letterbox instead.
-pub const MIN_COL_WIDTH: u16 = 80;
-/// Upper bound on a non-spine column's width, so a single window on a very wide
-/// terminal letterboxes (centred) rather than stretching to an unusable width.
-pub const MAX_COL_WIDTH: u16 = 120;
+/// The width of the right-hand rail of status cards.
+pub const RAIL_WIDTH: u16 = 32;
+/// The big pane never shrinks below this. On a terminal too narrow to fit both a
+/// readable big pane and the rail, the rail is dropped — cards aren't drawn, but
+/// every window stays focusable (focusing it makes it the big pane).
+pub const MIN_BIG_WIDTH: u16 = 50;
 
 /// A window's placement on screen: its index into the window set and the `Rect`
-/// to draw it in. Only windows that are actually visible get an entry — the
-/// renderer iterates these, so an off-strip column simply isn't drawn (and its
-/// PTY is never resized, preserving the idle-quiet property).
+/// to draw it in. The renderer iterates these, so a window with no placement
+/// simply isn't drawn (and its PTY is never resized — the idle-quiet property).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
     /// Index into `WindowSet::windows`.
@@ -36,165 +40,154 @@ pub struct Placement {
     pub rect: Rect,
 }
 
-/// The width one non-spine filmstrip column *wants*, given the viewport width:
-/// `clamp(viewport, 80..=120)`. Count-independent — it depends only on the
-/// viewport, never on how many windows exist — so opening, pinning or scrolling
-/// never reflows a live pane. Placement may clamp this down to the strip width
-/// on a narrow terminal (where the lone window then letterboxes).
-pub fn column_width(viewport_width: u16) -> u16 {
-    viewport_width.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
+/// Which window is the big (live-PTY) pane in the rail layout: the focused window,
+/// or — when the Spine itself is focused — the **active** window (the selection's
+/// pinned coin if it has one, else the transient preview). `None` only when there
+/// is nothing but the Spine (or `focus`/`active_idx` are out of range).
+pub fn rail_big_index(n: usize, focus: usize, active_idx: Option<usize>) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    if focus == 0 {
+        // The Spine is focused → the active window (pinned coin or preview) is big.
+        active_idx.filter(|&i| i < n)
+    } else if focus < n {
+        Some(focus)
+    } else {
+        None
+    }
 }
 
-/// How many whole non-spine columns fit in the strip to the right of the Spine.
-/// At least 1 (a lone window letterboxes within it) so focus always has
-/// somewhere to land.
-pub fn visible_columns(viewport_width: u16) -> usize {
-    let strip_w = viewport_width.saturating_sub(SPINE_WIDTH);
-    let col = column_width(viewport_width).min(strip_w.max(1));
-    ((strip_w / col.max(1)) as usize).max(1)
-}
+/// Lay out the rail: the Spine pinned left, one big pane (the focused window, or
+/// the active window when the Spine is focused), and a column of cards for every
+/// other *docked* window — never the preview (it shows only as the big pane).
+/// `active_idx` is the selection's pinned coin or the preview; `preview_idx` is the
+/// unpinned coin (excluded from cards). Never panics on a tiny viewport.
+pub fn rail(
+    area: Rect,
+    n: usize,
+    focus: usize,
+    active_idx: Option<usize>,
+    preview_idx: Option<usize>,
+) -> (Vec<Placement>, Vec<Placement>) {
+    if n == 0 || area.area() == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut full = Vec::new();
 
-/// Clamp/adjust the horizontal scroll so the focused non-spine column is fully
-/// in view. `focus_col` is the focused window's position **among non-spine
-/// windows** (0-based); `non_spine` is how many there are. Returns the new
-/// scroll offset (count of non-spine columns scrolled off the left).
-///
-/// Lives here (pure) and is called from focus-move / resize handlers, never from
-/// `draw` — `draw` only ever *reads* `scroll_x`.
-pub fn scroll_offset(
-    current: usize,
-    focus_col: Option<usize>,
-    non_spine: usize,
-    viewport_width: u16,
-) -> usize {
-    let cols = visible_columns(viewport_width);
-    // Never scroll past the point where the last window sits flush right.
-    let max_scroll = non_spine.saturating_sub(cols);
-    let mut scroll = current.min(max_scroll);
-    if let Some(f) = focus_col {
-        if f < scroll {
-            scroll = f; // focus is left of the window — page left to it
-        } else if f >= scroll + cols {
-            scroll = f + 1 - cols; // focus is right of the window — page right
+    let spine_w = SPINE_WIDTH.min(area.width);
+    full.push(Placement {
+        index: 0,
+        rect: Rect::new(area.x, area.y, spine_w, area.height),
+    });
+    // No room past the Spine → just the Spine (everything else is off-screen).
+    if spine_w >= area.width {
+        return (full, Vec::new());
+    }
+
+    let big = rail_big_index(n, focus, active_idx);
+    let rest_x = area.x + spine_w;
+    let rest_w = area.width - spine_w;
+
+    // Every non-spine window that isn't the big pane becomes a card, in order —
+    // except the preview, which is drawn only when it IS the big pane.
+    let card_indices: Vec<usize> = (1..n)
+        .filter(|&i| Some(i) != big && Some(i) != preview_idx)
+        .collect();
+
+    // Reserve the rail only when there are cards AND the big pane stays readable;
+    // otherwise drop it (the cards' windows are still reachable by focusing them).
+    let rail_w = if !card_indices.is_empty() && rest_w >= MIN_BIG_WIDTH + RAIL_WIDTH {
+        RAIL_WIDTH
+    } else {
+        0
+    };
+    let big_w = rest_w - rail_w;
+
+    if let Some(bi) = big
+        && big_w > 0
+    {
+        full.push(Placement {
+            index: bi,
+            rect: Rect::new(rest_x, area.y, big_w, area.height),
+        });
+    }
+
+    let mut cards = Vec::new();
+    if rail_w > 0 {
+        let rail_rect = Rect::new(rest_x + big_w, area.y, rail_w, area.height);
+        for (slot, rect) in split_1d(rail_rect, card_indices.len(), true)
+            .into_iter()
+            .enumerate()
+        {
+            cards.push(Placement {
+                index: card_indices[slot],
+                rect,
+            });
         }
     }
-    scroll.min(max_scroll)
+    (full, cards)
 }
 
-/// Lay out the filmstrip: the Spine pinned left, then the whole columns that fit
-/// starting at `scroll_x` (in non-spine-column units). A lone non-spine window
-/// letterboxes (centred at its natural width) within the column area. Partially
-/// clipped columns are dropped (the snap-to-whole-column rule).
-///
-/// `n` is the total window count (index 0 = Spine). Returns one [`Placement`]
-/// per *visible* window. Never panics on a tiny viewport — it just places
-/// fewer windows.
-pub fn filmstrip(area: Rect, n: usize, scroll_x: usize) -> Vec<Placement> {
+/// Whether window `idx` renders as a live PTY in the rail right now — i.e. it is
+/// the big pane. Allocation-free, so the poll loop and the AgentOutput repaint
+/// gate can call it every tick. A carded agent returns `false`, so it never pins
+/// the loop at 16 ms (the idle-quiet property). Takes `viewport_width` so it
+/// mirrors [`rail`]'s early return — at a width that leaves no room past the
+/// Spine, nothing is the big pane, so an off-screen agent never pins the loop.
+pub fn rail_visible(
+    n: usize,
+    focus: usize,
+    active_idx: Option<usize>,
+    idx: usize,
+    viewport_width: u16,
+) -> bool {
+    if SPINE_WIDTH.min(viewport_width) >= viewport_width {
+        return false; // no room past the Spine → rail() draws no big pane
+    }
+    rail_big_index(n, focus, active_idx) == Some(idx)
+}
+
+/// Lay out the mosaic: the Spine pinned left, every non-Spine window tiled
+/// near-square in the area to its right (reusing [`split_grid`]) — the
+/// full-attention layout where every coin (including the preview, when it exists)
+/// is live at once. Row-major over `1..n`. There is never a duplicate, because the
+/// preview is suppressed for a selection that already has a pinned coin.
+pub fn mosaic(area: Rect, n: usize) -> Vec<Placement> {
     if n == 0 || area.area() == 0 {
         return Vec::new();
     }
     let mut out = Vec::new();
-
-    // The Spine: fixed width, but never wider than the viewport.
     let spine_w = SPINE_WIDTH.min(area.width);
     out.push(Placement {
         index: 0,
         rect: Rect::new(area.x, area.y, spine_w, area.height),
     });
-    if n == 1 || spine_w >= area.width {
-        return out;
+    if spine_w >= area.width {
+        return out; // only the Spine fits
     }
-
-    let strip_x = area.x + spine_w;
-    let strip_w = area.width - spine_w;
-    let col_w = column_width(area.width).min(strip_w);
-    let cols = (strip_w / col_w.max(1)).max(1) as usize;
-    let non_spine = n - 1;
-
-    // A lone non-spine window letterboxes: centre it at its natural width inside
-    // the whole strip rather than stretching or left-anchoring it.
-    if non_spine == 1 {
-        let w = col_w.min(strip_w);
-        let x = strip_x + (strip_w - w) / 2;
+    let rest = Rect::new(area.x + spine_w, area.y, area.width - spine_w, area.height);
+    for (slot, rect) in split_grid(rest, n - 1).into_iter().enumerate() {
         out.push(Placement {
-            index: 1,
-            rect: Rect::new(x, area.y, w, area.height),
-        });
-        return out;
-    }
-
-    let scroll = scroll_x.min(non_spine.saturating_sub(cols));
-    for slot in 0..cols {
-        let win = 1 + scroll + slot; // window index (skip the Spine)
-        if win >= n {
-            break;
-        }
-        let x = strip_x + (slot as u16) * col_w;
-        // Snap-to-whole-column: only place a column that fits entirely.
-        if x + col_w > strip_x + strip_w {
-            break;
-        }
-        out.push(Placement {
-            index: win,
-            rect: Rect::new(x, area.y, col_w, area.height),
+            index: slot + 1,
+            rect,
         });
     }
     out
 }
 
-/// Lay out the mosaic: every window tiled near-square to fill `area`, row-major
-/// (reusing [`split_grid`]). All `n` windows are placed (none scrolled off).
-pub fn mosaic(area: Rect, n: usize) -> Vec<Placement> {
-    if n == 0 || area.area() == 0 {
-        return Vec::new();
-    }
-    split_grid(area, n)
-        .into_iter()
-        .enumerate()
-        .map(|(index, rect)| Placement { index, rect })
-        .collect()
-}
-
-/// Whether window `idx` is on screen in the filmstrip right now — allocation-
-/// free, so the render loop can poll it every tick to pick its cadence and gate
-/// AgentOutput repaints without materialising the placement list. Keys off the
-/// post-scroll visible set: an idle agent scrolled off-screen is *not* visible,
-/// so it never pins the loop at 16 ms (the idle-quiet property). Mosaic/zoom
-/// visibility is decided by the caller (mosaic shows all; zoom shows focus).
-pub fn filmstrip_visible(n: usize, scroll_x: usize, viewport_width: u16, idx: usize) -> bool {
+/// Whether window `idx` is drawn (and so its PTY is live) in the mosaic right now
+/// — every non-Spine window is, so this just guards the bounds and the cramped-
+/// terminal early return (only the Spine fits at a width ≤ `SPINE_WIDTH`), keeping
+/// the poll-cadence gate in lock-step with the renderer.
+pub fn mosaic_visible(n: usize, idx: usize, viewport_width: u16) -> bool {
     if idx >= n || viewport_width == 0 {
-        return false; // a zero-area strip draws nothing at all
-    }
-    if idx == 0 {
-        return true; // the spine is always on screen (when there's any width)
-    }
-    // Mirror filmstrip(): when the spine fills the whole width (viewport ≤
-    // SPINE_WIDTH) the renderer draws *only* the spine and drops every non-spine
-    // column — so none is visible. Without this, the poll loop would fast-poll
-    // (and AgentOutput would repaint) for an agent that isn't on screen on a very
-    // narrow terminal, defeating the idle-quiet property.
-    if SPINE_WIDTH.min(viewport_width) >= viewport_width {
         return false;
     }
-    let non_spine = n - 1;
-    if non_spine == 1 {
-        return true; // the lone window letterboxes — always visible
+    if idx == 0 {
+        return true; // the Spine is always placed (it's never a live PTY anyway)
     }
-    let cols = visible_columns(viewport_width);
-    let scroll = scroll_x.min(non_spine.saturating_sub(cols));
-    let col = idx - 1;
-    col >= scroll && col < scroll + cols
-}
-
-/// Lay out a single zoomed window filling the whole `area`.
-pub fn zoomed(area: Rect, focus: usize) -> Vec<Placement> {
-    if area.area() == 0 {
-        return Vec::new();
-    }
-    vec![Placement {
-        index: focus,
-        rect: area,
-    }]
+    SPINE_WIDTH.min(viewport_width) < viewport_width // false → too narrow for coins
 }
 
 /// Split `area` into `k` strips along one axis, giving the remainder to the
@@ -255,105 +248,83 @@ mod tests {
     }
 
     #[test]
-    fn column_width_clamps_to_the_readable_band() {
-        // clamp(viewport, 80..=120): a roomy viewport gives the max column…
-        assert_eq!(column_width(200), MAX_COL_WIDTH);
-        assert_eq!(column_width(400), MAX_COL_WIDTH);
-        // …a mid viewport gives the viewport width…
-        assert_eq!(column_width(100), 100);
-        // …and a cramped one floors at the readable minimum (placement then
-        // clamps it to the strip and the lone window letterboxes).
-        assert_eq!(column_width(10), MIN_COL_WIDTH);
+    fn rail_big_index_is_focus_or_preview_when_spine_focused() {
+        // Spine focused (0) → the active window (here index 1) is the big pane.
+        assert_eq!(rail_big_index(3, 0, Some(1)), Some(1));
+        // A non-spine focus is itself the big pane.
+        assert_eq!(rail_big_index(3, 2, Some(1)), Some(2));
+        // Spine focused with no active window → nothing to enlarge.
+        assert_eq!(rail_big_index(1, 0, None), None);
     }
 
     #[test]
-    fn filmstrip_always_places_the_spine_first() {
-        let p = filmstrip(area(), 3, 0);
-        assert_eq!(p[0].index, 0, "the spine leads");
-        assert_eq!(p[0].rect.width, SPINE_WIDTH);
-        assert_eq!(p[0].rect.x, 0);
-    }
-
-    #[test]
-    fn filmstrip_drops_partially_clipped_columns() {
-        // 200 wide → 156 for the strip → one 120-col column fits whole, a second
-        // would be clipped (156 < 240), so only one non-spine column is drawn.
-        let p = filmstrip(area(), 4, 0);
-        let non_spine = p.iter().filter(|pl| pl.index != 0).count();
-        assert_eq!(non_spine, 1, "no partial PTY columns are ever placed");
-        // Every placed column is fully inside the area.
-        for pl in &p {
-            assert!(
-                pl.rect.x + pl.rect.width <= area().x + area().width,
-                "placement {pl:?} spills past the viewport"
-            );
+    fn rail_places_the_spine_then_the_big_pane_then_cards_never_the_preview() {
+        // windows: [Spine, Preview(1), Pin(2), Pin(3)], focus on Pin(2); the
+        // selection is unpinned so active == preview == 1.
+        let (full, cards) = rail(area(), 4, 2, Some(1), Some(1));
+        assert_eq!(full[0].index, 0, "the spine leads");
+        assert_eq!(full[0].rect.width, SPINE_WIDTH);
+        assert_eq!(full[0].rect.x, 0);
+        assert_eq!(full[1].index, 2, "the focused window is the big pane");
+        assert!(
+            full[1].rect.width >= MIN_BIG_WIDTH,
+            "the big pane stays readable"
+        );
+        // Only the OTHER pinned window (3) is a card; the preview (1) is never one.
+        let carded: Vec<usize> = cards.iter().map(|p| p.index).collect();
+        assert_eq!(carded, vec![3], "the preview is never carded");
+        // Cards sit to the right of the big pane, never overlapping it.
+        let big = full[1].rect;
+        for c in &cards {
+            assert!(c.rect.x >= big.x + big.width, "card overlaps the big pane");
+            assert!(c.rect.x + c.rect.width <= area().x + area().width);
         }
     }
 
     #[test]
-    fn a_lone_window_letterboxes_centred() {
-        let p = filmstrip(area(), 2, 0);
-        let win = p.iter().find(|pl| pl.index == 1).expect("the lone window");
-        // Centred in the strip to the right of the spine, not left-anchored.
-        let strip_x = SPINE_WIDTH;
-        let strip_w = 200 - SPINE_WIDTH;
-        let w = column_width(200); // 120
-        assert_eq!(win.rect.width, w);
-        assert_eq!(win.rect.x, strip_x + (strip_w - w) / 2);
+    fn rail_cards_every_pinned_coin_when_the_spine_is_focused() {
+        // Spine focused → the active window (here the preview, 1) is the big pane;
+        // both pins (2,3) card.
+        let (full, cards) = rail(area(), 4, 0, Some(1), Some(1));
+        assert_eq!(full[1].index, 1, "the preview is the big pane");
+        let carded: Vec<usize> = cards.iter().map(|p| p.index).collect();
+        assert_eq!(carded, vec![2, 3]);
     }
 
     #[test]
-    fn scroll_keeps_the_focused_column_in_view() {
-        // Strip fits one 80-col column. Focus on the 3rd non-spine window must
-        // page the scroll so it's the visible column.
-        let vw = 200;
-        let cols = visible_columns(vw);
-        assert_eq!(cols, 1);
-        // Focus right of the window → scroll forward to show it.
-        let s = scroll_offset(0, Some(2), 5, vw);
-        assert_eq!(s, 2, "focus column 2 becomes the (only) visible column");
-        // Focus left of the window → page back.
-        let s = scroll_offset(4, Some(1), 5, vw);
-        assert_eq!(s, 1);
-        // Never scrolls past the last window.
-        let s = scroll_offset(99, None, 5, vw);
-        assert_eq!(s, 5 - cols);
+    fn rail_drops_the_card_column_on_a_narrow_terminal() {
+        // 80 wide → 36 past the spine: not enough for a readable big pane + rail,
+        // so the big pane takes it all and no cards are drawn (still focusable).
+        let (full, cards) = rail(Rect::new(0, 0, 80, 24), 4, 2, Some(1), Some(1));
+        assert_eq!(full.len(), 2, "spine + big pane");
+        assert!(cards.is_empty(), "the rail is dropped when it won't fit");
+        assert_eq!(
+            full[1].rect.width,
+            80 - SPINE_WIDTH,
+            "big pane takes the rest"
+        );
     }
 
     #[test]
-    fn mosaic_places_every_window() {
-        let p = mosaic(area(), 5);
-        assert_eq!(p.len(), 5, "mosaic never drops a window");
-        let idxs: Vec<usize> = p.iter().map(|pl| pl.index).collect();
-        assert_eq!(idxs, vec![0, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn layout_helpers_survive_a_zero_area() {
-        let z = Rect::new(0, 0, 0, 0);
-        assert!(filmstrip(z, 3, 0).is_empty());
-        assert!(mosaic(z, 3).is_empty());
-        assert!(split_grid(z, 3).is_empty());
-        assert!(zoomed(z, 0).is_empty());
-    }
-
-    #[test]
-    fn filmstrip_visible_agrees_with_what_filmstrip_actually_places() {
-        // The poll loop and AgentOutput repaint gate on `filmstrip_visible`; it
-        // must report exactly the windows `filmstrip` draws, or an off-screen
-        // agent would pin the loop at 16 ms (notably at width ≤ SPINE_WIDTH, where
-        // the renderer draws only the spine).
-        for width in [0u16, 1, 10, 30, 43, 44, 45, 80, 124, 165, 200, 320] {
-            for n in 1..=6usize {
-                for scroll in 0..=5usize {
-                    let area = Rect::new(0, 0, width, 24);
-                    let placed: std::collections::HashSet<usize> =
-                        filmstrip(area, n, scroll).iter().map(|p| p.index).collect();
+    fn rail_visible_agrees_with_what_rail_actually_enlarges() {
+        // The poll loop / AgentOutput gate keys off rail_visible; it must report
+        // exactly the one window rail() draws as the big pane (else an off-screen
+        // agent would pin the loop at 16 ms). Sweep widths — including the
+        // ≤ SPINE_WIDTH band where rail() drops the big pane entirely.
+        for width in [0u16, 1, 30, 44, 45, 80, 200] {
+            for n in 1..=5usize {
+                for focus in 0..n {
+                    let preview = (n > 1).then_some(1usize);
+                    let active = preview; // unpinned selection → active == preview
+                    let (full, _cards) =
+                        rail(Rect::new(0, 0, width, 24), n, focus, active, preview);
+                    // The big pane is the one full placement past the Spine (idx 0).
+                    let big = full.iter().map(|p| p.index).find(|&i| i != 0);
                     for idx in 0..n {
                         assert_eq!(
-                            filmstrip_visible(n, scroll, width, idx),
-                            placed.contains(&idx),
-                            "disagreement: width={width} n={n} scroll={scroll} idx={idx}"
+                            rail_visible(n, focus, active, idx, width),
+                            big == Some(idx),
+                            "rail disagreement: width={width} n={n} focus={focus} idx={idx}"
                         );
                     }
                 }
@@ -362,11 +333,89 @@ mod tests {
     }
 
     #[test]
+    fn mosaic_pins_the_spine_left_and_tiles_every_non_spine_window() {
+        // [Spine, Coin(1), Coin(2), Coin(3), Coin(4)] → spine left + 4 tiles. There
+        // is no focus/preview dependence: a duplicate preview is suppressed upstream
+        // (in reaim_preview), so mosaic simply tiles whatever windows exist.
+        let p = mosaic(area(), 5);
+        assert_eq!(p.len(), 5, "the spine + every non-spine window");
+        assert_eq!(p[0].index, 0, "the spine leads");
+        assert_eq!(
+            p[0].rect.width, SPINE_WIDTH,
+            "the spine keeps its fixed width"
+        );
+        let idxs: Vec<usize> = p.iter().map(|pl| pl.index).collect();
+        assert_eq!(idxs, vec![0, 1, 2, 3, 4]);
+        // Every tiled coin sits to the right of the spine.
+        for pl in &p[1..] {
+            assert!(pl.rect.x >= SPINE_WIDTH, "a coin overlaps the spine");
+        }
+    }
+
+    #[test]
+    fn mosaic_visible_agrees_with_what_mosaic_actually_places() {
+        // Sweep widths — including the ≤ SPINE_WIDTH band where mosaic() places
+        // only the Spine — so the poll-cadence gate never fast-polls an agent the
+        // renderer dropped.
+        for width in [0u16, 1, 30, 44, 45, 80, 200] {
+            for n in 1..=5usize {
+                let placed: Vec<usize> = mosaic(Rect::new(0, 0, width, 24), n)
+                    .iter()
+                    .map(|p| p.index)
+                    .collect();
+                for idx in 0..n {
+                    assert_eq!(
+                        mosaic_visible(n, idx, width),
+                        placed.contains(&idx),
+                        "mosaic disagreement: width={width} n={n} idx={idx}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn layout_helpers_survive_a_zero_area() {
+        let z = Rect::new(0, 0, 0, 0);
+        assert_eq!(rail(z, 3, 0, Some(1), Some(1)), (Vec::new(), Vec::new()));
+        assert!(mosaic(z, 3).is_empty());
+        assert!(split_grid(z, 3).is_empty());
+    }
+
+    #[test]
+    fn rail_survives_a_width_at_or_below_the_spine() {
+        // At width ≤ SPINE_WIDTH the renderer draws only the spine and no cards —
+        // so no carded agent is "visible" and the poll loop stays quiet.
+        for w in [1u16, 20, 44] {
+            let (full, cards) = rail(Rect::new(0, 0, w, 24), 4, 2, Some(1), Some(1));
+            assert_eq!(full.len(), 1, "only the spine fits");
+            assert!(cards.is_empty());
+        }
+    }
+
+    #[test]
     fn split_grid_tiles_without_gaps_or_overlaps() {
-        // Four panes on a 200×40 area tile 2×2, covering it exactly.
-        let cells = split_grid(area(), 4);
-        assert_eq!(cells.len(), 4);
-        let covered: u32 = cells.iter().map(|r| r.area()).sum();
-        assert_eq!(covered, area().area(), "the grid tiles the area exactly");
+        // Paint each cell into a per-cell coverage grid and assert every cell is
+        // covered EXACTLY once — the property the name advertises. An area-sum
+        // check can't distinguish a gap from an overlap; this can, and it also
+        // exercises ragged final rows (k = 5, 7) where the risk actually lives.
+        let a = area(); // 200×40
+        let w = a.width as usize;
+        for k in [1usize, 2, 3, 4, 5, 7, 9] {
+            let cells = split_grid(a, k);
+            assert_eq!(cells.len(), k, "k={k}: one rect per pane");
+            let mut cover = vec![0u16; w * a.height as usize];
+            for r in &cells {
+                for y in r.y..r.y + r.height {
+                    for x in r.x..r.x + r.width {
+                        cover[y as usize * w + x as usize] += 1;
+                    }
+                }
+            }
+            assert!(
+                cover.iter().all(|&c| c == 1),
+                "k={k}: every cell covered exactly once — no gaps, no overlaps"
+            );
+        }
     }
 }

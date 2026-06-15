@@ -19,11 +19,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{App, Flash, LeftView};
 use crate::backend::Lifecycle;
 use crate::keymap::Action;
-use crate::layout::{self, Placement};
+use crate::layout;
 use crate::model::{Direction, Graph, Status};
 use crate::session::AgentStatus;
 use crate::theme::{self, *};
-use crate::window::{DepsRoot, DepsSide, LayoutMode, NodeKind, TreeRow, WindowId, WindowKind};
+use crate::window::{CoinMode, DepsSide, LayoutMode, NodeKind, TreeRow, WindowId, WindowKind};
 
 const MAX_TITLE: usize = 64;
 /// Below this inner width a `claude` PTY preview is unreadable, so a window
@@ -47,6 +47,9 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
 
     if app.show_help {
         render_help(app, frame);
+    }
+    if app.show_summary {
+        render_summary(app, frame);
     }
 }
 
@@ -86,13 +89,13 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     }
     // Auto-resume spinner: while docked agents are still coming back, the header
     // breathes a "resuming N…" so the cockpit reads as busy, not stalled.
-    if app.resuming_count > 0 {
+    if app.resuming_count() > 0 {
         spans.push(Span::styled(" · ", Style::new().fg(BORDER)));
         spans.push(Span::styled(
             format!(
                 "{} resuming {}…",
                 theme::agent_spinner(app.frame),
-                app.resuming_count
+                app.resuming_count()
             ),
             Style::new().fg(ORANGE_400).bold(),
         ));
@@ -138,38 +141,153 @@ fn render_strip(app: &mut App, frame: &mut Frame, area: Rect) {
         return;
     }
     let n = app.windows.windows.len();
-    let placements: Vec<Placement> = if app.windows.zoomed {
-        layout::zoomed(area, app.windows.focus)
-    } else {
-        match app.windows.layout {
-            LayoutMode::Filmstrip => layout::filmstrip(area, n, app.windows.scroll_x),
-            LayoutMode::Mosaic => layout::mosaic(area, n),
-        }
-    };
+    let focus = app.windows.focus;
+    // The active window represents the selection (its pinned coin, else the
+    // preview); it's the big pane when the Spine is focused.
+    let active = app.active_index();
+    let preview = app.windows.preview_index();
 
-    for placement in placements {
-        let idx = placement.index;
-        if idx >= app.windows.windows.len() {
-            continue;
-        }
-        let focused = idx == app.windows.focus;
-        // Clone the small per-window facts so the render fns can re-borrow `app`
-        // for the specific field each needs (PTY backend, deps cursor, list).
-        let id = app.windows.windows[idx].id;
-        let pinned = app.windows.windows[idx].pinned;
-        let kind = app.windows.windows[idx].kind.clone();
-        match kind {
-            WindowKind::Spine => render_spine(app, frame, placement.rect, focused),
-            WindowKind::Agent(issue) => {
-                render_agent_window(app, frame, placement.rect, id, &issue, focused, pinned)
-            }
-            WindowKind::Deps(DepsRoot::Issue) => {
-                render_deps_window(app, frame, placement.rect, idx, focused, pinned)
-            }
-            WindowKind::Deps(DepsRoot::Fleet) => {
-                render_fleet_window(app, frame, placement.rect, focused, pinned)
+    // Zoom: the big pane fills the whole viewport (hiding the Spine and the rail).
+    if app.windows.zoomed {
+        let big = layout::rail_big_index(n, focus, active).unwrap_or(focus);
+        render_window_at(app, frame, area, big);
+        return;
+    }
+
+    match app.windows.layout {
+        // Mosaic: the Spine pinned left, every non-spine window tiled live in the rest.
+        LayoutMode::Mosaic => {
+            for p in layout::mosaic(area, n) {
+                render_window_at(app, frame, p.rect, p.index);
             }
         }
+        // Rail: the Spine, one big pane (focused window, or the active window when
+        // the Spine is focused), and a column of compact text cards for every other
+        // docked window (never the preview).
+        LayoutMode::Rail => {
+            let (full, cards) = layout::rail(area, n, focus, active, preview);
+            for p in full {
+                render_window_at(app, frame, p.rect, p.index);
+            }
+            for p in cards {
+                render_card(app, frame, p.rect, p.index);
+            }
+        }
+    }
+}
+
+/// Render the window at `idx` as a full pane (the Spine, a live PTY screen, or a
+/// dependency body) into `rect`. Used for the rail's big pane, every mosaic tile,
+/// and the zoomed pane.
+fn render_window_at(app: &mut App, frame: &mut Frame, rect: Rect, idx: usize) {
+    if idx >= app.windows.windows.len() {
+        return;
+    }
+    let focused = idx == app.windows.focus;
+    // Clone the small per-window facts so the render fns can re-borrow `app` for
+    // the specific field each needs (PTY backend, deps cursor, list).
+    let id = app.windows.windows[idx].id;
+    let pinned = app.windows.windows[idx].pinned;
+    let kind = app.windows.windows[idx].kind.clone();
+    match kind {
+        WindowKind::Spine => render_spine(app, frame, rect, focused),
+        // A coin renders its current face; `pinned` is the window's real pin flag,
+        // so the preview (unpinned) shows no pin chip and reads as transient.
+        WindowKind::Coin {
+            issue,
+            mode: CoinMode::Chat,
+        } => render_agent_window(app, frame, rect, id, &issue, focused, pinned),
+        WindowKind::Coin {
+            mode: CoinMode::Deps,
+            ..
+        } => render_deps_window(app, frame, rect, idx, focused, pinned),
+        WindowKind::Fleet => render_fleet_window(app, frame, rect, focused, pinned),
+    }
+}
+
+/// Render a compact, text-only status card for a rail window — never a live PTY,
+/// so the rail sidesteps tui-term's horizontal-clipping limit and a carded agent
+/// never forces a fast poll (idle-quiet). A card is never the focused window (the
+/// focused window is always the big pane), so it always paints in its status hue.
+fn render_card(app: &App, frame: &mut Frame, rect: Rect, idx: usize) {
+    if rect.area() == 0 {
+        return;
+    }
+    let w = &app.windows.windows[idx];
+    let pinned = w.pinned;
+    let (mut title, hue, breathe, body): (Vec<Span<'static>>, Color, bool, String) = match &w.kind {
+        WindowKind::Coin {
+            issue,
+            mode: CoinMode::Chat,
+        } => {
+            let status = app.fleet.get(issue).copied();
+            let exited = app
+                .backends
+                .get(issue)
+                .is_some_and(|b| matches!(b.status(), Lifecycle::Exited(_)));
+            let (hue, label) = theme::window_status_hue(status, exited);
+            let (mark, mstyle) = match status {
+                Some(s) => theme::agent_marker(s, app.frame),
+                None => ("○", Style::new().fg(hue)),
+            };
+            let key = app
+                .graph
+                .get(issue)
+                .map_or(issue.as_str(), |i| i.key.as_str());
+            (
+                vec![
+                    Span::raw(" "),
+                    Span::styled(mark, mstyle),
+                    Span::styled(format!(" {key} "), Style::new().fg(INK).bold()),
+                ],
+                hue,
+                status == Some(AgentStatus::NeedsYou),
+                label.to_string(),
+            )
+        }
+        WindowKind::Coin {
+            issue,
+            mode: CoinMode::Deps,
+        } => {
+            // The current exploration root (re-rooting moves it), else the coin's
+            // identity.
+            let root = w
+                .deps
+                .as_ref()
+                .map(|c| c.root.clone())
+                .unwrap_or_else(|| issue.clone());
+            (
+                vec![
+                    Span::styled(" ◆ ", Style::new().fg(GREEN_500)),
+                    Span::styled(format!("{root} "), Style::new().fg(INK).bold()),
+                ],
+                GREEN_500,
+                false,
+                "deps".to_string(),
+            )
+        }
+        WindowKind::Fleet => (
+            vec![Span::styled(" GRAPH ", Style::new().fg(GREEN_100).bold())],
+            GREEN_500,
+            false,
+            "overview".to_string(),
+        ),
+        WindowKind::Spine => return, // the Spine is never carded
+    };
+    if pinned {
+        title.push(Span::styled("⊙ ", Style::new().fg(ORANGE_400)));
+    }
+    let block = window_block(Line::from(title), false, hue, breathe, app.frame);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.area() > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {body}"),
+                Style::new().fg(hue),
+            ))),
+            inner,
+        );
     }
 }
 
@@ -673,27 +791,68 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
 /// focused window's kind.
 fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
     let p = app.prefix_label();
+    // Remap-driven, like render_help (plan §3 Phase 2: "kills the hints lie") — the
+    // shown keys are read live from the keymap so a rebind can't make the footer
+    // contradict reality. `vk` = a bare verb key (the prefix is already implied);
+    // `dk` = the direct key(s). Only pure-motion glyphs (↑↓ ←→ ⏎ space) stay
+    // iconic; the help overlay is the authoritative per-binding reference.
+    let vk = |a| app.keymap.verb_key_label(a);
+    let dk = |a| app.keymap.label_for(a);
     let text: String = if app.search_active {
         " type to filter · ⏎ accept · esc clear".to_string()
     } else if app.kill_confirm.is_some() {
         " y / ⏎ confirm kill · any other key cancels".to_string()
     } else if app.prefix_armed {
         format!(
-            " {p} armed: ←→ focus · z zoom · p pin · w close · x kill · | layout · q quit · ? help · {p} again → agent"
+            " {p} armed: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} rail/mosaic · {} quit · {} help · {p} again → agent",
+            vk(Action::ContextToggle),
+            vk(Action::ZoomToggle),
+            vk(Action::PinWindow),
+            vk(Action::CloseWindow),
+            vk(Action::KillWindow),
+            vk(Action::LayoutToggle),
+            vk(Action::Quit),
+            vk(Action::ToggleHelp),
         )
     } else {
         match app.windows.focused_kind() {
-            WindowKind::Agent(_) => {
-                format!(" keys → agent · {p} to escape · {p} ←→ focus · {p} w close · {p} x kill")
-            }
-            WindowKind::Deps(DepsRoot::Issue) => format!(
-                " ↑↓ move · ←→ side · ⏎ re-root · space collapse · b back · {p} ←→ focus · {p} w close · ? help"
+            WindowKind::Coin {
+                mode: CoinMode::Chat,
+                ..
+            } => format!(
+                " keys → agent · {p} escape · {p} {} chat/deps · {p} {} nav · {p} {} close · {p} {} kill",
+                vk(Action::ContextToggle),
+                vk(Action::FocusNav),
+                vk(Action::CloseWindow),
+                vk(Action::KillWindow),
             ),
-            WindowKind::Deps(DepsRoot::Fleet) => {
-                format!(" the project map · {p} ←→ focus · {p} w close · ? help")
-            }
+            WindowKind::Coin {
+                mode: CoinMode::Deps,
+                ..
+            } => format!(
+                " ↑↓ move · ←→ side · ⏎ re-root · space collapse · {} back · {} chat/deps · {p} {} nav · {} help",
+                dk(Action::Back),
+                dk(Action::ContextToggle),
+                vk(Action::FocusNav),
+                dk(Action::ToggleHelp),
+            ),
+            WindowKind::Fleet => format!(
+                " the project map · {p} {} nav · {p} {} close · {} help",
+                vk(Action::FocusNav),
+                vk(Action::CloseWindow),
+                dk(Action::ToggleHelp),
+            ),
             WindowKind::Spine => format!(
-                " ↑↓ move · ⏎ open agent · d deps · g map · r roster · n needs-you · / find · f filter · {p} q quit · ? help"
+                " ↑↓ move · ⏎ open agent · {} chat/deps · {} deps · {} map · {} roster · {} needs-you · {} find · {} summary · {p} {} quit · {} help",
+                dk(Action::ContextToggle),
+                dk(Action::OpenDeps),
+                dk(Action::OpenFleet),
+                dk(Action::ToggleRoster),
+                dk(Action::JumpNeedsYou),
+                dk(Action::StartSearch),
+                dk(Action::ToggleSummary),
+                vk(Action::Quit),
+                dk(Action::ToggleHelp),
             ),
         }
     };
@@ -716,15 +875,19 @@ fn render_help(app: &App, frame: &mut Frame) {
         ),
         (
             direct(Action::Enter),
-            "open / focus an agent on the selection",
+            "open / focus an agent on the selection (active window → chat)",
+        ),
+        (
+            direct(Action::ContextToggle),
+            "flip the active window: chat ↔ deps (Ctrl-a Tab in a chat)",
         ),
         (
             direct(Action::OpenDeps),
-            "open a dependency window for the selection",
+            "dive into the active window's dependency tree",
         ),
         (
             direct(Action::OpenFleet),
-            "open the project overview (Fleet) window",
+            "open the project overview (Fleet) tab",
         ),
         (
             direct(Action::ToggleRoster),
@@ -733,6 +896,10 @@ fn render_help(app: &App, frame: &mut Frame) {
         (
             direct(Action::StartSearch),
             "fuzzy-find issues by id or title",
+        ),
+        (
+            direct(Action::ToggleSummary),
+            "summary overlay for the selected issue (any key closes)",
         ),
         (
             format!(
@@ -766,6 +933,7 @@ fn render_help(app: &App, frame: &mut Frame) {
             format!("{} {}", verb(Action::FocusLeft), verb(Action::FocusRight)),
             "focus the window left / right",
         ),
+        (verb(Action::FocusNav), "jump focus home to the nav (spine)"),
         (
             verb(Action::AttachOrSpawn),
             "open / focus an agent (from any window)",
@@ -776,17 +944,20 @@ fn render_help(app: &App, frame: &mut Frame) {
         ),
         (
             verb(Action::PinWindow),
-            "pin / unpin the focused window (persists)",
+            "pin = graduate the preview coin to a permanent tab",
         ),
         (
             verb(Action::CloseWindow),
-            "close = undock (an agent keeps running)",
+            "close = undock a tab (an agent keeps running)",
         ),
         (
             verb(Action::KillWindow),
             "kill the focused agent (confirmed)",
         ),
-        (verb(Action::LayoutToggle), "toggle filmstrip ⇄ mosaic"),
+        (
+            verb(Action::LayoutToggle),
+            "force rail ⇄ mosaic (auto by coin count)",
+        ),
         (verb(Action::Quit), "quit the cockpit"),
     ];
 
@@ -821,6 +992,104 @@ fn render_help(app: &App, frame: &mut Frame) {
         .border_style(Style::new().fg(GREEN_600))
         .title(Line::from(Span::styled(
             " lindep ",
+            Style::new().fg(GREEN_500).bold(),
+        )));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The issue-summary overlay (`i`): a dismissable, at-a-glance card for the
+/// selected (or focused) issue — its status/priority/assignee/team, blocked/cycle
+/// flags, and its direct blockers + blocked work with their statuses. Pure read of
+/// the local graph; no network. Any key closes it (see `App::on_key`).
+fn render_summary(app: &App, frame: &mut Frame) {
+    let Some(key) = app.detail_key() else {
+        return;
+    };
+    let g = &app.graph;
+    let Some(issue) = g.get(key) else {
+        return;
+    };
+
+    let (glyph, color) = theme::status_glyph(issue.status);
+    let (pmark, pcolor) = theme::priority_marker(issue.priority);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!(" {glyph} "), Style::new().fg(color)),
+            Span::styled(format!("{} ", issue.key), Style::new().fg(INK).bold()),
+            Span::styled(status_label(issue.status), Style::new().fg(color)),
+            Span::styled(format!("   {pmark}"), Style::new().fg(pcolor)),
+        ]),
+        Line::from(Span::styled(
+            format!("  {}", issue.title),
+            Style::new().fg(GREEN_100).bold(),
+        )),
+        Line::raw(""),
+    ];
+    let mut meta = vec![Span::styled(
+        format!("  team {}", issue.team()),
+        Style::new().fg(MUTED),
+    )];
+    if let Some(a) = &issue.assignee {
+        meta.push(Span::styled(format!("  · @{a}"), Style::new().fg(MUTED)));
+    }
+    if g.is_blocked(key) {
+        meta.push(Span::styled("  · ⊘ blocked", Style::new().fg(AMBER_400)));
+    }
+    if g.in_cycle(key) {
+        meta.push(Span::styled("  · ↺ in cycle", Style::new().fg(AMBER_400)));
+    }
+    lines.push(Line::from(meta));
+    lines.push(Line::raw(""));
+
+    for (dir, label, empty) in [
+        (
+            Direction::Upstream,
+            "▲ BLOCKED BY",
+            "✓ nothing — ready to start",
+        ),
+        (
+            Direction::Downstream,
+            "▼ BLOCKS",
+            "· blocks nothing downstream",
+        ),
+    ] {
+        let (direct, total) = (g.direct_count(key, dir), g.transitive(key, dir));
+        lines.push(Line::from(Span::styled(
+            format!(" {label}  ({direct} direct · {total} total)"),
+            Style::new().fg(GREEN_400).bold(),
+        )));
+        let neighbours = g.neighbours(key, dir);
+        if neighbours.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("   {empty}"),
+                Style::new().fg(MUTED).italic(),
+            )));
+        } else {
+            for nk in neighbours {
+                let (ng, nc) = status_for(g, nk);
+                let mut spans = vec![
+                    Span::styled(format!("   {ng} "), Style::new().fg(nc)),
+                    Span::styled(format!("{nk:<10} "), Style::new().fg(INK).bold()),
+                ];
+                if let Some(ni) = g.get(nk) {
+                    spans.push(Span::styled(
+                        truncate(&ni.title, 44),
+                        Style::new().fg(MUTED),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+
+    let area = centered_rect(78, lines.len() as u16 + 2, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(GREEN_600))
+        .title(Line::from(Span::styled(
+            " issue summary · any key to close ",
             Style::new().fg(GREEN_500).bold(),
         )));
     frame.render_widget(Paragraph::new(lines).block(block), area);

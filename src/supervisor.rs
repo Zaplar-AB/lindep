@@ -366,104 +366,155 @@ async fn supervise(task: &AgentTask) {
         return notify(format!("hook settings for {} failed: {e}", task.issue));
     }
 
-    let mut spawn_cfg = SpawnConfig::claude(
-        &task.issue,
-        worktree.path,
-        &session_id,
-        resume,
-        task.rows,
-        task.cols,
-    )
-    .arg("--settings")
-    .arg(settings.to_string_lossy().to_string());
-    for guardrail in &task.guardrails {
-        spawn_cfg = spawn_cfg.arg(guardrail);
-    }
-
-    let backend = match (task.spawn)(spawn_cfg, task.events.clone()) {
-        Ok(backend) => backend,
-        Err(e) => return notify(format!("spawning agent for {} failed: {e}", task.issue)),
-    };
-    let _ = task.events.send(AppEvent::AgentSpawned {
-        issue: task.issue.clone(),
-        backend: Arc::clone(&backend),
-    });
-
-    // The process is up, so leave Spawning immediately — otherwise a healthy but
-    // quiet agent (thinking/streaming before its first PostToolUse) would show
-    // `◌ spawning` forever, indistinguishable from a wedged spawn. The hook bus
-    // refines this to NeedsYou/Idle once it has something to report.
-    crate::session::mutate_and_persist(&task.store, &task.events, |store| {
-        store.set_status(&task.issue, AgentStatus::Running);
-    })
-    .await;
-    let _ = task.events.send(AppEvent::AgentStatusChanged {
-        issue: task.issue.clone(),
-        status: AgentStatus::Running,
-    });
-
-    // Run until the user cancels or the agent exits on its own.
-    let exit = backend.exit_notify();
-    let cancelled = tokio::select! {
-        () = task.token.cancelled() => true,
-        () = exit.notified() => false,
-    };
-
-    // Snapshot the ground-truth lifecycle *before* we signal anything, so the
-    // verdict below reflects what the process actually did rather than what our
-    // teardown left behind. On a self-exit the wait thread has already recorded
-    // `Exited(code)` before waking us; on a cancel this is `Running` unless the
-    // process beat us to it (both select! arms ready) — in which case it carries
-    // the real exit code, so a crash racing the cancel isn't laundered into Idle.
-    //
-    // One sub-microsecond window is knowingly left open: the wait thread sets
-    // `reaped` *before* it writes `Exited` (so the killpg gate is conservative —
-    // see backend::signal_group), so a cancel that reads `status()` in between
-    // sees `Running` and grades a just-crashed agent `Stopped` rather than
-    // `Failed`. Closing it would require writing `Exited` before `reaped`, which
-    // trades a cosmetic mis-grade for a real recycled-pid-signal hazard — not a
-    // good trade, so the window stays.
-    let pre_shutdown = backend.status();
-
-    if cancelled {
-        backend.shutdown(); // SIGTERM the process group
-        // Confirm death; escalate to SIGKILL if the agent ignores SIGTERM, so a
-        // process group never outlives the cockpit. We poll the *monotonic*
-        // lifecycle rather than awaiting `exit.notified()` again: the wait thread
-        // fires its one permit only once, and the select! above may already have
-        // consumed it (a self-exit racing the cancel), which would leave a second
-        // `notified()` to hang for the whole grace window.
-        if !await_exit(backend.as_ref()).await {
-            backend.force_kill();
-            await_exit(backend.as_ref()).await;
+    // A `--resume` whose saved conversation has vanished ("No conversation found")
+    // exits fast and non-zero; retry ONCE with a fresh `--session-id` (the
+    // deterministic id recreates cleanly) rather than looping on the dead session.
+    let mut resume = resume;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let mut spawn_cfg = SpawnConfig::claude(
+            &task.issue,
+            worktree.path.clone(),
+            &session_id,
+            resume,
+            task.rows,
+            task.cols,
+        )
+        .arg("--settings")
+        .arg(settings.to_string_lossy().to_string());
+        for guardrail in &task.guardrails {
+            spawn_cfg = spawn_cfg.arg(guardrail);
         }
-    } else {
-        backend.shutdown(); // already exited; idempotent
-    }
 
-    // The agent task is the sole authority on post-mortem status, graded off the
-    // pre-teardown snapshot so our own SIGTERM/SIGKILL can't recolour the verdict.
-    // A self-exit is graded by its exit code (Done/Failed). A deliberate cancel of
-    // a still-running process is Stopped — dead but resumable — but a cancel that
-    // lost the race to the process's own exit honours the real exit code, so a
-    // non-zero crash reads Failed, never a laundered Stopped. Stopped is distinct
-    // from Idle (resting *but still up*), so the header stops counting a cancelled
-    // agent as live the instant you stop it. (The backend's own AgentExited event
-    // only drives the footer + frees the render handle.)
-    let status = match pre_shutdown {
-        // Still alive when we cancelled: we killed it — a clean, resumable stop.
-        Lifecycle::Running => AgentStatus::Stopped,
-        Lifecycle::Exited(Some(0)) | Lifecycle::Exited(None) => AgentStatus::Done,
-        Lifecycle::Exited(Some(_)) => AgentStatus::Failed,
-    };
-    crate::session::mutate_and_persist(&task.store, &task.events, |store| {
-        store.set_status(&task.issue, status);
-    })
-    .await;
-    let _ = task.events.send(AppEvent::AgentStatusChanged {
-        issue: task.issue.clone(),
-        status,
-    });
+        let backend = match (task.spawn)(spawn_cfg, task.events.clone()) {
+            Ok(backend) => backend,
+            Err(e) => return notify(format!("spawning agent for {} failed: {e}", task.issue)),
+        };
+        let _ = task.events.send(AppEvent::AgentSpawned {
+            issue: task.issue.clone(),
+            backend: Arc::clone(&backend),
+        });
+
+        // The process is up, so leave Spawning immediately — otherwise a healthy but
+        // quiet agent (thinking/streaming before its first PostToolUse) would show
+        // `◌ spawning` forever, indistinguishable from a wedged spawn. The hook bus
+        // refines this to NeedsYou/Idle once it has something to report.
+        crate::session::mutate_and_persist(&task.store, &task.events, |store| {
+            store.set_status(&task.issue, AgentStatus::Running);
+        })
+        .await;
+        let _ = task.events.send(AppEvent::AgentStatusChanged {
+            issue: task.issue.clone(),
+            status: AgentStatus::Running,
+        });
+
+        // Run until the user cancels or the agent exits on its own.
+        let exit = backend.exit_notify();
+        let cancelled = tokio::select! {
+            () = task.token.cancelled() => true,
+            () = exit.notified() => false,
+        };
+
+        // Snapshot the ground-truth lifecycle *before* we signal anything, so the
+        // verdict below reflects what the process actually did rather than what our
+        // teardown left behind. On a self-exit the wait thread has already recorded
+        // `Exited(code)` before waking us; on a cancel this is `Running` unless the
+        // process beat us to it (both select! arms ready) — in which case it carries
+        // the real exit code, so a crash racing the cancel isn't laundered into Idle.
+        //
+        // One sub-microsecond window is knowingly left open: the wait thread sets
+        // `reaped` *before* it writes `Exited` (so the killpg gate is conservative —
+        // see backend::signal_group), so a cancel that reads `status()` in between
+        // sees `Running` and grades a just-crashed agent `Stopped` rather than
+        // `Failed`. Closing it would require writing `Exited` before `reaped`, which
+        // trades a cosmetic mis-grade for a real recycled-pid-signal hazard — not a
+        // good trade, so the window stays.
+        let pre_shutdown = backend.status();
+
+        if cancelled {
+            backend.shutdown(); // SIGTERM the process group
+            // Confirm death; escalate to SIGKILL if the agent ignores SIGTERM, so a
+            // process group never outlives the cockpit. We poll the *monotonic*
+            // lifecycle rather than awaiting `exit.notified()` again: the wait thread
+            // fires its one permit only once, and the select! above may already have
+            // consumed it (a self-exit racing the cancel), which would leave a second
+            // `notified()` to hang for the whole grace window.
+            if !await_exit(backend.as_ref()).await {
+                backend.force_kill();
+                await_exit(backend.as_ref()).await;
+            }
+        } else {
+            backend.shutdown(); // already exited; idempotent
+        }
+
+        // A `--resume` that found no saved conversation self-exits non-zero with
+        // claude's "No conversation found" banner. Relaunch once, fresh, before this
+        // gets graded Failed (which would tombstone the issue and strand it in a loop
+        // that keeps re-resuming the same missing session).
+        if !cancelled
+            && resume
+            && attempt == 1
+            && matches!(pre_shutdown, Lifecycle::Exited(Some(code)) if code != 0)
+            && missing_conversation(backend.as_ref()).await
+        {
+            resume = false;
+            notify(format!(
+                "{}: saved conversation gone — starting a fresh session",
+                task.issue
+            ));
+            continue;
+        }
+
+        // The agent task is the sole authority on post-mortem status, graded off the
+        // pre-teardown snapshot so our own SIGTERM/SIGKILL can't recolour the verdict.
+        // A self-exit is graded by its exit code (Done/Failed). A deliberate cancel of
+        // a still-running process is Stopped — dead but resumable — but a cancel that
+        // lost the race to the process's own exit honours the real exit code, so a
+        // non-zero crash reads Failed, never a laundered Stopped. Stopped is distinct
+        // from Idle (resting *but still up*), so the header stops counting a cancelled
+        // agent as live the instant you stop it. (The backend's own AgentExited event
+        // only drives the footer + frees the render handle.)
+        let status = match pre_shutdown {
+            // Still alive when we cancelled: we killed it — a clean, resumable stop.
+            Lifecycle::Running => AgentStatus::Stopped,
+            Lifecycle::Exited(Some(0)) | Lifecycle::Exited(None) => AgentStatus::Done,
+            Lifecycle::Exited(Some(_)) => AgentStatus::Failed,
+        };
+        crate::session::mutate_and_persist(&task.store, &task.events, |store| {
+            store.set_status(&task.issue, status);
+        })
+        .await;
+        let _ = task.events.send(AppEvent::AgentStatusChanged {
+            issue: task.issue.clone(),
+            status,
+        });
+        break;
+    }
+}
+
+/// Whether the agent's screen shows claude's "No conversation found" banner — the
+/// failure mode of `--resume <id>` when that conversation has been deleted. Polled
+/// for up to ~1 s because the wait thread can fire the exit notify before the read
+/// pump has drained the final banner into the parser; the generous window keeps the
+/// retry-fresh decision robust even under load (a false negative just degrades to
+/// the pre-fix behaviour — graded Failed, relaunchable). Returns early the moment
+/// the banner appears. Cheap: only called once, on a resume launch's own non-zero
+/// exit. A false positive is implausible (the exact phrase only appears on this
+/// failure), so a fresh session is never started over a live conversation.
+async fn missing_conversation(backend: &dyn AgentBackend) -> bool {
+    for _ in 0..20 {
+        let seen = backend
+            .parser()
+            .read()
+            .map(|p| p.screen().contents().contains("No conversation found"))
+            .unwrap_or(false);
+        if seen {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
 }
 
 /// Wait up to [`KILL_GRACE`] for the agent's process to be confirmed gone,
