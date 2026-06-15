@@ -954,9 +954,6 @@ impl App {
         for issue in targets.into_iter().take(eager) {
             self.resume_one(&issue);
         }
-        if self.resuming_count > 0 {
-            self.resume_deadline = self.frame + RESUME_GRACE_FRAMES;
-        }
     }
 
     /// Lazy-resume the focused window if it's a docked agent that was live before
@@ -994,6 +991,10 @@ impl App {
         supervisor.launch(issue.to_string(), title);
         self.pending_launch.insert(issue.to_string());
         self.resuming_count += 1;
+        // (Re)arm the grace from this resume, so a lazily-resumed agent (focused
+        // long after the eager batch) shows its spinner and is still bounded —
+        // the spinner can't pin the loop awake past the grace, eager or lazy.
+        self.resume_deadline = self.frame + RESUME_GRACE_FRAMES;
     }
 
     // ── Background events ───────────────────────────────────────────────────────
