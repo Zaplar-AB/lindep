@@ -17,6 +17,13 @@ use crate::model::{Direction, Graph, Issue};
 use crate::session::AgentStatus;
 use crate::supervisor::SupervisorHandle;
 
+/// How many animation frames a node flash lasts (~400 ms at the 100 ms tick).
+const FLASH_FRAMES: u64 = 4;
+
+/// Most chat panes shown at once on the chat wall — below ~a handful of rows a
+/// `claude` PTY preview is unreadable, so we cap rather than slice it thinner.
+const MAX_CHAT_PANES: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     List,
@@ -28,6 +35,24 @@ pub enum Pane {
 pub enum Mode {
     Lens,
     Overview,
+}
+
+/// What fills the right half of the lens: the dependency trees, or the live
+/// agent chats. Toggled with the `chat` key; the left issue list (the
+/// navigation spine) stays put either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightView {
+    Deps,
+    Chat,
+}
+
+/// A brief, self-extinguishing highlight on an issue's node — the "juice" that
+/// makes a launch or a finish register. Lives for a few animation frames then
+/// expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flash {
+    Launched,
+    Finished,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,9 +162,28 @@ pub struct App {
     /// The issue whose PTY the cockpit is currently attached to (`None` = the
     /// dashboard). While attached, all input is forwarded to that agent.
     pub attached: Option<String>,
-    /// Size (rows, cols) the attached agent was last resized to, so we only
-    /// push a resize when the pane actually changes.
-    pub attached_size: Option<(u16, u16)>,
+    /// Last (rows, cols) each agent's PTY was resized to, keyed by issue — for
+    /// both the full-screen attach pane and the smaller chat-preview panes. We
+    /// reflow a `claude` only when *its* geometry actually changes, so browsing
+    /// the chat wall doesn't churn SIGWINCHes.
+    pub preview_size: HashMap<String, (u16, u16)>,
+    /// Which widget fills the right half of the lens (deps trees vs agent chats).
+    pub right_view: RightView,
+    /// Issues whose chat is pinned to the chat wall — kept visible while you
+    /// browse other issues. Ordered (a `Vec`, not a set) so pins stay put.
+    pub pinned: Vec<String>,
+    /// An issue whose agent we just launched and are waiting to come up, so the
+    /// footer can nudge "ready · t to attach" the moment it spawns. Never an
+    /// auto-takeover — launch is async and a surprise full-screen would jar.
+    pub pending_attach: Option<String>,
+    /// Monotonic animation tick, advanced by the render loop only while
+    /// something is animating. The renderer reads it to drive spinners/pulses;
+    /// it never reads a clock, so `ui::draw` stays a pure function of state.
+    pub frame: u64,
+    /// Transient per-issue node flashes: issue → (kind, frame it expires at).
+    /// Written in `apply_event`, pruned each animation tick ([`App::tick_frame`])
+    /// once expired; read by the renderer (which also gates on the expiry frame).
+    pub flash: HashMap<String, (Flash, u64)>,
     /// While attached with a leader-sequence detach key, the leader chord that's
     /// been pressed and is awaiting its completion (e.g. `Ctrl-A`, waiting for
     /// `d`). `None` the rest of the time.
@@ -191,7 +235,12 @@ impl App {
             fleet: HashMap::new(),
             backends: HashMap::new(),
             attached: None,
-            attached_size: None,
+            preview_size: HashMap::new(),
+            right_view: RightView::Deps,
+            pinned: Vec::new(),
+            pending_attach: None,
+            frame: 0,
+            flash: HashMap::new(),
             pending_leader: None,
             supervisor: None,
             keymap: Keymap::default(),
@@ -252,13 +301,25 @@ impl App {
     }
 
     fn sync_list_selection(&mut self) {
-        if self.order.is_empty() {
-            self.list_state.select(None);
-        } else if let Some(i) = self.order.iter().position(|k| *k == self.root) {
+        if let Some(i) = self.order.iter().position(|k| *k == self.root) {
             self.list_state.select(Some(i));
         } else {
-            self.list_state.select(Some(0));
+            // The root isn't in the visible list — either the list is empty, or a
+            // jump (n / c / ] / enter / back) landed on an issue the active
+            // filter/search hides. Show NO highlight rather than lighting up an
+            // unrelated row: the lens describes the root, the list honestly shows
+            // nothing selected. (A filter/search *change* re-aims the root into
+            // the list first, in `rebuild_order`, so it never reaches here.)
+            self.list_state.select(None);
         }
+    }
+
+    /// Whether the focused root is absent from the visible list (hidden by the
+    /// active filter/search), so the list intentionally shows no highlight. Lets
+    /// a jump explain itself instead of leaving the user staring at a blank
+    /// selection.
+    fn root_is_hidden(&self) -> bool {
+        !self.order.is_empty() && !self.order.contains(&self.root)
     }
 
     // ── Tree (lens) construction ───────────────────────────────────────────
@@ -486,9 +547,11 @@ impl App {
             Some(i) => (i + 1) % members.len(),
             None => 0,
         };
-        let key = members[next].clone();
-        self.status_msg = Some(format!("cycle {}/{} — {}", next + 1, members.len(), key));
-        self.set_root(key, true);
+        let (key, n, total) = (members[next].clone(), next + 1, members.len());
+        // Re-root first, then describe where we landed — so the "hidden by
+        // filter" note reflects the new root's visibility, not the old one's.
+        self.set_root(key.clone(), true);
+        self.status_msg = Some(format!("cycle {n}/{total} — {key}{}", self.hidden_note()));
     }
 
     /// Jump to the next issue whose agent needs you, in display order, wrapping
@@ -510,9 +573,12 @@ impl App {
             Some(i) => (i + 1) % members.len(),
             None => 0,
         };
-        let key = members[next].clone();
-        self.status_msg = Some(format!("needs you {}/{} — {key}", next + 1, members.len()));
-        self.set_root(key, true);
+        let (key, n, total) = (members[next].clone(), next + 1, members.len());
+        self.set_root(key.clone(), true);
+        self.status_msg = Some(format!(
+            "needs you {n}/{total} — {key}{}",
+            self.hidden_note()
+        ));
     }
 
     // ── Key handling ─────────────────────────────────────────────────────────
@@ -590,6 +656,15 @@ impl App {
             Action::Attach => self.attach(),
             // Only meaningful while attached (handled in on_attached_key).
             Action::Detach => {}
+            Action::ToggleChat => {
+                self.right_view = match self.right_view {
+                    RightView::Deps => RightView::Chat,
+                    RightView::Chat => RightView::Deps,
+                };
+            }
+            Action::TogglePin => self.toggle_pin_current(),
+            Action::CycleChat => self.cycle_chat(1),
+            Action::CycleChatBack => self.cycle_chat(-1),
             Action::CycleFilter => {
                 self.filter = self.filter.next();
                 self.rebuild_order();
@@ -625,37 +700,79 @@ impl App {
             AppEvent::AgentSpawned { issue, backend } => {
                 self.fleet.insert(issue.clone(), AgentStatus::Spawning);
                 self.backends.insert(issue.clone(), backend);
-                self.status_msg = Some(format!("agent launched on {issue} — t to attach"));
+                self.flash
+                    .insert(issue.clone(), (Flash::Launched, self.frame + FLASH_FRAMES));
+                // If `a` was waiting on this launch, surface the attach nudge now
+                // its terminal is live, and clear the wait.
+                self.status_msg = if self.pending_attach.as_deref() == Some(issue.as_str()) {
+                    self.pending_attach = None;
+                    let t = self.keymap.label_for(Action::Attach);
+                    Some(format!("agent on {issue} ready · {t} to attach"))
+                } else {
+                    let t = self.keymap.label_for(Action::Attach);
+                    Some(format!("agent launched on {issue} · {t} to attach"))
+                };
                 true
             }
-            // Repaint only when the output belongs to the agent we're attached
-            // to; off-screen agents' output changes nothing visible.
-            AppEvent::AgentOutput { issue } => self.attached.as_deref() == Some(issue.as_str()),
+            // Repaint when the output belongs to an agent whose screen is on
+            // screen right now — attached, or showing as a chat pane. Off-screen
+            // output changes nothing visible, so an idle/closed chat never
+            // busy-repaints.
+            AppEvent::AgentOutput { issue } => self.is_chat_visible(&issue),
             AppEvent::AgentExited { issue, code } => {
                 // The supervisor's agent task is authoritative for fleet status
-                // (via AgentStatusChanged) — a cancel reads as Idle, a self-exit
-                // as Done/Failed. Here we only surface a footer line and reclaim
-                // the render handle now the PTY is gone, unless the user is still
-                // attached and looking at its final screen.
+                // (via AgentStatusChanged) — a cancel reads as Stopped, a
+                // self-exit as Done/Failed. Here we only surface a footer line and
+                // reclaim the render handle now the PTY is gone, unless the user
+                // is still attached and looking at its final screen.
                 self.status_msg = Some(match code {
                     Some(0) | None => format!("agent on {issue} finished"),
                     Some(c) => format!("agent on {issue} exited ({c})"),
                 });
-                if self.attached.as_deref() != Some(issue.as_str()) {
+                // Its geometry is meaningless once it's dead; drop the bookkeeping
+                // so a relaunch reflows from scratch and the map stays bounded.
+                self.preview_size.remove(&issue);
+                // Reclaim the dead render handle — unless we're attached (reading
+                // its final screen) or it's pinned to the wall (so its final
+                // screen stays as an EXITED card until you unpin it).
+                let keep = self.attached.as_deref() == Some(issue.as_str())
+                    || self.pinned.contains(&issue);
+                if !keep {
                     self.backends.remove(&issue);
                 }
                 true
             }
             AppEvent::AgentNeedsYou { issue, reason } => {
+                // Ignore a hook that arrives after the agent was torn down — it
+                // must not resurrect a terminated node and re-inflate the count.
+                if self.is_terminal(&issue) {
+                    return false;
+                }
                 self.fleet.insert(issue.clone(), AgentStatus::NeedsYou);
                 self.status_msg = Some(format!("⚑ {issue} needs you — {reason}"));
                 true
             }
             AppEvent::AgentStatusChanged { issue, status } => {
+                // The supervisor's terminal verdict (Stopped/Done/Failed) is
+                // final: a late *live* status from a racing hook (e.g. a Stop
+                // hook's Idle) must not un-terminate the node. A fresh launch
+                // revives it through AgentSpawned, not here.
+                if status.is_live() && self.is_terminal(&issue) {
+                    return false;
+                }
+                // A clean or crashed finish gets a brief node flash so it
+                // registers even if you weren't watching that node.
+                if matches!(status, AgentStatus::Done | AgentStatus::Failed) {
+                    self.flash
+                        .insert(issue.clone(), (Flash::Finished, self.frame + FLASH_FRAMES));
+                }
                 self.fleet.insert(issue, status);
                 true
             }
             AppEvent::AgentAction { issue, action } => {
+                if self.is_terminal(&issue) {
+                    return false; // stale tool-use hook after teardown
+                }
                 self.fleet.insert(issue.clone(), AgentStatus::Running);
                 self.status_msg = Some(format!("{issue}: {action}"));
                 true
@@ -663,8 +780,11 @@ impl App {
         }
     }
 
-    /// Launch an agent on the focused issue (the `a` key). Surfaces a reason in
-    /// the footer when it can't.
+    /// Open an agent on the focused issue (the `a` key) — the first half of the
+    /// two-step open→attach flow. One agent per issue: a *live* agent is never
+    /// duplicated (we just show its chat and point at attach); a resting or
+    /// finished one is relaunched, which resumes its conversation. Always
+    /// switches the right pane to the chat so you see what you opened.
     fn launch_agent(&mut self) {
         let Some(issue) = self.focused_issue() else {
             self.status_msg = Some("no issue selected".into());
@@ -676,12 +796,42 @@ impl App {
             return;
         }
         let (key, title) = (issue.key.clone(), issue.title.clone());
+        let t = self.keymap.label_for(Action::Attach);
+
+        // Already-live agent: don't spin up a second one. Show its chat instead.
+        match self.fleet.get(&key).copied() {
+            Some(AgentStatus::Spawning | AgentStatus::Running) => {
+                self.right_view = RightView::Chat;
+                self.status_msg = Some(format!("{key} already has an agent · {t} to attach"));
+                return;
+            }
+            Some(AgentStatus::NeedsYou) => {
+                self.right_view = RightView::Chat;
+                self.status_msg = Some(format!("⚑ {key} needs you · {t} to attach"));
+                return;
+            }
+            // Absent, or resting/terminal (idle/stopped/done/failed) → (re)launch.
+            _ => {}
+        }
+        let resuming = matches!(
+            self.fleet.get(&key),
+            Some(
+                AgentStatus::Idle | AgentStatus::Stopped | AgentStatus::Done | AgentStatus::Failed
+            )
+        );
+
         // Clone the handle out so we can also touch `status_msg` without a
         // borrow conflict; the clone is cheap (an mpsc sender).
         match self.supervisor.clone() {
             Some(supervisor) => {
                 supervisor.launch(key.clone(), title);
-                self.status_msg = Some(format!("launching agent on {key}…"));
+                self.right_view = RightView::Chat;
+                self.pending_attach = Some(key.clone());
+                self.status_msg = Some(if resuming {
+                    format!("resuming agent on {key} · opening chat…")
+                } else {
+                    format!("opening agent on {key} · {t} to attach when ready")
+                });
             }
             None => self.status_msg = Some("agent control plane unavailable".into()),
         }
@@ -692,23 +842,100 @@ impl App {
         let Some(issue) = self.focused_issue().map(|i| i.key.clone()) else {
             return;
         };
-        if !self.fleet.contains_key(&issue) {
-            self.status_msg = Some(format!("no agent running on {issue}"));
+        // Only a *live* agent can be stopped — a stopped/done/failed node still
+        // shows in the fleet (so you can see it ran) but there's nothing to kill.
+        if !self.fleet.get(&issue).is_some_and(AgentStatus::is_live) {
+            self.status_msg = Some(format!("no live agent on {issue}"));
             return;
         }
         match self.supervisor.clone() {
             Some(supervisor) => {
                 supervisor.cancel(issue.clone());
-                self.status_msg = Some(format!("cancelling agent on {issue}…"));
+                self.status_msg = Some(format!("stopping agent on {issue}…"));
             }
             None => self.status_msg = Some("agent control plane unavailable".into()),
         }
     }
 
-    /// `(agents, needs-you)` counts for the header summary.
+    /// `(live-agents, needs-you)` counts for the header summary. Counts only
+    /// agents whose process is up ([`AgentStatus::is_live`]), so the number
+    /// drops the instant you stop or finish one — a stopped/done/failed node
+    /// lingers in the fleet (to show it ran) but no longer counts as "on".
     pub fn fleet_summary(&self) -> (usize, usize) {
+        let agents = self.fleet.values().filter(|s| s.is_live()).count();
         let needs_you = self.fleet.values().filter(|s| s.needs_you()).count();
-        (self.fleet.len(), needs_you)
+        (agents, needs_you)
+    }
+
+    /// Whether `issue`'s agent has reached a terminal state (the process is
+    /// gone). Used to make terminal status sticky against a racing late hook.
+    fn is_terminal(&self, issue: &str) -> bool {
+        matches!(
+            self.fleet.get(issue),
+            Some(AgentStatus::Stopped | AgentStatus::Done | AgentStatus::Failed)
+        )
+    }
+
+    /// The issues whose chat is on the chat wall, in render order: pinned first
+    /// (in pin order), then the current selection. Filtered on `backends` — a
+    /// handle exists only while there's a screen to show. The live current
+    /// selection is *always* given a slot (the "follows the cursor" chat is the
+    /// primary feature), dropping the oldest pin only if the wall is already
+    /// full — so a selected agent's chat is never silently hidden.
+    pub fn chat_panes(&self) -> Vec<String> {
+        let mut panes: Vec<String> = self
+            .pinned
+            .iter()
+            .filter(|k| self.backends.contains_key(*k))
+            .cloned()
+            .collect();
+        match self.focused_issue().map(|i| i.key.clone()) {
+            Some(sel) if self.backends.contains_key(&sel) && !panes.contains(&sel) => {
+                if panes.len() >= MAX_CHAT_PANES {
+                    panes.truncate(MAX_CHAT_PANES - 1); // reserve the selection's slot
+                }
+                panes.push(sel);
+            }
+            _ => panes.truncate(MAX_CHAT_PANES),
+        }
+        panes
+    }
+
+    /// Whether `issue`'s live screen is on screen right now — attached, or shown
+    /// as a chat pane. Gates the AgentOutput repaint so only visible agents'
+    /// output forces a redraw (preserving the idle-quiet property). Kept
+    /// allocation-free: `AgentOutput` fires per PTY read, so this is a hot path.
+    pub fn is_chat_visible(&self, issue: &str) -> bool {
+        if self.attached.as_deref() == Some(issue) {
+            return true;
+        }
+        if self.right_view != RightView::Chat || self.mode != Mode::Lens {
+            return false;
+        }
+        // Mirrors `chat_panes` membership without materialising it: a pinned
+        // agent (pins are capped below the wall size, so none is truncated), or
+        // the live current selection (always given a slot).
+        self.pinned.iter().any(|k| k == issue)
+            || (self.backends.contains_key(issue)
+                && self.focused_issue().is_some_and(|i| i.key == issue))
+    }
+
+    /// Whether anything on screen is animating — a live agent's spinner/pulse,
+    /// or an unexpired node flash. The render loop arms its animation tick only
+    /// when this holds, so a cockpit of only resting/terminal agents (or none)
+    /// never busy-repaints.
+    pub fn is_animating(&self) -> bool {
+        self.flash.values().any(|&(_, until)| self.frame < until)
+            || self.fleet.values().any(AgentStatus::is_animating)
+    }
+
+    /// Advance the animation frame and drop any flash that has now expired (so
+    /// the `flash` map stays bounded and `is_animating` settles back to false).
+    /// Called by the render loop on its wall-clock animation cadence.
+    pub fn tick_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+        let now = self.frame;
+        self.flash.retain(|_, &mut (_, until)| now < until);
     }
 
     /// The label of the currently-bound detach key (e.g. `F10`), so the attach
@@ -727,10 +954,88 @@ impl App {
             return;
         }
         self.attached = Some(issue.clone());
-        self.attached_size = None; // force a resize to the pane on first render
+        // Drop any cached geometry so the first render resizes the agent to the
+        // full-screen attach pane.
+        self.preview_size.remove(&issue);
         self.pending_leader = None;
         let detach = self.keymap.label_for(Action::Detach);
         self.status_msg = Some(format!("attached to {issue} · {detach} to detach"));
+    }
+
+    /// Pin or unpin the focused issue's chat (the `p` key). A pinned chat stays
+    /// on the wall while you browse other issues — the way to keep several agents
+    /// visible at once. Refuses to overflow the wall rather than silently
+    /// evicting a pin.
+    fn toggle_pin_current(&mut self) {
+        let Some(key) = self.focused_issue().map(|i| i.key.clone()) else {
+            return;
+        };
+        if let Some(pos) = self.pinned.iter().position(|k| *k == key) {
+            self.pinned.remove(pos);
+            // If we were keeping a dead agent's screen alive only because it was
+            // pinned (see AgentExited), reclaim its handle now.
+            if self
+                .backends
+                .get(&key)
+                .is_some_and(|b| matches!(b.status(), Lifecycle::Exited(_)))
+            {
+                self.backends.remove(&key);
+                self.preview_size.remove(&key);
+            }
+            self.status_msg = Some(format!("unpinned {key}"));
+            return;
+        }
+        if !self.backends.contains_key(&key) {
+            self.status_msg = Some(format!("no agent on {key} to pin — a to open one"));
+            return;
+        }
+        // Cap pins one below the wall size so the current selection always keeps
+        // a slot — pinning never hides the chat that follows your cursor.
+        const PIN_CAP: usize = MAX_CHAT_PANES - 1;
+        if self.pinned.len() >= PIN_CAP {
+            self.status_msg = Some(format!("chat wall full ({PIN_CAP} pins) — unpin one first"));
+            return;
+        }
+        self.pinned.push(key.clone());
+        self.right_view = RightView::Chat;
+        self.status_msg = Some(format!("pinned {key} · stays while you browse"));
+    }
+
+    /// Step the lens to the next/prev issue that has a live agent screen,
+    /// wrapping, and switch to the chat view so you see it — a quick tour of the
+    /// running agents (`]` / `[`). Walks the graph's display order so it visits
+    /// agents even on issues the current filter hides.
+    fn cycle_chat(&mut self, delta: i32) {
+        let agents: Vec<String> = self
+            .graph
+            .keys()
+            .iter()
+            .filter(|k| self.backends.contains_key(*k))
+            .cloned()
+            .collect();
+        if agents.is_empty() {
+            self.status_msg = Some("no agents to switch between — a to open one".into());
+            return;
+        }
+        self.right_view = RightView::Chat;
+        let next = match agents.iter().position(|k| *k == self.root) {
+            Some(i) => (i as i32 + delta).rem_euclid(agents.len() as i32) as usize,
+            None if delta >= 0 => 0,
+            None => agents.len() - 1,
+        };
+        let (key, n, total) = (agents[next].clone(), next + 1, agents.len());
+        self.set_root(key.clone(), true);
+        self.status_msg = Some(format!("chat {n}/{total} · {key}{}", self.hidden_note()));
+    }
+
+    /// A status suffix flagging that the lens jumped to an issue the active
+    /// filter/search hides — so the empty list highlight reads as deliberate.
+    fn hidden_note(&self) -> &'static str {
+        if self.root_is_hidden() {
+            " · hidden by filter (clear it to list)"
+        } else {
+            ""
+        }
     }
 
     /// Detach back to the dashboard, leaving the agent running. If the agent
@@ -738,7 +1043,9 @@ impl App {
     fn detach(&mut self) {
         self.pending_leader = None;
         if let Some(issue) = self.attached.take() {
-            self.attached_size = None;
+            // Force the next render (chat pane or re-attach) to re-resize this
+            // agent to whatever Rect it lands in.
+            self.preview_size.remove(&issue);
             let still_running = self
                 .backends
                 .get(&issue)
@@ -1233,6 +1540,308 @@ mod tests {
         app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
         app.fleet.insert("ZAP-205".into(), AgentStatus::NeedsYou);
         assert_eq!(app.fleet_summary(), (2, 1));
+    }
+
+    #[test]
+    fn stopping_or_finishing_an_agent_drops_it_from_the_live_count() {
+        // The reported bug: the header count never fell when you closed an agent.
+        let mut app = app();
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        app.fleet.insert("ZAP-205".into(), AgentStatus::NeedsYou);
+        assert_eq!(app.fleet_summary(), (2, 1));
+
+        // A stop (Stopped) and a finish (Done) both leave the node in the fleet
+        // — so you can still see it ran — but neither counts as a live agent.
+        app.apply_event(AppEvent::AgentStatusChanged {
+            issue: "ZAP-204".into(),
+            status: AgentStatus::Stopped,
+        });
+        app.apply_event(AppEvent::AgentStatusChanged {
+            issue: "ZAP-205".into(),
+            status: AgentStatus::Done,
+        });
+        assert_eq!(app.fleet_summary(), (0, 0), "the live count drops to zero");
+        assert!(
+            app.fleet.contains_key("ZAP-204") && app.fleet.contains_key("ZAP-205"),
+            "the nodes still record that an agent ran there"
+        );
+    }
+
+    #[test]
+    fn chat_panes_show_pins_first_then_selection_and_cap() {
+        let mut app = app();
+        for key in ["ZAP-150", "ZAP-188", "ZAP-198", "ZAP-201", "ZAP-205"] {
+            let fake = crate::backend::fake::FakeBackend::new(key);
+            app.backends
+                .insert(key.into(), fake as Arc<dyn AgentBackend>);
+        }
+        app.pinned = vec!["ZAP-150".into(), "ZAP-188".into()];
+        app.root = "ZAP-205".into();
+        assert_eq!(
+            app.chat_panes(),
+            vec!["ZAP-150", "ZAP-188", "ZAP-205"],
+            "pins in order, then the current selection"
+        );
+
+        // Even with the wall full of pins (set directly, bypassing the UI cap),
+        // a live unpinned selection is never silently hidden — it keeps a slot,
+        // dropping the oldest pin instead (the M1 fix).
+        app.pinned = vec![
+            "ZAP-150".into(),
+            "ZAP-188".into(),
+            "ZAP-198".into(),
+            "ZAP-201".into(),
+        ];
+        let panes = app.chat_panes();
+        assert_eq!(panes.len(), 4);
+        assert!(
+            panes.contains(&"ZAP-205".to_string()),
+            "the selected agent's chat always gets a slot"
+        );
+    }
+
+    #[test]
+    fn pinning_caps_at_one_below_the_wall_and_keeps_the_selection_visible() {
+        let mut app = app();
+        for key in ["ZAP-150", "ZAP-188", "ZAP-198", "ZAP-201"] {
+            let fake = crate::backend::fake::FakeBackend::new(key);
+            app.backends
+                .insert(key.into(), fake as Arc<dyn AgentBackend>);
+        }
+        // Pin three (the cap, reserving the 4th slot for the selection).
+        for key in ["ZAP-150", "ZAP-188", "ZAP-198"] {
+            app.root = key.into();
+            press(&mut app, KeyCode::Char('p'));
+        }
+        assert_eq!(app.pinned.len(), 3);
+        // The fourth pin is refused.
+        app.root = "ZAP-201".into();
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.pinned.len(), 3, "the cap holds");
+        assert!(app.status_msg.as_deref().unwrap().contains("full"));
+        // …and ZAP-201's chat still shows as the selection's reserved pane.
+        let panes = app.chat_panes();
+        assert_eq!(panes.len(), 4);
+        assert!(panes.contains(&"ZAP-201".to_string()));
+    }
+
+    #[test]
+    fn a_late_hook_cannot_resurrect_a_terminated_agent() {
+        // Guards the headline count fix against a hook racing the teardown.
+        let mut app = app();
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Done);
+
+        // Stray PostToolUse / Notification / Stop hooks after teardown are ignored.
+        assert!(!app.apply_event(AppEvent::AgentAction {
+            issue: "ZAP-204".into(),
+            action: "ran grep".into(),
+        }));
+        assert!(!app.apply_event(AppEvent::AgentNeedsYou {
+            issue: "ZAP-204".into(),
+            reason: "late prompt".into(),
+        }));
+        assert!(!app.apply_event(AppEvent::AgentStatusChanged {
+            issue: "ZAP-204".into(),
+            status: AgentStatus::Idle,
+        }));
+        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Done));
+        assert_eq!(app.fleet_summary(), (0, 0), "the count stays at zero");
+
+        // But a fresh launch legitimately revives it through AgentSpawned.
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.apply_event(AppEvent::AgentSpawned {
+            issue: "ZAP-204".into(),
+            backend: fake as Arc<dyn AgentBackend>,
+        });
+        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Spawning));
+    }
+
+    #[test]
+    fn a_pinned_agents_screen_survives_its_exit_until_unpinned() {
+        let mut app = app();
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-205");
+        app.backends
+            .insert("ZAP-205".into(), fake.clone() as Arc<dyn AgentBackend>);
+        app.pinned = vec!["ZAP-205".into()];
+
+        // It exits — but because it's pinned, its final screen stays on the wall.
+        fake.finish(Some(0));
+        app.apply_event(AppEvent::AgentExited {
+            issue: "ZAP-205".into(),
+            code: Some(0),
+        });
+        assert!(
+            app.backends.contains_key("ZAP-205"),
+            "kept for the EXITED card while pinned"
+        );
+
+        // Unpinning the dead agent reclaims its handle.
+        app.root = "ZAP-205".into();
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.pinned.is_empty());
+        assert!(
+            !app.backends.contains_key("ZAP-205"),
+            "reclaimed on unpin once it's dead"
+        );
+    }
+
+    #[test]
+    fn a_jump_to_a_filtered_out_agent_clears_the_highlight_and_says_so() {
+        let mut app = app();
+        // ZAP-198 is unblocked, so filtering to Blocked hides it from the list.
+        app.fleet.insert("ZAP-198".into(), AgentStatus::NeedsYou);
+        app.filter = Filter::Blocked;
+        app.rebuild_order();
+        assert!(
+            !app.order.contains(&"ZAP-198".to_string()),
+            "precondition: the filter hides the agent's issue"
+        );
+
+        press(&mut app, KeyCode::Char('n')); // jump to the needs-you agent
+        assert_eq!(app.root, "ZAP-198", "the lens jumps to the agent");
+        assert_eq!(
+            app.list_state.selected(),
+            None,
+            "the list shows no highlight rather than lighting an unrelated row"
+        );
+        assert!(
+            app.status_msg
+                .as_deref()
+                .unwrap()
+                .contains("hidden by filter"),
+            "and the jump explains why the list looks empty"
+        );
+
+        // Clearing the filter brings it back into the list, highlighted in sync.
+        app.filter = Filter::All;
+        app.rebuild_order();
+        assert_eq!(
+            app.list_state.selected(),
+            app.order.iter().position(|k| *k == "ZAP-198"),
+            "revealed and highlighted once the filter no longer hides it"
+        );
+    }
+
+    #[test]
+    fn tick_frame_advances_and_expires_flashes() {
+        let mut app = app();
+        // A launch flash makes the cockpit animate until the flash expires.
+        app.flash.insert("ZAP-204".into(), (Flash::Launched, 3));
+        assert!(app.is_animating());
+        for _ in 0..3 {
+            app.tick_frame();
+        }
+        assert!(
+            !app.is_animating(),
+            "the flash expired and nothing else animates → the loop goes quiet"
+        );
+        assert!(app.flash.is_empty(), "the expired flash was pruned");
+    }
+
+    #[test]
+    fn agent_output_repaints_only_when_its_chat_is_on_screen() {
+        let mut app = app();
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-205");
+        app.backends
+            .insert("ZAP-205".into(), fake as Arc<dyn AgentBackend>);
+        app.root = "ZAP-205".into();
+
+        // Deps view: the screen isn't shown, so output changes nothing.
+        app.right_view = RightView::Deps;
+        assert!(!app.apply_event(AppEvent::AgentOutput {
+            issue: "ZAP-205".into()
+        }));
+
+        // Chat view with it selected: its pane is on screen → repaint.
+        app.right_view = RightView::Chat;
+        assert!(app.apply_event(AppEvent::AgentOutput {
+            issue: "ZAP-205".into()
+        }));
+
+        // An off-screen agent's output still changes nothing visible.
+        assert!(!app.apply_event(AppEvent::AgentOutput {
+            issue: "ZAP-999".into()
+        }));
+    }
+
+    #[test]
+    fn is_animating_is_false_for_a_fleet_of_only_resting_agents() {
+        let mut app = app();
+        assert!(!app.is_animating(), "no agents → nothing animates");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
+        app.fleet.insert("ZAP-205".into(), AgentStatus::Done);
+        app.fleet.insert("ZAP-201".into(), AgentStatus::Stopped);
+        assert!(
+            !app.is_animating(),
+            "idle/done/stopped rest quietly — the cockpit doesn't busy-repaint"
+        );
+        app.fleet.insert("ZAP-240".into(), AgentStatus::Running);
+        assert!(app.is_animating(), "a working agent drives the tick");
+    }
+
+    #[test]
+    fn opening_an_already_live_agent_shows_its_chat_instead_of_duplicating() {
+        let mut app = app();
+        app.root = "ZAP-205".into();
+        app.fleet.insert("ZAP-205".into(), AgentStatus::Running);
+        // The live-guard returns before any supervisor command, so no duplicate.
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.right_view, RightView::Chat, "a reveals the chat");
+        assert!(
+            app.status_msg
+                .as_deref()
+                .unwrap()
+                .contains("already has an agent")
+        );
+    }
+
+    #[test]
+    fn pending_attach_is_cleared_and_a_flash_set_when_the_agent_spawns() {
+        let mut app = app();
+        app.pending_attach = Some("ZAP-205".into());
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-205");
+        app.apply_event(AppEvent::AgentSpawned {
+            issue: "ZAP-205".into(),
+            backend: fake as Arc<dyn AgentBackend>,
+        });
+        assert!(app.pending_attach.is_none(), "the wait clears once it's up");
+        assert!(app.status_msg.as_deref().unwrap().contains("ready"));
+        assert!(app.flash.contains_key("ZAP-205"), "a launch flash is set");
+    }
+
+    #[test]
+    fn pin_toggles_and_refuses_without_an_agent() {
+        let mut app = app();
+        app.root = "ZAP-205".into();
+        // No agent yet → can't pin.
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.pinned.is_empty());
+        assert!(app.status_msg.as_deref().unwrap().contains("no agent"));
+
+        // With a live screen, p pins then unpins.
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-205");
+        app.backends
+            .insert("ZAP-205".into(), fake as Arc<dyn AgentBackend>);
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.pinned, vec!["ZAP-205".to_string()]);
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.pinned.is_empty(), "a second p unpins");
+    }
+
+    #[test]
+    fn v_toggles_the_right_pane_and_stop_needs_a_live_agent() {
+        let mut app = app();
+        assert_eq!(app.right_view, RightView::Deps);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.right_view, RightView::Chat);
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.right_view, RightView::Deps);
+
+        // x on a stopped (not live) node reports rather than firing a no-op stop.
+        app.root = "ZAP-205".into();
+        app.fleet.insert("ZAP-205".into(), AgentStatus::Stopped);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.status_msg.as_deref().unwrap().contains("no live agent"));
     }
 
     #[test]

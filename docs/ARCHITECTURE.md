@@ -22,7 +22,7 @@ degrades cleanly to the read-only graph viewer.
 
 | Layer | Module(s) | Responsibility |
 |-------|-----------|----------------|
-| 1. Cockpit (TUI) | `app`, `ui`, `theme`, `keymap` | State, input (via a remappable keymap), rendering — incl. the fleet overlay and the attach pane |
+| 1. Cockpit (TUI) | `app`, `ui`, `theme`, `keymap` | State, input (via a remappable keymap), rendering — incl. the fleet markers, the switchable chat wall and the attach pane |
 | 2. Linear client | `linear` | Blocking `ureq` GraphQL read (personal key); write-back is v2 |
 | 3. Control plane | `backend` | `AgentBackend` trait + `PtyAgent` (PTY host); Codex/Aider slot in here |
 | 4. Pipeline engine | *(v3)* | Generic stage machine over `.lindep/pipeline.toml` — not in v1 |
@@ -190,15 +190,42 @@ cargo run -- --demo          # graph viewer only, no agents, no key needed
 
 | Key | Action |
 |-----|--------|
-| `a` | Launch a Claude agent on the focused issue |
+| `a` | Open an agent on the focused issue (resumes if it ran before). One agent per issue — a live one is never duplicated |
+| `v` | Toggle the right pane between the dependency trees and the live agent chats |
+| `p` | Pin / unpin the focused issue's chat to the chat wall (stays while you browse) |
+| `]` / `[` | Switch the lens to the next / previous agent's chat |
 | `t` | Attach to its live terminal (all keys go to the agent) |
 | `F10` | Detach (agent keeps running) |
 | `x` | Stop the focused issue's agent |
 | `n` | Jump to the next issue whose agent needs you |
 | `?` | Full keymap (graph navigation keys unchanged) |
 
-Node glyphs: `◌` spawning · `▸` running · `⚑` needs you · `◦` idle · `✓` done ·
-`✗` failed. Header shows `N agents · M needs you`.
+**Two-step flow + visibility.** `a` *opens* an agent (the first step); `t`
+*attaches* once it's up (the second). The two are deliberately distinct so you
+don't accidentally spin up a duplicate, and the cockpit enforces one agent per
+issue. The **chat wall** (`v`) shows several agents' live screens at once —
+read-only previews, reflowed to fit — with pinned chats kept on screen while the
+selection's chat follows wherever you browse.
+
+Agent state reads three ways at once — a left-edge **gutter bar** (`▎`, so it
+survives the selection highlight), a trailing **marker**, and (on the chat wall)
+the pane **border**:
+
+| State | Glyph | Colour | Animated |
+|-------|-------|--------|----------|
+| spawning | spinner `⠋…` | green | spins |
+| working | spinner `⠋…` | **orange** | spins |
+| needs you | `⚑` | **amber** | pulses |
+| idle (alive) | `◦` | teal | — |
+| stopped (you cancelled it) | `◼` | graphite | — |
+| done | `✓` | teal | — |
+| failed | `✗` | red | — |
+
+The header shows `N agents · M needs you`, where `N` counts only **live** agents
+(spawning/working/needs-you/idle) — so it drops the instant you stop or finish
+one, while the node still records that an agent ran there. Animation is gated:
+the loop only advances frames while something is actually live or flashing, so a
+cockpit of resting/terminal agents (or none) still never busy-repaints.
 
 Every binding is remappable via a `[keys]` table in `config.toml`
 (`<repo>/.lindep/config.toml`, then `~/.config/lindep/config.toml` — personal

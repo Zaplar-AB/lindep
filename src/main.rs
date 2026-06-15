@@ -331,23 +331,39 @@ fn install_panic_hook() {
 }
 
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx) -> io::Result<()> {
+    use std::time::Instant;
     use tokio::sync::mpsc::error::TryRecvError;
 
-    // The view is a pure function of state. State changes from two sources now:
-    // terminal input (key/resize) and background `AppEvent`s drained from the
-    // channel. We repaint only when one of those actually changed something —
-    // so a fully idle cockpit, with no input and no agents talking, still never
-    // busy-repaints (the property the original key-only loop guaranteed).
+    // Animation advances on a wall-clock cadence (~10 fps), deliberately
+    // decoupled from the poll rate (which varies 16–250 ms): a spinner looks the
+    // same whether we're polling fast for a live PTY or idling, and never strobes.
+    const ANIM_FRAME: Duration = Duration::from_millis(100);
+    let mut last_tick = Instant::now();
+
+    // The view is a pure function of state. State changes from three sources:
+    // terminal input (key/resize), background `AppEvent`s drained from the
+    // channel, and the animation frame tick. We repaint only when one of those
+    // actually changed something — so a fully idle cockpit, with no input, no
+    // agents talking and nothing animating, still never busy-repaints (the
+    // property the original key-only loop guaranteed).
     terminal.draw(|frame| ui::draw(app, frame))?;
     while !app.should_quit {
         let mut dirty = false;
 
         // Bound input latency with a poll timeout; this also paces how often we
-        // check the event channel. The poll itself is cheap and never repaints.
-        // While attached we poll fast so keystrokes and PTY output feel live;
-        // otherwise we idle at 250 ms to keep a quiet cockpit truly quiet.
-        let timeout = if app.attached.is_some() {
+        // check the event channel and the animation clock. The poll itself is
+        // cheap and never repaints. We poll fast (16 ms) when a live PTY screen
+        // is on screen — attached, or a chat wall of live agents — so input and
+        // output feel live; at the animation cadence (100 ms) when something is
+        // merely animating off to the side (a spinner in the list); and idle at
+        // 250 ms when nothing moves, keeping a quiet cockpit truly quiet.
+        let chats_live = app.right_view == app::RightView::Chat
+            && app.mode == app::Mode::Lens
+            && !app.chat_panes().is_empty();
+        let timeout = if app.attached.is_some() || chats_live {
             Duration::from_millis(16)
+        } else if app.is_animating() {
+            ANIM_FRAME
         } else {
             Duration::from_millis(250)
         };
@@ -372,6 +388,22 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
                 // the user may still be driving the UI, so keep looping.
                 Err(TryRecvError::Disconnected) => break,
             }
+        }
+
+        // Advance the animation frame on the wall-clock cadence while something
+        // is animating, forcing one repaint per frame. A still cockpit (no live
+        // agents, no flash → `is_animating()` false) never advances the frame and
+        // so never repaints on its own — the idle-quiet property holds. When idle
+        // we keep the clock fresh so the first frame after a lull waits a full
+        // interval rather than firing instantly.
+        if app.is_animating() {
+            if last_tick.elapsed() >= ANIM_FRAME {
+                app.tick_frame();
+                last_tick = Instant::now();
+                dirty = true;
+            }
+        } else {
+            last_tick = Instant::now();
         }
 
         if dirty {
@@ -435,6 +467,94 @@ mod tests {
         let out = render_snapshot(&mut app, 100, 30).expect("render");
         assert!(out.contains("ATTACHED"), "attach header shown:\n{out}");
         assert!(out.contains("detach"), "detach hint shown");
+    }
+
+    #[test]
+    fn chat_view_renders_the_selected_agents_pane() {
+        let mut app = App::new(demo::graph());
+        app.right_view = app::RightView::Chat;
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.backends.insert(
+            "ZAP-204".into(),
+            fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
+        );
+        app.fleet
+            .insert("ZAP-204".into(), crate::session::AgentStatus::Running);
+        app.root = "ZAP-204".into();
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(out.contains("CHAT"), "the chat badge shows:\n{out}");
+        assert!(
+            out.contains("WORKING"),
+            "a working agent's pane is labelled"
+        );
+        assert!(out.contains("ZAP-204"));
+    }
+
+    #[test]
+    fn chat_view_labels_a_finished_agent_done_not_exited() {
+        // Regression for the review's m3: a finished pinned agent must read DONE,
+        // and a stopped/done agent must not inflate the header count.
+        let mut app = App::new(demo::graph());
+        app.right_view = app::RightView::Chat;
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-201");
+        app.backends.insert(
+            "ZAP-201".into(),
+            fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
+        );
+        app.fleet
+            .insert("ZAP-201".into(), crate::session::AgentStatus::Done);
+        app.pinned = vec!["ZAP-201".into()];
+        app.root = "ZAP-201".into();
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(out.contains("DONE"), "a finished agent reads DONE:\n{out}");
+        assert!(!out.contains("EXITED"), "not the transient amber EXITED");
+        assert!(
+            !out.contains("1 agent"),
+            "a finished (non-live) agent isn't counted in the header:\n{out}"
+        );
+    }
+
+    #[test]
+    fn chat_view_empty_state_teaches_how_to_open_an_agent() {
+        let mut app = App::new(demo::graph());
+        app.right_view = app::RightView::Chat; // no backends → an empty wall
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(out.contains("CHAT"));
+        assert!(
+            out.contains("no agent"),
+            "the empty state nudges opening one:\n{out}"
+        );
+    }
+
+    #[test]
+    fn chat_view_survives_adversarial_sizes() {
+        // A multi-pane chat wall (pins + selection, incl. a dead pinned agent)
+        // must not panic when the split yields tiny or zero-area panes.
+        for (w, h) in [
+            (0u16, 0u16),
+            (1, 1),
+            (3, 2),
+            (5, 3),
+            (20, 4),
+            (44, 6),
+            (80, 10),
+            (120, 40),
+        ] {
+            let mut app = App::new(demo::graph());
+            app.right_view = app::RightView::Chat;
+            for key in ["ZAP-204", "ZAP-201", "ZAP-205"] {
+                let fake = crate::backend::fake::FakeBackend::new(key);
+                app.backends.insert(
+                    key.into(),
+                    fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
+                );
+                app.fleet
+                    .insert(key.into(), crate::session::AgentStatus::Running);
+            }
+            app.pinned = vec!["ZAP-201".into(), "ZAP-205".into()];
+            app.root = "ZAP-204".into();
+            render_snapshot(&mut app, w, h).expect("chat wall must not panic");
+        }
     }
 
     #[test]

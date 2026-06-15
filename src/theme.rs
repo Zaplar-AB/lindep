@@ -24,13 +24,24 @@ pub const MUTED: Color = Color::Rgb(0x8A, 0x8F, 0x96); // secondary / dim text
 pub const BORDER: Color = Color::Rgb(0x2C, 0x2F, 0x33); // idle pane borders
 pub const WELL: Color = Color::Rgb(0x14, 0x15, 0x17); // footer well
 
-// ── Amber — warnings: blocked, urgent, cycles ───────────────────────────────
+// ── Amber — warnings: blocked, urgent, cycles, and the one must-act agent
+//    state (needs-you). Deliberately *not* reused for "working" — see ORANGE. ─
 pub const AMBER_400: Color = Color::Rgb(0xF0, 0xAD, 0x43);
 pub const AMBER_500: Color = Color::Rgb(0xE1, 0x8C, 0x1B);
+
+// ── Orange — an agent actively working ("doing things"). Warm and lively like
+//    the user asked for, but a distinct hue from amber so "needs you" stays the
+//    single most eye-grabbing state. Working earns attention through *motion*
+//    (the spinner), not by competing with amber. ──────────────────────────────
+pub const ORANGE_400: Color = Color::Rgb(0xF2, 0x7A, 0x21);
 
 // ── Status-green ramp — workflow state ──────────────────────────────────────
 pub const STATUS_400: Color = Color::Rgb(0x4F, 0xC9, 0x8C);
 pub const STATUS_600: Color = Color::Rgb(0x0F, 0x84, 0x44);
+
+// ── Red — a failed agent. Distinct from amber so a crash reads as "wrong", not
+//    merely "attention". ──────────────────────────────────────────────────────
+pub const RED_400: Color = Color::Rgb(0xE0, 0x5A, 0x4B);
 
 /// Selection style for the pane that currently holds focus — the one moving,
 /// racing-green element on screen.
@@ -61,17 +72,62 @@ pub fn status_glyph(status: Status) -> (&'static str, Color) {
     }
 }
 
-/// Glyph + colour for an agent's state on its issue node. Racing green marks a
-/// live agent (the house rule: green = the agent / active); amber pulls the eye
-/// to the one state that needs the human.
+/// Static glyph + colour for an agent's state (no animation). The salience
+/// order is deliberate: needs-you (amber) and failed (red) pull the eye hardest,
+/// working glows orange, spawning is quiet green, idle is calm teal, a stopped
+/// agent fades to graphite. Every state has a distinct glyph *shape* so the
+/// signal survives a monochrome terminal. The animated variants of these live
+/// in [`agent_marker`].
 pub fn agent_glyph(status: AgentStatus) -> (&'static str, Color) {
     match status {
         AgentStatus::Spawning => ("◌", GREEN_400),
-        AgentStatus::Running => ("▸", GREEN_500),
+        AgentStatus::Running => ("▸", ORANGE_400),
         AgentStatus::NeedsYou => ("⚑", AMBER_400),
-        AgentStatus::Idle => ("◦", GREEN_400),
+        AgentStatus::Idle => ("◦", STATUS_400),
+        AgentStatus::Stopped => ("◼", MUTED),
         AgentStatus::Done => ("✓", STATUS_400),
-        AgentStatus::Failed => ("✗", AMBER_500),
+        AgentStatus::Failed => ("✗", RED_400),
+    }
+}
+
+/// Braille spinner frames — one single-width cell, so swapping frames never
+/// shifts a column. Eight frames at ~10 fps is a smooth, calm rotation.
+pub const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/// The spinner glyph for a given animation frame.
+pub fn agent_spinner(frame: u64) -> &'static str {
+    SPINNER[(frame % SPINNER.len() as u64) as usize]
+}
+
+/// The pulse style for the needs-you flag: a ~1.2 s heartbeat between bold and
+/// dim amber. Never a terminal blink attribute (those flash the whole cell and
+/// are an accessibility hazard) — just a brightness breath.
+pub fn needs_you_style(frame: u64) -> Style {
+    let base = Style::new().fg(AMBER_400);
+    if (frame / 6).is_multiple_of(2) {
+        base.add_modifier(Modifier::BOLD)
+    } else {
+        base.add_modifier(Modifier::DIM)
+    }
+}
+
+/// Animated marker — glyph + full style — for an agent's state at `frame`. This
+/// is what the issue list, the overview chips and the chat-pane titles render so
+/// a *working* agent visibly spins and a *needs-you* agent visibly pulses. The
+/// terminal (resting) states are steady. Pure in `frame`, so the renderer stays
+/// a function of state (the frame counter lives on `App`).
+pub fn agent_marker(status: AgentStatus, frame: u64) -> (&'static str, Style) {
+    match status {
+        AgentStatus::Spawning => (agent_spinner(frame), Style::new().fg(GREEN_400)),
+        AgentStatus::Running => (
+            agent_spinner(frame),
+            Style::new().fg(ORANGE_400).add_modifier(Modifier::BOLD),
+        ),
+        AgentStatus::NeedsYou => ("⚑", needs_you_style(frame)),
+        AgentStatus::Idle => ("◦", Style::new().fg(STATUS_400)),
+        AgentStatus::Stopped => ("◼", Style::new().fg(MUTED)),
+        AgentStatus::Done => ("✓", Style::new().fg(STATUS_400)),
+        AgentStatus::Failed => ("✗", Style::new().fg(RED_400).add_modifier(Modifier::BOLD)),
     }
 }
 
@@ -84,5 +140,44 @@ pub fn priority_marker(priority: Priority) -> (&'static str, Color) {
         Priority::Medium => ("◦", MUTED),
         Priority::Low => ("▽", MUTED),
         Priority::None => (" ", MUTED),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const ALL: [AgentStatus; 7] = [
+        AgentStatus::Spawning,
+        AgentStatus::Running,
+        AgentStatus::NeedsYou,
+        AgentStatus::Idle,
+        AgentStatus::Stopped,
+        AgentStatus::Done,
+        AgentStatus::Failed,
+    ];
+
+    #[test]
+    fn every_agent_state_has_a_distinct_static_glyph() {
+        // Colour alone never carries the signal — each state must read in a
+        // monochrome terminal too, so the glyph shapes must all differ.
+        let glyphs: HashSet<&str> = ALL.iter().map(|s| agent_glyph(*s).0).collect();
+        assert_eq!(
+            glyphs.len(),
+            ALL.len(),
+            "two states share a glyph: {glyphs:?}"
+        );
+    }
+
+    #[test]
+    fn the_spinner_cycles_through_every_frame_and_never_repeats_adjacently() {
+        let frames: Vec<&str> = (0..SPINNER.len() as u64).map(agent_spinner).collect();
+        assert_eq!(frames, SPINNER, "agent_spinner walks the frames in order");
+        assert_eq!(
+            agent_spinner(0),
+            agent_spinner(SPINNER.len() as u64),
+            "it wraps"
+        );
     }
 }

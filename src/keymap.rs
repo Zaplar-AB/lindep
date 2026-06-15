@@ -50,6 +50,10 @@ pub enum Action {
     CancelAgent,
     Attach,
     Detach,
+    ToggleChat,
+    TogglePin,
+    CycleChat,
+    CycleChatBack,
     CycleFilter,
     CycleSort,
     ToggleGraph,
@@ -76,6 +80,10 @@ const DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::CancelAgent, "stop-agent", &["x"]),
     (Action::Attach, "attach", &["t"]),
     (Action::Detach, "detach", &["f10"]),
+    (Action::ToggleChat, "chat", &["v"]),
+    (Action::TogglePin, "pin-chat", &["p"]),
+    (Action::CycleChat, "cycle-chat", &["]"]),
+    (Action::CycleChatBack, "cycle-chat-back", &["["]),
     (Action::CycleFilter, "filter", &["f"]),
     (Action::CycleSort, "sort", &["s"]),
     (Action::ToggleGraph, "graph", &["g"]),
@@ -456,6 +464,27 @@ mod tests {
         assert_eq!(
             km.action_for(ev(KeyCode::Char('j'), KeyModifiers::NONE)),
             Some(Action::MoveDown)
+        );
+    }
+
+    #[test]
+    fn the_new_chat_keys_bind_to_their_defaults() {
+        let km = Keymap::default();
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('v'), KeyModifiers::NONE)),
+            Some(Action::ToggleChat)
+        );
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('p'), KeyModifiers::NONE)),
+            Some(Action::TogglePin)
+        );
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char(']'), KeyModifiers::NONE)),
+            Some(Action::CycleChat)
+        );
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('['), KeyModifiers::NONE)),
+            Some(Action::CycleChatBack)
         );
     }
 

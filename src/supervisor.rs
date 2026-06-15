@@ -357,16 +357,22 @@ async fn supervise(task: &AgentTask) {
         backend.shutdown(); // already exited; idempotent
     }
 
-    // The agent task is the sole authority on post-mortem status: Idle for a
-    // deliberate stop (resumable), Done/Failed for a self-exit. (The backend's
-    // own AgentExited event only drives the footer + frees the render handle.)
+    // The agent task is the sole authority on post-mortem status: Stopped for a
+    // deliberate stop (process dead but resumable), Done/Failed for a self-exit.
+    // (The backend's own AgentExited event only drives the footer + frees the
+    // render handle.) Stopped is distinct from Idle — an Idle agent is resting
+    // but still up; a Stopped one has been torn down — so the cockpit can stop
+    // counting it as a live agent the instant it's cancelled.
     let status = if cancelled {
-        AgentStatus::Idle
+        AgentStatus::Stopped
     } else {
         match backend.status() {
             Lifecycle::Exited(Some(0)) | Lifecycle::Exited(None) => AgentStatus::Done,
             Lifecycle::Exited(Some(_)) => AgentStatus::Failed,
-            Lifecycle::Running => AgentStatus::Idle,
+            // Still "Running" only because a self-exit raced our cancel through
+            // the select! above; the shutdown below tears it down, so it's
+            // effectively a deliberate stop.
+            Lifecycle::Running => AgentStatus::Stopped,
         }
     };
     if let Ok(mut store) = task.store.lock() {

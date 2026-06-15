@@ -35,8 +35,15 @@ pub enum AgentStatus {
     Running,
     /// Waiting on the human — a permission prompt or an idle nudge.
     NeedsYou,
-    /// Quiet but alive (Stop hook fired, conversation idle).
+    /// Quiet but alive: the agent finished a turn (a `Stop` hook fired) and is
+    /// resting with its process still up, ready to continue. Distinct from
+    /// [`AgentStatus::Stopped`], whose process is gone.
     Idle,
+    /// The user deliberately stopped the agent: its process is dead, but its
+    /// conversation is resumable (`--resume`). This is the post-cancel resting
+    /// state — separated from `Idle` so a *stopped* agent stops counting as
+    /// "on" the instant you stop it.
+    Stopped,
     /// Finished its task cleanly.
     Done,
     /// Exited abnormally / errored.
@@ -48,6 +55,30 @@ impl AgentStatus {
     /// `&self` so it can be passed directly as `Option::is_some_and`'s predicate.
     pub const fn needs_you(&self) -> bool {
         matches!(self, AgentStatus::NeedsYou)
+    }
+
+    /// Whether a live process backs this status — i.e. the agent is genuinely
+    /// "on". This is what the header counts: a `Stopped`/`Done`/`Failed` agent
+    /// (and an issue with no agent at all) is *not* live, so the count drops the
+    /// moment you stop or finish one. `Idle` is live (resting, still up).
+    pub const fn is_live(&self) -> bool {
+        matches!(
+            self,
+            AgentStatus::Spawning
+                | AgentStatus::Running
+                | AgentStatus::NeedsYou
+                | AgentStatus::Idle
+        )
+    }
+
+    /// Whether this status should drive the animation tick — the states where
+    /// the agent is actively doing (or waiting to do) something, so a quiet
+    /// cockpit of only resting/terminal agents still never busy-repaints.
+    pub const fn is_animating(&self) -> bool {
+        matches!(
+            self,
+            AgentStatus::Spawning | AgentStatus::Running | AgentStatus::NeedsYou
+        )
     }
 }
 
@@ -322,6 +353,27 @@ mod tests {
         store.ensure("ENG-1", PathBuf::from("/wt/ENG-1"), "felix/eng-1".into());
         store.ensure("ENG-2", PathBuf::from("/wt/ENG-2"), "felix/eng-2".into());
         store
+    }
+
+    #[test]
+    fn is_live_counts_only_agents_with_a_running_process() {
+        use AgentStatus::*;
+        for s in [Spawning, Running, NeedsYou, Idle] {
+            assert!(s.is_live(), "{s:?} is a live agent");
+        }
+        for s in [Stopped, Done, Failed] {
+            assert!(!s.is_live(), "{s:?} is not live — its process is gone");
+        }
+    }
+
+    #[test]
+    fn stopped_round_trips_through_the_state_file() {
+        let path = temp_state_path();
+        let mut store = seeded(&path);
+        store.set_status("ENG-1", AgentStatus::Stopped);
+        store.save().unwrap();
+        let reloaded = SessionStore::load(&path).unwrap();
+        assert_eq!(reloaded.get("ENG-1").unwrap().status, AgentStatus::Stopped);
     }
 
     #[test]
