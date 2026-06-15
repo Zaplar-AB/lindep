@@ -54,6 +54,13 @@ pub enum Action {
     TogglePin,
     CycleChat,
     CycleChatBack,
+    /// Open the chat composer — message the selected/pinned agent without the
+    /// full-screen attach takeover.
+    ComposeChat,
+    /// Flip the left pane between the issue list and the agents roster.
+    ToggleRoster,
+    /// Cycle the chat wall's split: stacked rows → side-by-side columns → grid.
+    CycleChatLayout,
     CycleFilter,
     CycleSort,
     ToggleGraph,
@@ -84,6 +91,9 @@ const DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::TogglePin, "pin-chat", &["p"]),
     (Action::CycleChat, "cycle-chat", &["]"]),
     (Action::CycleChatBack, "cycle-chat-back", &["["]),
+    (Action::ComposeChat, "compose", &["i"]),
+    (Action::ToggleRoster, "agents", &["r"]),
+    (Action::CycleChatLayout, "chat-layout", &["|"]),
     (Action::CycleFilter, "filter", &["f"]),
     (Action::CycleSort, "sort", &["s"]),
     (Action::ToggleGraph, "graph", &["g"]),
@@ -496,6 +506,23 @@ mod tests {
         assert_eq!(
             km.action_for(ev(KeyCode::Char('['), KeyModifiers::NONE)),
             Some(Action::CycleChatBack)
+        );
+    }
+
+    #[test]
+    fn the_cockpit_v2_keys_bind_to_their_defaults() {
+        let km = Keymap::default();
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('i'), KeyModifiers::NONE)),
+            Some(Action::ComposeChat)
+        );
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Some(Action::ToggleRoster)
+        );
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('|'), KeyModifiers::NONE)),
+            Some(Action::CycleChatLayout)
         );
     }
 

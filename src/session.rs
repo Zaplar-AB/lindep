@@ -84,6 +84,24 @@ impl AgentStatus {
             AgentStatus::Spawning | AgentStatus::Running | AgentStatus::NeedsYou
         )
     }
+
+    /// Ordering rank for the agents roster — lower sorts first. needs-you leads
+    /// (it's the one that must be acted on), then live work (running, then the
+    /// brief spawning), then idle, then the terminal states — a crash (Failed)
+    /// ahead of a clean stop/finish so a failure stays visible at the top of the
+    /// dead pile. Ranks 0–2 are exactly the [`AgentStatus::is_animating`] set, so
+    /// the roster's "live work floats up" order tracks what visibly moves.
+    pub const fn salience_rank(self) -> u8 {
+        match self {
+            AgentStatus::NeedsYou => 0,
+            AgentStatus::Running => 1,
+            AgentStatus::Spawning => 2,
+            AgentStatus::Idle => 3,
+            AgentStatus::Failed => 4,
+            AgentStatus::Stopped => 5,
+            AgentStatus::Done => 6,
+        }
+    }
 }
 
 /// One persisted agent session.

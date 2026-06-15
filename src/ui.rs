@@ -9,11 +9,13 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, HighlightSpacing, List, ListItem, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph,
+};
 use tui_term::widget::PseudoTerminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Flash, Mode, NodeKind, Pane, RightView, TreeRow};
+use crate::app::{App, ChatSplit, Flash, LeftView, Mode, NodeKind, Pane, RightView, TreeRow};
 use crate::backend::{AgentBackend, Lifecycle};
 use crate::model::{Direction, Graph, Status};
 use crate::session::AgentStatus;
@@ -21,6 +23,10 @@ use crate::theme::{self, *};
 
 const LIST_WIDTH: u16 = 44;
 const MAX_TITLE: usize = 64;
+/// Below this inner width a `claude` PTY preview is unreadable, so a chat pane
+/// narrower than this (e.g. a thin column under a side/grid split) collapses to a
+/// one-line summary instead of rendering a garbled screen.
+const MIN_CHAT_PREVIEW_W: u16 = 24;
 
 pub fn draw(app: &mut App, frame: &mut Frame) {
     // Attached to an agent: its PTY takes over the whole screen.
@@ -228,40 +234,43 @@ fn render_lens(app: &mut App, frame: &mut Frame, area: Rect) {
     let [left, right] =
         Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Min(0)]).areas(area);
 
-    render_issue_list(app, frame, left);
-    // The left list (the navigation spine) is constant; the right pane swaps
-    // between the dependency trees and the live agent chats.
+    // The left pane is a two-tab navigation spine — the full issue list, or the
+    // agents roster — and the right pane swaps between the dependency trees and
+    // the live agent chats. The two axes are independent.
+    match app.left_view {
+        LeftView::Issues => render_issue_list(app, frame, left),
+        LeftView::Agents => render_agent_roster(app, frame, left),
+    }
     match app.right_view {
         RightView::Deps => render_focus_panes(app, frame, right),
         RightView::Chat => render_chat_panes(app, frame, right),
     }
 }
 
+/// The left pane's tab strip — ISSUES | AGENTS, the active tab lit, each with its
+/// count — so the agents roster is a discoverable flip of the navigation spine
+/// rather than a hidden mode.
+fn left_tabs_title(app: &App) -> Line<'static> {
+    let tab = |label: &str, count: usize, active: bool| {
+        let style = if active {
+            Style::new().fg(GREEN_100).bg(GREEN_700).bold()
+        } else {
+            Style::new().fg(MUTED)
+        };
+        Span::styled(format!(" {label} {count} "), style)
+    };
+    Line::from(vec![
+        tab("ISSUES", app.order.len(), app.left_view == LeftView::Issues),
+        Span::raw(" "),
+        tab("AGENTS", app.fleet.len(), app.left_view == LeftView::Agents),
+    ])
+}
+
 fn render_issue_list(app: &mut App, frame: &mut Frame, area: Rect) {
     let active = app.focus == Pane::List;
-    let title = Line::from(vec![
-        Span::styled(" ISSUES ", Style::new().fg(GREEN_100).bold()),
-        Span::styled(format!("{} ", app.order.len()), Style::new().fg(MUTED)),
-    ]);
-    let block = pane_block(title, active);
+    let block = pane_block(left_tabs_title(app), active);
 
-    let items: Vec<ListItem> = app
-        .order
-        .iter()
-        .map(|k| {
-            let flash = app
-                .flash
-                .get(k)
-                .and_then(|&(kind, until)| (app.frame < until).then_some(kind));
-            ListItem::new(issue_line(
-                &app.graph,
-                k,
-                app.fleet.get(k).copied(),
-                app.frame,
-                flash,
-            ))
-        })
-        .collect();
+    let items: Vec<ListItem> = app.order.iter().map(|k| issue_item(app, k)).collect();
 
     let list = List::new(items)
         .block(block)
@@ -273,6 +282,56 @@ fn render_issue_list(app: &mut App, frame: &mut Frame, area: Rect) {
             theme::cursor_idle()
         });
     frame.render_stateful_widget(list, area, &mut app.list_state);
+}
+
+/// The agents roster — the left pane's "AGENTS" tab. Lists every issue with an
+/// agent, salience-sorted (needs-you → working → idle → terminal), each row the
+/// same whole-row-tinted [`issue_item`] the issue list uses. The cursor tracks
+/// whichever agent the lens currently sits on, so the roster and the chat wall
+/// move together. With nothing running it teaches the open flow rather than
+/// showing a blank pane.
+fn render_agent_roster(app: &mut App, frame: &mut Frame, area: Rect) {
+    let active = app.focus == Pane::List;
+    let block = pane_block(left_tabs_title(app), active);
+
+    let agents = app.agent_order();
+    if agents.is_empty() {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::from(Span::styled(
+                    "  no agents running",
+                    Style::new().fg(MUTED).italic(),
+                )),
+                Line::from(Span::styled(
+                    "  a on an issue opens one",
+                    Style::new().fg(BORDER),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    // The roster highlight tracks `root` (the single source of truth), derived
+    // fresh each frame — no second persistent selection to keep in sync.
+    let selected = agents.iter().position(|k| *k == app.root);
+    let items: Vec<ListItem> = agents.iter().map(|k| issue_item(app, k)).collect();
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_symbol(if active { "▸ " } else { "  " })
+        .highlight_spacing(HighlightSpacing::Always)
+        .highlight_style(if active {
+            theme::cursor_active()
+        } else {
+            theme::cursor_idle()
+        });
+    let mut state = ListState::default();
+    state.select(selected);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_focus_panes(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -396,8 +455,19 @@ fn render_chat_panes(app: &mut App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    // Empty state: nothing live to show here. Teach the open/pin flow.
+    // The composer, when open, claims the bottom line of the wall; the panes
+    // share what's left. Anchoring it here keeps it put under any split.
+    let (panes_area, composer) = match app.compose {
+        Some(_) if inner.height >= 2 => {
+            let [panes_area, bar] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+            (panes_area, Some(bar))
+        }
+        _ => (inner, None),
+    };
+
     if panes.is_empty() {
+        // Empty state: nothing live to show here. Teach the open/pin flow.
         let msg = match app.focused_issue() {
             Some(i) => format!(
                 "  no agent on {} — a to open one · p to pin its chat",
@@ -415,43 +485,97 @@ fn render_chat_panes(app: &mut App, frame: &mut Frame, area: Rect) {
                     Style::new().fg(BORDER),
                 )),
             ]),
-            inner,
+            panes_area,
         );
-        return;
+    } else {
+        // Clone the backend handles (and pinned-ness) out BEFORE the loop so no
+        // borrow of `app.backends` overlaps the `&mut app.preview_size` writes each
+        // pane makes. The Arc clones are cheap (a refcount bump).
+        let target = app.compose.as_ref().map(|c| c.target.clone());
+        let agents: Vec<(String, Arc<dyn AgentBackend>, bool)> = panes
+            .iter()
+            .filter_map(|k| {
+                app.backends
+                    .get(k)
+                    .map(|b| (k.clone(), Arc::clone(b), app.pinned.iter().any(|p| p == k)))
+            })
+            .collect();
+
+        for ((issue, backend, pinned), rect) in
+            agents
+                .into_iter()
+                .zip(chat_layout(panes_area, panes.len(), app.chat_split))
+        {
+            let is_target = target.as_deref() == Some(issue.as_str());
+            render_one_chat(
+                app,
+                frame,
+                rect,
+                &issue,
+                backend.as_ref(),
+                pinned,
+                is_target,
+            );
+        }
     }
 
-    // Clone the backend handles (and pinned-ness) out BEFORE the loop so no
-    // borrow of `app.backends` overlaps the `&mut app.preview_size` writes each
-    // pane makes. The Arc clones are cheap (a refcount bump).
-    let agents: Vec<(String, Arc<dyn AgentBackend>, bool)> = panes
-        .iter()
-        .filter_map(|k| {
-            app.backends
-                .get(k)
-                .map(|b| (k.clone(), Arc::clone(b), app.pinned.iter().any(|p| p == k)))
-        })
-        .collect();
-
-    for ((issue, backend, pinned), rect) in agents.into_iter().zip(chat_layout(inner, panes.len()))
-    {
-        render_one_chat(app, frame, rect, &issue, backend.as_ref(), pinned);
+    if let Some(bar) = composer {
+        render_composer(app, frame, bar);
     }
 }
 
-/// The chat wall's outer title: the focused issue + a CHAT badge.
+/// The chat composer bar — a single highlighted line naming the agent your
+/// message reaches and echoing what you've typed, with a caret. Enter sends the
+/// line to that agent's PTY; Esc closes it. The lightweight alternative to a
+/// full-screen attach when you just need to nudge or answer one agent.
+fn render_composer(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(compose) = &app.compose else {
+        return;
+    };
+    let chip = Style::new().fg(GREEN_100).bg(GREEN_700).bold();
+    let field = Style::new().fg(INK).bg(WELL);
+    let chip_text = format!(" ✎ {} ", compose.target);
+    let hint = "  ⏎ send · esc done";
+    // Window the buffer so the caret (its tail) stays on screen as the message
+    // grows past the bar — a plain left-aligned line would scroll exactly what
+    // you're typing off the right edge. Reserve the chip, the leading space, the
+    // caret cell and the hint; show the trailing slice that fits the rest.
+    let avail = (area.width as usize)
+        .saturating_sub(UnicodeWidthStr::width(chip_text.as_str()))
+        .saturating_sub(UnicodeWidthStr::width(hint))
+        .saturating_sub(2) // leading space + caret cell
+        .max(1);
+    let shown = tail_fit(&compose.buffer, avail);
+    let line = Line::from(vec![
+        Span::styled(chip_text, chip),
+        Span::styled(" ", field),
+        Span::styled(shown, field),
+        Span::styled("▏", Style::new().fg(GREEN_400).bg(WELL)),
+        Span::styled(hint, Style::new().fg(MUTED).bg(WELL)),
+    ]);
+    frame.render_widget(Paragraph::new(line).style(Style::new().bg(WELL)), area);
+}
+
+/// The chat wall's outer title: the focused issue, a CHAT badge, and the current
+/// split mode (so the `chat-layout` key's effect is labelled, not guessed).
 fn chat_wall_title(app: &App) -> Line<'static> {
-    match app.focused_issue() {
-        Some(i) => Line::from(vec![
+    let mut spans = match app.focused_issue() {
+        Some(i) => vec![
             Span::styled(" ◆ ", Style::new().fg(GREEN_500)),
             Span::styled(format!("{}  ", i.key), Style::new().fg(INK).bold()),
             Span::styled(
-                truncate(&i.title, MAX_TITLE.saturating_sub(8)),
+                truncate(&i.title, MAX_TITLE.saturating_sub(16)),
                 Style::new().fg(MUTED),
             ),
-            Span::styled(" CHAT ", Style::new().fg(ORANGE_400).bold()),
-        ]),
-        None => Line::from(Span::styled(" CHAT ", Style::new().fg(ORANGE_400).bold())),
-    }
+        ],
+        None => Vec::new(),
+    };
+    spans.push(Span::styled(" CHAT ", Style::new().fg(ORANGE_400).bold()));
+    spans.push(Span::styled(
+        format!("· {} ", app.chat_split.label()),
+        Style::new().fg(MUTED),
+    ));
+    Line::from(spans)
 }
 
 /// Render one agent's chat pane: a state-coloured frame, then its live (or
@@ -464,13 +588,17 @@ fn render_one_chat(
     issue: &str,
     backend: &dyn AgentBackend,
     pinned: bool,
+    is_target: bool,
 ) {
     if rect.area() == 0 {
         return;
     }
     let status = app.fleet.get(issue).copied();
     let exited = matches!(backend.status(), Lifecycle::Exited(_));
-    let (border, label) = chat_pane_chrome(status, exited);
+    let (status_border, label) = chat_pane_chrome(status, exited);
+    // The composer's target pane is framed racing-green (the house "active
+    // affordance" colour), so it's unmistakable which agent your typing reaches.
+    let border = if is_target { GREEN_500 } else { status_border };
     // `issue` is itself the graph key (the graph never shrinks), so no lookup.
     let key = issue;
 
@@ -491,6 +619,9 @@ fn render_one_chat(
         // wide emoji (which terminals size inconsistently) would skew the title.
         title.push(Span::styled("⊙ pin ", Style::new().fg(ORANGE_400)));
     }
+    if is_target {
+        title.push(Span::styled("✎ typing ", Style::new().fg(GREEN_400).bold()));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(border))
@@ -501,9 +632,10 @@ fn render_one_chat(
     if pane.area() == 0 {
         return;
     }
-    // Too short for a real terminal preview — collapse to a one-line summary so
-    // the pane never renders a 1-row garbled screen.
-    if pane.height < 2 {
+    // Too small for a real terminal preview — too few rows, or too narrow under a
+    // side/grid split — so collapse to a one-line summary rather than render a
+    // garbled screen.
+    if pane.height < 2 || pane.width < MIN_CHAT_PREVIEW_W {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" {key} · {label}"),
@@ -546,25 +678,66 @@ fn chat_pane_chrome(status: Option<AgentStatus>, exited: bool) -> (Color, &'stat
     }
 }
 
-/// Split `area` into `k` stacked panes, giving the remainder rows to the top
-/// panes (so heights differ by at most one). Empty for `k == 0` or a zero-height
-/// area; a pane can come back zero-height when `k` exceeds the rows available —
-/// callers guard on `rect.area()` before drawing.
-fn chat_layout(area: Rect, k: usize) -> Vec<Rect> {
-    if k == 0 || area.height == 0 {
+/// Split `area` into `k` chat panes according to `split`:
+/// - [`ChatSplit::Stack`] — stacked rows (the original behaviour).
+/// - [`ChatSplit::Side`] — side-by-side columns.
+/// - [`ChatSplit::Grid`] — a near-square tiling, row-major.
+///
+/// Empty for `k == 0` or a zero-area `area`; a pane can come back zero-sized when
+/// `k` exceeds the cells available — callers guard on `rect.area()` before
+/// drawing.
+fn chat_layout(area: Rect, k: usize, split: ChatSplit) -> Vec<Rect> {
+    if k == 0 || area.area() == 0 {
         return Vec::new();
     }
+    match split {
+        ChatSplit::Stack => split_1d(area, k, true),
+        ChatSplit::Side => split_1d(area, k, false),
+        ChatSplit::Grid => split_grid(area, k),
+    }
+}
+
+/// Split `area` into `k` strips along one axis, giving the remainder to the first
+/// strips (so sizes differ by at most one). `vertical` stacks rows; otherwise it
+/// lays out columns.
+fn split_1d(area: Rect, k: usize, vertical: bool) -> Vec<Rect> {
     let k = k as u16;
-    let base = area.height / k;
-    let extra = area.height % k;
+    let total = if vertical { area.height } else { area.width };
+    let base = total / k;
+    let extra = total % k;
     let mut rects = Vec::with_capacity(k as usize);
-    let mut y = area.y;
+    let mut pos = if vertical { area.y } else { area.x };
     for i in 0..k {
-        let h = base + u16::from(i < extra);
-        rects.push(Rect::new(area.x, y, area.width, h));
-        y = y.saturating_add(h);
+        let size = base + u16::from(i < extra);
+        rects.push(if vertical {
+            Rect::new(area.x, pos, area.width, size)
+        } else {
+            Rect::new(pos, area.y, size, area.height)
+        });
+        pos = pos.saturating_add(size);
     }
     rects
+}
+
+/// Tile `area` into `k` near-square cells, row-major: `ceil(√k)` columns and the
+/// rows needed to hold them. A short final row spreads its cells across the full
+/// width, so there's no ragged gap.
+fn split_grid(area: Rect, k: usize) -> Vec<Rect> {
+    // Smallest `c` with `c² ≥ k` — `ceil(√k)`, integer-only (no float casts).
+    let cols = (1..=k).find(|c| c * c >= k).unwrap_or(1);
+    let rows = k.div_ceil(cols);
+    let mut cells = Vec::with_capacity(k);
+    for (r, row_rect) in split_1d(area, rows, true).into_iter().enumerate() {
+        // The final row holds only the leftover panes.
+        let in_row = if r + 1 == rows { k - r * cols } else { cols };
+        for cell in split_1d(row_rect, in_row, false) {
+            cells.push(cell);
+            if cells.len() == k {
+                return cells;
+            }
+        }
+    }
+    cells
 }
 
 // ── Overview (layered, edge-free) ────────────────────────────────────────────
@@ -732,14 +905,19 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
-    let text = if app.search_active {
-        " type to filter · ⏎ accept · esc clear"
+    let text: String = if let Some(c) = &app.compose {
+        format!(
+            " ✎ message {} · ⏎ send · esc done · t attaches for full control",
+            c.target
+        )
+    } else if app.search_active {
+        " type to filter · ⏎ accept · esc clear".to_string()
     } else if app.mode == Mode::Overview {
-        " ↑↓ move · a open · t attach · x stop · n needs-you · g lens · c cycles · f filter · s sort · ? help · q quit"
+        " ↑↓ move · a open · t attach · x stop · n needs-you · r agents · g lens · f filter · s sort · ? help · q quit".to_string()
     } else if app.right_view == RightView::Chat {
-        " ↑↓ pick · ]/[ switch agent · a open/resume · t attach · x stop · p pin · v deps · n needs-you · ? help · q quit"
+        " ↑↓ pick · i write · p pin · | layout · ]/[ next · t attach · x stop · v deps · r roster · n needs-you · ? help".to_string()
     } else {
-        " ↑↓ move · ←→/tab pane · ⏎ focus · a open · t attach · x stop · v chat · p pin · ]/[ agents · n needs-you · b back · / find · g graph · ? help · q quit"
+        " ↑↓ move · ←→/tab pane · a open · t attach · v chat · r roster · p pin · n needs-you · b back · / find · g graph · ? help · q quit".to_string()
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(text, Style::new().fg(MUTED))))
@@ -775,11 +953,17 @@ fn render_help(app: &App, frame: &mut Frame) {
         ),
         (k(CancelAgent), "stop the agent on the focused issue"),
         (k(ToggleChat), "right pane: dependencies ↔ live chats"),
+        (k(ToggleRoster), "left pane: issue list ↔ agents roster"),
         (k(TogglePin), "pin / unpin this issue's chat to the wall"),
         (
             format!("{} / {}", k(CycleChat), k(CycleChatBack)),
             "switch to the next / previous agent's chat",
         ),
+        (
+            k(ComposeChat),
+            "message the selected agent (no full attach)",
+        ),
+        (k(CycleChatLayout), "chat wall split: stack / side / grid"),
         (k(JumpNeedsYou), "jump to the next agent that needs you"),
         ("— graph —".to_string(), ""),
         (k(Back), "back to the previously focused issue"),
@@ -889,6 +1073,26 @@ fn issue_line<'a>(
         spans.push(Span::styled(mark, mstyle));
     }
     Line::from(spans)
+}
+
+/// One issue row as a list item, carrying the whole-row status tint. The tint
+/// lives on the *item* style (not the inner [`Line`]) deliberately: ratatui
+/// paints the item style across the full row — including the highlight-symbol
+/// gutter — whereas a `Line` background only covers the content, leaving a 2-cell
+/// notch. So the colour signal really spans the *entire* row, not just an edge.
+/// The active-pane selection still wins (its `cursor_active` background patches
+/// over this one on the focused row). Shared by the issue list and the roster.
+fn issue_item<'a>(app: &App, key: &str) -> ListItem<'a> {
+    let flash = app
+        .flash
+        .get(key)
+        .and_then(|&(kind, until)| (app.frame < until).then_some(kind));
+    let status = app.fleet.get(key).copied();
+    let item = ListItem::new(issue_line(&app.graph, key, status, app.frame, flash));
+    match status {
+        Some(s) => item.style(Style::new().bg(theme::agent_row_bg(s, app.frame))),
+        None => item,
+    }
 }
 
 /// One row of a dependency tree, including its box-drawing prefix and any
@@ -1012,10 +1216,50 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// The trailing slice of `s` that fits in `max` display *columns*, prefixed with
+/// '…' when it had to drop the head — the mirror of [`truncate`], which keeps the
+/// head. Used by the composer so a growing line keeps its caret (the tail) on
+/// screen instead of scrolling it off the right edge.
+fn tail_fit(s: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    let budget = max.saturating_sub(1); // reserve a column for the ellipsis
+    let mut w = 0;
+    let mut tail = String::new();
+    for c in s.chars().rev() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        w += cw;
+        tail.push(c);
+    }
+    let mut out = String::from("…");
+    out.extend(tail.chars().rev());
+    out
+}
+
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_fit_keeps_the_tail_visible_with_a_leading_ellipsis() {
+        // Fits whole → unchanged (no ellipsis).
+        assert_eq!(tail_fit("hello", 10), "hello");
+        // Overflows → keep the END (where the caret sits), drop the head.
+        assert_eq!(tail_fit("abcdefghij", 4), "…hij");
+        // Degenerate widths never panic and still show the caret context.
+        assert_eq!(tail_fit("abcdef", 1), "…");
+        assert_eq!(tail_fit("", 5), "");
+    }
 }

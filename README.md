@@ -101,15 +101,29 @@ orchestration layer (it spawns the real `claude`, it does not reimplement it).
 | `F10` | Detach back to the dashboard (the agent keeps running) |
 | `x` | Stop the agent on the focused issue |
 | `n` | Jump to the next issue whose agent needs you |
+| `v` | Right pane: dependency trees ↔ the live **chat wall** |
+| `r` | Left pane: the issue list ↔ the **agents roster** |
+| `p` | Pin / unpin a chat so it stays on the wall while you browse |
+| `i` | **Write to** the selected agent — message it without a full attach |
+| <code>&#124;</code> | Cycle the chat wall's split: stacked rows → side-by-side columns → grid |
+| `]` / `[` | Step the lens to the next / previous agent's chat |
 
-Each issue node is annotated with its agent's state: `◌` spawning · `▸` running ·
-`⚑` needs you · `◦` idle · `✓` done · `✗` failed; the header shows a fleet
-summary (`3 agents · 1 needs you`). Agents that raise a permission prompt or go
-idle light up live via Claude **hooks** posted to a loopback endpoint — no
-polling. Sessions are durable: lindep persists each agent's `session_id` and
-`--resume`s it on relaunch, so the *process* is disposable but the *conversation*
-is not. All cockpit state lives under `.lindep/` (gitignored); outside a git
-repo (or with `--demo`) lindep is just the graph viewer.
+Each issue **row** carries its agent's state two ways: a whole-row colour tint
+plus a trailing marker — `◌` spawning · `▸` running · `⚑` needs you (the row
+breathes) · `◦` idle · `✓` done · `✗` failed; the header shows a fleet summary
+(`3 agents · 1 needs you`). The **agents roster** (`r`) is a salience-sorted tab
+— needs-you first, then live work, then idle, then finished — so triage is one
+glance and the cursor drives the chat wall as you step it. The **chat wall** (`v`)
+previews several agents' live screens at once; press `i` to type a line straight
+to the agent under the cursor (answer a prompt, nudge it) without the full-screen
+attach, or `t` to take it over completely.
+
+Agents that raise a permission prompt or go idle light up live via Claude
+**hooks** posted to a loopback endpoint — no polling. Sessions are durable:
+lindep persists each agent's `session_id` and `--resume`s it on relaunch, so the
+*process* is disposable but the *conversation* is not. All cockpit state lives
+under `.lindep/` (gitignored); outside a git repo (or with `--demo`) lindep is
+just the graph viewer.
 
 ### Rebinding keys
 

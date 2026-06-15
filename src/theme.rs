@@ -17,6 +17,10 @@ pub const GREEN_400: Color = Color::Rgb(0x6F, 0xA6, 0x8C);
 pub const GREEN_500: Color = Color::Rgb(0x41, 0x85, 0x5F);
 pub const GREEN_600: Color = Color::Rgb(0x20, 0x69, 0x4A);
 pub const GREEN_700: Color = Color::Rgb(0x15, 0x52, 0x39);
+// Darker still — the quiet idle-cursor background. Dimmer than GREEN_700 (so the
+// idle selection stays subordinate to the active one) yet brighter in the green
+// channel than any `agent_row_bg` tint, so the cursor reads on a coloured row.
+pub const GREEN_900: Color = Color::Rgb(0x0E, 0x3A, 0x29);
 
 // ── Graphite neutrals — text and structure ─────────────────────────────────
 pub const INK: Color = Color::Rgb(0xF4, 0xF5, 0xF6); // primary text
@@ -53,9 +57,13 @@ pub fn cursor_active() -> Style {
 }
 
 /// Selection style for a pane that is *not* focused: we still mark where the
-/// cursor rests, but quietly, so only one selection ever looks "live".
+/// cursor rests, but quietly, so only one selection ever looks "live". Carries a
+/// dim green *background* (not just green text) so the cursor stays legible even
+/// when it lands on a whole-row [`agent_row_bg`] tint — without that bg the only
+/// cue would be a grey→green text shift over a coloured row, easy to miss. Still
+/// clearly subordinate to [`cursor_active`]: dimmer, and not bold.
 pub fn cursor_idle() -> Style {
-    Style::new().fg(GREEN_400)
+    Style::new().bg(GREEN_900).fg(GREEN_100)
 }
 
 /// Glyph + colour for a workflow state. Matched defensively — Linear's
@@ -131,6 +139,28 @@ pub fn agent_marker(status: AgentStatus, frame: u64) -> (&'static str, Style) {
     }
 }
 
+/// A subtle, dark background tint for a list row whose issue has an agent — so
+/// the *whole* row, not just a left gutter, carries the state colour. Kept very
+/// dark (low luminance, just enough chroma to read as the status hue) for two
+/// reasons: INK / MUTED text must stay legible on a dark terminal, and the
+/// racing-green selection highlight ([`cursor_active`], a `GREEN_700` background)
+/// must still clearly win on the focused row. needs-you *breathes* in step with
+/// [`needs_you_style`] so the one must-act state pulses across the full row;
+/// every other state is steady (its marker/spinner already carries any motion).
+pub fn agent_row_bg(status: AgentStatus, frame: u64) -> Color {
+    match status {
+        AgentStatus::Spawning => Color::Rgb(0x10, 0x1C, 0x16),
+        AgentStatus::Running => Color::Rgb(0x2B, 0x1A, 0x0C),
+        // The same ~1.2 s heartbeat as the flag/header, applied to the row tint.
+        AgentStatus::NeedsYou if (frame / 6).is_multiple_of(2) => Color::Rgb(0x3A, 0x2B, 0x0D),
+        AgentStatus::NeedsYou => Color::Rgb(0x24, 0x1B, 0x09),
+        AgentStatus::Idle => Color::Rgb(0x0E, 0x20, 0x19),
+        AgentStatus::Stopped => Color::Rgb(0x17, 0x18, 0x1A),
+        AgentStatus::Done => Color::Rgb(0x0C, 0x22, 0x17),
+        AgentStatus::Failed => Color::Rgb(0x2C, 0x12, 0x10),
+    }
+}
+
 /// Glyph + colour for priority. A leading space keeps the column aligned when a
 /// priority marker is absent.
 pub fn priority_marker(priority: Priority) -> (&'static str, Color) {
@@ -167,6 +197,23 @@ mod tests {
             glyphs.len(),
             ALL.len(),
             "two states share a glyph: {glyphs:?}"
+        );
+    }
+
+    #[test]
+    fn the_needs_you_row_tint_breathes_while_other_states_hold_steady() {
+        // needs-you is the one row tint that pulses (it shares the flag's
+        // heartbeat), so two phases of the cycle must differ…
+        assert_ne!(
+            agent_row_bg(AgentStatus::NeedsYou, 0),
+            agent_row_bg(AgentStatus::NeedsYou, 6),
+            "the needs-you row tint must breathe between frames"
+        );
+        // …while a working agent's tint is steady (its spinner carries the motion).
+        assert_eq!(
+            agent_row_bg(AgentStatus::Running, 0),
+            agent_row_bg(AgentStatus::Running, 6),
+            "non-needs-you row tints must not flicker"
         );
     }
 

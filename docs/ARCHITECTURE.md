@@ -22,7 +22,7 @@ degrades cleanly to the read-only graph viewer.
 
 | Layer | Module(s) | Responsibility |
 |-------|-----------|----------------|
-| 1. Cockpit (TUI) | `app`, `ui`, `theme`, `keymap` | State, input (via a remappable keymap), rendering — incl. the fleet markers, the switchable chat wall and the attach pane |
+| 1. Cockpit (TUI) | `app`, `ui`, `theme`, `keymap` | State, input (via a remappable keymap), rendering — incl. the whole-row fleet tints, the agents roster, the tileable chat wall, the composer and the attach pane |
 | 2. Linear client | `linear` | Blocking `ureq` GraphQL read (personal key); write-back is v2 |
 | 3. Control plane | `backend` | `AgentBackend` trait + `PtyAgent` (PTY host); Codex/Aider slot in here |
 | 4. Pipeline engine | *(v3)* | Generic stage machine over `.lindep/pipeline.toml` — not in v1 |
@@ -193,7 +193,10 @@ cargo run -- --demo          # graph viewer only, no agents, no key needed
 |-----|--------|
 | `a` | Open an agent on the focused issue (resumes if it ran before). One agent per issue — a live one is never duplicated |
 | `v` | Toggle the right pane between the dependency trees and the live agent chats |
+| `r` | Toggle the left pane between the issue list and the agents roster |
 | `p` | Pin / unpin the focused issue's chat to the chat wall (stays while you browse) |
+| `i` | Open the composer — type one line to the selected/pinned agent's PTY without a full attach |
+| <code>&#124;</code> | Cycle the chat wall's split: stacked rows → side-by-side columns → grid |
 | `]` / `[` | Switch the lens to the next / previous agent's chat |
 | `t` | Attach to its live terminal (all keys go to the agent) |
 | `F10` | Detach (agent keeps running) |
@@ -206,11 +209,27 @@ cargo run -- --demo          # graph viewer only, no agents, no key needed
 don't accidentally spin up a duplicate, and the cockpit enforces one agent per
 issue. The **chat wall** (`v`) shows several agents' live screens at once —
 read-only previews, reflowed to fit — with pinned chats kept on screen while the
-selection's chat follows wherever you browse.
+selection's chat follows wherever you browse. Its panes tile three ways (`|`):
+stacked rows, side-by-side columns, or a near-square grid.
 
-Agent state reads three ways at once — a left-edge **gutter bar** (`▎`, so it
-survives the selection highlight), a trailing **marker**, and (on the chat wall)
-the pane **border**:
+Three lighter-weight affordances sit between "glance" and "take over":
+
+- The **agents roster** (`r`) is the left pane's second tab — every issue with an
+  agent, salience-sorted (needs-you → working → idle → terminal) and stepped with
+  the same cursor that drives the chat wall, so it's a triage list, not just a
+  count.
+- The **composer** (`i`) writes one line straight to the selected (or first
+  pinned) live agent's PTY — answer a permission prompt, nudge an idle agent —
+  without the full-screen attach takeover. It captures the keyboard the way
+  search does; Enter sends, Esc closes. For anything richer (arrow keys, Ctrl
+  chords) you still `t` to attach.
+- The **split** (`|`) is per-wall, so you choose left/right vs above/below to suit
+  the terminal's shape.
+
+Agent state reads several ways at once — a whole-row **colour tint** (the entire
+issue/roster row, not just an edge; needs-you breathes), a left-edge **gutter
+bar** (`▎`, so it survives the selection highlight), a trailing **marker**, and
+(on the chat wall) the pane **border**:
 
 | State | Glyph | Colour | Animated |
 |-------|-------|--------|----------|

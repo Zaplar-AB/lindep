@@ -38,12 +38,61 @@ pub enum Mode {
 }
 
 /// What fills the right half of the lens: the dependency trees, or the live
-/// agent chats. Toggled with the `chat` key; the left issue list (the
-/// navigation spine) stays put either way.
+/// agent chats. Toggled with the `chat` key; the left pane (the navigation
+/// spine) stays put either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RightView {
     Deps,
     Chat,
+}
+
+/// What fills the left pane: the full issue list (the navigation spine) or the
+/// agents roster — every issue that has an agent, sorted by how much it wants
+/// your attention. A "tab" you flip with the `agents` key; selecting a roster
+/// row re-aims the lens (and the chat wall) at that agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftView {
+    Issues,
+    Agents,
+}
+
+/// How the chat wall splits its space between panes. The default stacks them in
+/// rows (good when the wall is tall and narrow); `Side` puts them in columns
+/// (good on a wide terminal); `Grid` tiles them near-square for three or four
+/// agents at once. Cycled with the `chat-layout` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatSplit {
+    Stack,
+    Side,
+    Grid,
+}
+
+impl ChatSplit {
+    const fn next(self) -> Self {
+        match self {
+            ChatSplit::Stack => ChatSplit::Side,
+            ChatSplit::Side => ChatSplit::Grid,
+            ChatSplit::Grid => ChatSplit::Stack,
+        }
+    }
+    pub const fn label(self) -> &'static str {
+        match self {
+            ChatSplit::Stack => "stack",
+            ChatSplit::Side => "side",
+            ChatSplit::Grid => "grid",
+        }
+    }
+}
+
+/// An in-progress message being typed to one agent from the chat wall — the
+/// lightweight alternative to a full-screen attach. Holds the agent it targets
+/// (resolved when the composer opens, so it stays put while you type) and the
+/// line buffered locally until you press Enter, when it's written to that
+/// agent's PTY in one go.
+#[derive(Debug, Clone)]
+pub struct Compose {
+    pub target: String,
+    pub buffer: String,
 }
 
 /// A brief, self-extinguishing highlight on an issue's node — the "juice" that
@@ -187,6 +236,13 @@ pub struct App {
     pub preview_size: HashMap<String, (u16, u16)>,
     /// Which widget fills the right half of the lens (deps trees vs agent chats).
     pub right_view: RightView,
+    /// Which list fills the left pane (the issue list vs the agents roster).
+    pub left_view: LeftView,
+    /// How the chat wall arranges its panes (stacked rows / side columns / grid).
+    pub chat_split: ChatSplit,
+    /// An open chat composer, or `None`. While `Some`, keystrokes feed the
+    /// message buffer instead of the dashboard bindings (like `search_active`).
+    pub compose: Option<Compose>,
     /// Issues whose chat is pinned to the chat wall — kept visible while you
     /// browse other issues. Ordered (a `Vec`, not a set) so pins stay put.
     pub pinned: Vec<String>,
@@ -258,6 +314,9 @@ impl App {
             attached: None,
             preview_size: HashMap::new(),
             right_view: RightView::Deps,
+            left_view: LeftView::Issues,
+            chat_split: ChatSplit::Stack,
+            compose: None,
             pinned: Vec::new(),
             pending_attach: None,
             frame: 0,
@@ -475,6 +534,11 @@ impl App {
             self.focus
         };
         match pane {
+            // The agents roster is its own left-pane "tab": stepping it walks the
+            // salience-sorted agents (relative to where the lens sits) and re-aims
+            // the lens at each, so it drives the chat wall the way the issue list
+            // drives the deps view.
+            Pane::List if self.left_view == LeftView::Agents => self.move_roster(delta),
             Pane::List => {
                 move_state(&mut self.list_state, self.order.len(), delta);
                 if let Some(i) = self.list_state.selected()
@@ -617,6 +681,15 @@ impl App {
             return;
         }
 
+        // The chat composer captures the keyboard the same way search does — its
+        // keys build a message, not dashboard actions — so it's checked before the
+        // needs-you acknowledgement and the bindings below. (Typing a reply to an
+        // agent shouldn't silently clear the needs-you alert until it's sent.)
+        if self.compose.is_some() {
+            self.on_compose_key(key);
+            return;
+        }
+
         // A dashboard keypress acknowledges any standing needs-you footer and
         // clears the transient status line.
         self.status_msg = None;
@@ -689,6 +762,9 @@ impl App {
             Action::TogglePin => self.toggle_pin_current(),
             Action::CycleChat => self.cycle_chat(1),
             Action::CycleChatBack => self.cycle_chat(-1),
+            Action::ComposeChat => self.open_compose(),
+            Action::ToggleRoster => self.toggle_roster(),
+            Action::CycleChatLayout => self.cycle_chat_layout(),
             Action::CycleFilter => {
                 self.filter = self.filter.next();
                 self.rebuild_order();
@@ -706,6 +782,9 @@ impl App {
             Action::StartSearch => {
                 self.search_active = true;
                 self.focus = Pane::List;
+                // Search filters the issue list, so surface it (you can't fuzzy-find
+                // against the agents roster).
+                self.left_view = LeftView::Issues;
             }
             Action::ToggleHelp => self.show_help = !self.show_help,
         }
@@ -771,6 +850,10 @@ impl App {
                 if !keep {
                     self.backends.remove(&issue);
                 }
+                // A composer aimed at this agent now points at a dead PTY (even a
+                // kept, pinned EXITED card can't take input) — close it so the
+                // "✎ …" bar can't outlive the agent it claims to message.
+                self.close_compose_for(&issue);
                 true
             }
             AppEvent::AgentNeedsYou { issue, reason } => {
@@ -855,6 +938,7 @@ impl App {
                 if !keep {
                     self.backends.remove(&issue);
                 }
+                self.close_compose_for(&issue);
                 true
             }
         }
@@ -1097,6 +1181,181 @@ impl App {
         self.pinned.push(key.clone());
         self.right_view = RightView::Chat;
         self.status_msg = Some(format!("pinned {key} · stays while you browse"));
+    }
+
+    // ── Agents roster (the left "AGENTS" tab) ────────────────────────────────
+
+    /// The agents roster: every issue that currently has an agent, ordered by how
+    /// loudly it's calling for attention — needs-you first, then live work, then
+    /// idle, then the terminal states that linger until reaped. Ties break on the
+    /// natural issue id. This is what the left pane's "AGENTS" tab lists and the
+    /// order the roster cursor steps through.
+    pub fn agent_order(&self) -> Vec<String> {
+        let mut agents: Vec<(&String, AgentStatus)> =
+            self.fleet.iter().map(|(k, s)| (k, *s)).collect();
+        agents.sort_by(|(ka, sa), (kb, sb)| {
+            sa.salience_rank()
+                .cmp(&sb.salience_rank())
+                .then_with(|| natural_key_cmp(ka, kb))
+        });
+        agents.into_iter().map(|(k, _)| k.clone()).collect()
+    }
+
+    /// Step the roster cursor by `delta` (wrapping) and re-aim the lens at the
+    /// agent it lands on — the roster analogue of moving the issue list, so the
+    /// chat wall follows. A no-op when nothing is running.
+    fn move_roster(&mut self, delta: i32) {
+        let agents = self.agent_order();
+        if agents.is_empty() {
+            return;
+        }
+        let next = match agents.iter().position(|k| *k == self.root) {
+            Some(i) => (i as i32 + delta).rem_euclid(agents.len() as i32) as usize,
+            None if delta >= 0 => 0,
+            None => agents.len() - 1,
+        };
+        // Re-aim without touching history — same as issue-list navigation. Sync
+        // the issue-list selection too (every other re-aim path does, via
+        // `set_root`/`move_selection`), so flipping back to the ISSUES tab finds
+        // its highlight on `root`, not stranded on a stale row.
+        self.root = agents[next].clone();
+        self.sync_list_selection();
+        self.rebuild_trees();
+    }
+
+    /// Flip the left pane between the issue list and the agents roster (the
+    /// `agents` key). The lens (and thus the chat wall) is untouched, so an agent
+    /// already in view stays selected when its roster row appears.
+    fn toggle_roster(&mut self) {
+        self.left_view = match self.left_view {
+            LeftView::Issues => LeftView::Agents,
+            LeftView::Agents => LeftView::Issues,
+        };
+        if self.left_view == LeftView::Agents && self.fleet.is_empty() {
+            self.status_msg = Some("no agents yet — a on an issue to open one".into());
+        }
+    }
+
+    // ── Chat wall layout + composer ──────────────────────────────────────────
+
+    /// Cycle the chat wall's split (the `chat-layout` key): stacked rows →
+    /// side-by-side columns → grid. Switches to the chat view so the change is
+    /// visible and drops the cached pane geometry so every shown agent reflows to
+    /// its new Rect.
+    fn cycle_chat_layout(&mut self) {
+        self.chat_split = self.chat_split.next();
+        // Reveal the surface this acts on: the chat wall only renders in the lens,
+        // so from the graph overview this would otherwise be an invisible no-op.
+        self.mode = Mode::Lens;
+        self.right_view = RightView::Chat;
+        // Each pane's Rect moves under the new split; forget the cached sizes so
+        // the next render re-resizes every live agent to where it now sits.
+        self.preview_size.clear();
+        self.set_footer(format!("chat layout: {}", self.chat_split.label()));
+    }
+
+    /// Open the chat composer on the agent under the cursor — message it without
+    /// the full-screen attach takeover (the `compose` key). Targets the live
+    /// selection, else the first pinned live agent; refuses when there's no live
+    /// agent on the wall to talk to. Switches to the chat view so you see the pane
+    /// you're typing into.
+    fn open_compose(&mut self) {
+        // Resolve the target *before* touching the view, so a refusal leaves you
+        // where you were instead of yanking you into an empty chat wall.
+        let Some(target) = self.compose_target() else {
+            self.status_msg =
+                Some("no live agent here to message — a opens one, t attaches".into());
+            return;
+        };
+        // Reveal the pane you're typing into: the composer only renders on the
+        // chat wall in the lens, so force both (else `i` from the graph overview
+        // would silently capture the keyboard into an invisible buffer).
+        self.mode = Mode::Lens;
+        self.right_view = RightView::Chat;
+        self.compose = Some(Compose {
+            target,
+            buffer: String::new(),
+        });
+        self.status_msg = None;
+    }
+
+    /// The agent a freshly-opened composer targets: the live selection if there
+    /// is one, otherwise the first pinned agent still live. Only a running PTY can
+    /// take input, so terminal/exited agents are skipped.
+    fn compose_target(&self) -> Option<String> {
+        let is_live = |k: &str| {
+            self.backends
+                .get(k)
+                .is_some_and(|b| matches!(b.status(), Lifecycle::Running))
+        };
+        if let Some(key) = self.focused_issue().map(|i| i.key.clone())
+            && is_live(&key)
+        {
+            return Some(key);
+        }
+        self.pinned.iter().find(|k| is_live(k)).cloned()
+    }
+
+    /// Handle a key while the composer is open: Enter sends the line, Esc closes
+    /// the composer, Backspace / char edit the buffer — mirroring the search input.
+    fn on_compose_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.compose = None;
+                self.status_msg = None;
+            }
+            KeyCode::Enter => self.send_compose(),
+            KeyCode::Backspace => {
+                if let Some(c) = self.compose.as_mut() {
+                    c.buffer.pop();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(c) = self.compose.as_mut() {
+                    c.buffer.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Write the composed line (plus a carriage return, to submit it) to the
+    /// target agent's PTY, then clear the buffer so you can keep chatting. An
+    /// empty line is ignored; a vanished or closed PTY closes the composer with a
+    /// note rather than dropping keystrokes into a dead terminal.
+    fn send_compose(&mut self) {
+        // Pull what we need out of the immutable borrow first, so the send and the
+        // buffer reset below can take `&mut self` freely.
+        let (issue, line) = match &self.compose {
+            Some(c) if !c.buffer.trim().is_empty() => (c.target.clone(), c.buffer.clone()),
+            _ => return, // no composer, or nothing worth sending
+        };
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\r');
+        let Some(backend) = self.backends.get(&issue) else {
+            self.compose = None;
+            self.set_footer(format!("agent on {issue} is gone"));
+            return;
+        };
+        if backend.send_input(&bytes).is_ok() {
+            if let Some(c) = self.compose.as_mut() {
+                c.buffer.clear();
+            }
+            self.set_footer(format!("sent to {issue}"));
+        } else {
+            self.compose = None;
+            self.set_footer(format!("agent on {issue} is no longer accepting input"));
+        }
+    }
+
+    /// Close the composer if it's aimed at `issue` — called when that agent's PTY
+    /// dies or it's reaped, so a background exit while you're mid-message can't
+    /// leave the "✎ …" bar lying about a target that no longer exists.
+    fn close_compose_for(&mut self, issue: &str) {
+        if self.compose.as_ref().is_some_and(|c| c.target == issue) {
+            self.compose = None;
+            self.set_footer(format!("agent on {issue} is gone — composer closed"));
+        }
     }
 
     /// Step the lens to the next/prev issue that has a live agent screen,
@@ -2191,5 +2450,127 @@ mod tests {
         }
         assert_eq!(app.root, root);
         assert!(!app.up_rows.is_empty());
+    }
+
+    // ── Cockpit v2: roster, composer, split orientation ──────────────────────
+
+    #[test]
+    fn agent_order_sorts_by_salience_not_by_id() {
+        let mut app = app();
+        let k: Vec<String> = app.order.iter().take(4).cloned().collect();
+        app.fleet.insert(k[0].clone(), AgentStatus::Done);
+        app.fleet.insert(k[1].clone(), AgentStatus::NeedsYou);
+        app.fleet.insert(k[2].clone(), AgentStatus::Running);
+        app.fleet.insert(k[3].clone(), AgentStatus::Idle);
+        // needs-you → running → idle → done, regardless of issue id.
+        assert_eq!(
+            app.agent_order(),
+            vec![k[1].clone(), k[2].clone(), k[3].clone(), k[0].clone()]
+        );
+    }
+
+    #[test]
+    fn the_agents_tab_drives_the_lens_through_running_agents() {
+        let mut app = app();
+        let k: Vec<String> = app.order.iter().take(2).cloned().collect();
+        app.fleet.insert(k[0].clone(), AgentStatus::Idle);
+        app.fleet.insert(k[1].clone(), AgentStatus::NeedsYou);
+
+        press(&mut app, KeyCode::Char('r')); // flip the left pane to the roster
+        assert_eq!(app.left_view, LeftView::Agents);
+
+        press(&mut app, KeyCode::Down);
+        let first = app.root.clone();
+        assert!(
+            app.fleet.contains_key(&first),
+            "the roster re-aims the lens at an agent"
+        );
+        press(&mut app, KeyCode::Down);
+        assert_ne!(first, app.root, "each step lands on a different agent");
+        assert!(app.fleet.contains_key(&app.root));
+
+        press(&mut app, KeyCode::Char('r')); // flip back to the issue list
+        assert_eq!(app.left_view, LeftView::Issues);
+        // Roster navigation must keep the issue-list selection in lockstep with
+        // `root` (the single source of truth) — else the list highlights a stale,
+        // unrelated row when you flip back.
+        assert_eq!(
+            app.list_state.selected(),
+            app.order.iter().position(|k| *k == app.root),
+            "the issue-list highlight tracks root after roster navigation"
+        );
+    }
+
+    #[test]
+    fn refusing_to_compose_leaves_the_view_untouched() {
+        let mut app = app();
+        assert_eq!(app.right_view, RightView::Deps);
+        press(&mut app, KeyCode::Char('i')); // no live agent → refused
+        assert!(app.compose.is_none());
+        // A refusal must not yank you out of the deps view into an empty chat wall.
+        assert_eq!(app.right_view, RightView::Deps);
+    }
+
+    #[test]
+    fn an_open_composer_closes_when_its_target_agent_is_reaped() {
+        let mut app = app();
+        let issue = app.root.clone();
+        app.compose = Some(Compose {
+            target: issue.clone(),
+            buffer: "half a message".into(),
+        });
+        // A background teardown of the very agent you're messaging must not leave
+        // the "✎ …" bar lying about a target that no longer exists.
+        app.apply_event(AppEvent::AgentReaped {
+            issue: issue.clone(),
+        });
+        assert!(app.compose.is_none(), "the composer closes with its target");
+    }
+
+    #[test]
+    fn the_chat_layout_key_cycles_stack_side_grid() {
+        let mut app = app();
+        assert_eq!(app.chat_split, ChatSplit::Stack);
+        press(&mut app, KeyCode::Char('|'));
+        assert_eq!(app.chat_split, ChatSplit::Side);
+        // Cycling the layout reveals the wall so the change is visible.
+        assert_eq!(app.right_view, RightView::Chat);
+        press(&mut app, KeyCode::Char('|'));
+        assert_eq!(app.chat_split, ChatSplit::Grid);
+        press(&mut app, KeyCode::Char('|'));
+        assert_eq!(app.chat_split, ChatSplit::Stack);
+    }
+
+    #[test]
+    fn composing_refuses_when_there_is_no_live_agent_to_message() {
+        let mut app = app(); // no backends in a plain demo app
+        press(&mut app, KeyCode::Char('i'));
+        assert!(app.compose.is_none());
+        assert!(
+            app.status_msg
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no live agent"),
+            "it explains why instead of silently doing nothing"
+        );
+    }
+
+    #[test]
+    fn the_composer_captures_keys_and_esc_closes_it() {
+        let mut app = app();
+        // Drive the composer state directly (opening it needs a live PTY).
+        app.compose = Some(Compose {
+            target: "ZAP-1".into(),
+            buffer: String::new(),
+        });
+        // A letter binding (`i` = compose) builds the message, it doesn't re-fire.
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.compose.as_ref().unwrap().buffer, "hi");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.compose.as_ref().unwrap().buffer, "h");
+        press(&mut app, KeyCode::Esc); // esc closes the composer (not the app)
+        assert!(app.compose.is_none());
+        assert!(!app.should_quit);
     }
 }
