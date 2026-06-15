@@ -7,21 +7,8 @@ Linear lets you mark that one issue *blocks* another, but there's no good way to
 see the whole dependency web at a glance. `lindep` pulls a project's issues and
 their `blocks` relations and renders them as a clean, navigable graph.
 
-```
-  lindep · Inference Platform  12 issues · 12 edges · 1 cycles ↺          filter:all sort:blocked
-┌ ISSUES 11 ───────────────────────────────┐┌ ◆ ZAP-204  Streaming token API ───────────────────────┐
-│▸ ◐ ▲ ZAP-204  Streaming token API ⊘ ↺    ││▲ UPSTREAM · must finish first (4 direct · 8 total)     │
-│  ◐ ▲ ZAP-201  GPU pool autoscaler ⊘      ││  ├─ ◐ ◦ ZAP-188  gRPC transport upgrade                │
-│  ○ ▲ ZAP-212  Multi-region failover ⊘ ↺  ││  │  └─ ● △ ZAP-150  Protobuf schema freeze             │
-│  ◐ △ ZAP-240  Token usage metering ⊘ ↺   ││  ├─ ◐ ▲ ZAP-201  GPU pool autoscaler                   │
-│  ◐   ZAP-205  SSE backpressure ⊘         ││  │  └─ ⇗ INFRA-77 Terraform GPU module [ext]           │
-│  …                                       ││  └─ ○ ▲ ZAP-212  Multi-region failover ↺               │
-│                                          ││▼ DOWNSTREAM · this unblocks (3 direct · 7 total)       │
-│                                          ││  ├─ ◐   ZAP-205  SSE backpressure                      │
-│                                          ││  └─ ◐ △ ZAP-240  Token usage metering ↺                │
-└──────────────────────────────────────────┘└────────────────────────────────────────────────────────┘
- ◐ ZAP-204 In Progress · @r.okafor · blocks 3 (↓7) · blocked-by 4 (↑8) · ⊘ blocked · ↺ in cycle
-```
+<img width="1277" height="737" alt="image" src="https://github.com/user-attachments/assets/382ae598-8cec-4cce-b35a-77cdffbdd4a4" />
+
 
 ## Install
 
