@@ -47,6 +47,43 @@ pub const STATUS_600: Color = Color::Rgb(0x0F, 0x84, 0x44);
 //    merely "attention". ──────────────────────────────────────────────────────
 pub const RED_400: Color = Color::Rgb(0xE0, 0x5A, 0x4B);
 
+// ── Violet — the cockpit-v3 focus colour. House rule: racing green stays
+//    reserved for the agent / active selection (see the module header), so the
+//    *window-manager* focus ring needs its own hue that never competes with a
+//    green selection inside a pane. Violet is that hue — the thick/double border
+//    of whichever column currently owns your keys. VIOLET_400 is the steady
+//    focus ring; VIOLET_200 is a brighter accent for a focused title chip. ─────
+pub const VIOLET_400: Color = Color::Rgb(0x9B, 0x87, 0xF5);
+pub const VIOLET_200: Color = Color::Rgb(0xC4, 0xB9, 0xFA);
+
+/// Border style for the focused window — a steady (frame-independent) violet, so
+/// the focus ring never strobes. Pairs with `BorderType::Double` at the call
+/// site; status hue ([`window_status_hue`]) carries the *unfocused* borders.
+pub fn focus_border_style() -> Style {
+    Style::new().fg(VIOLET_400).add_modifier(Modifier::BOLD)
+}
+
+/// Border hue + short label for an *unfocused* window, by its agent status — the
+/// status the title bar / border communicates at a glance (running-orange,
+/// needs-you breathing-amber, idle-cyan…). Lifted verbatim from the v2
+/// `chat_pane_chrome` so the colour vocabulary is unchanged; `None` is a
+/// non-agent window (Deps/Spine) or one whose status hasn't landed yet, and
+/// `exited` is the sub-frame window where the PTY is gone but no terminal status
+/// has arrived. needs-you *breathes* via [`needs_you_style`] at the call site.
+pub fn window_status_hue(status: Option<AgentStatus>, exited: bool) -> (Color, &'static str) {
+    match status {
+        Some(AgentStatus::Spawning) => (GREEN_400, "STARTING"),
+        Some(AgentStatus::Running) => (ORANGE_400, "WORKING"),
+        Some(AgentStatus::NeedsYou) => (AMBER_400, "NEEDS YOU"),
+        Some(AgentStatus::Idle) => (STATUS_400, "IDLE"),
+        Some(AgentStatus::Stopped) => (MUTED, "STOPPED"),
+        Some(AgentStatus::Done) => (STATUS_400, "DONE"),
+        Some(AgentStatus::Failed) => (RED_400, "FAILED"),
+        None if exited => (AMBER_400, "EXITED"),
+        None => (BORDER, "AGENT"),
+    }
+}
+
 /// Selection style for the pane that currently holds focus — the one moving,
 /// racing-green element on screen.
 pub fn cursor_active() -> Style {

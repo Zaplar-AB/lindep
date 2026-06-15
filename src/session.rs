@@ -542,6 +542,124 @@ pub async fn persist_snapshot(events: &AppEventTx, path: PathBuf, bytes: Vec<u8>
     }
 }
 
+// ── Cockpit window-layout persistence (Cockpit v3) ──────────────────────────
+//
+// The *durable conversation* lives in `state.json` (above). The cockpit's
+// *window layout* — which docked windows are open, in what order, the layout
+// mode, and which one had focus — is a separate, view-only concern, so it lives
+// in a sibling `cockpit.json`. Kept apart from `state.json` deliberately: that
+// file has many off-thread writers (supervisor + hook bus), whereas the cockpit
+// layout has exactly one writer (the render thread), so folding them together
+// would invite cross-writer contention for no benefit. Reuses the same atomic,
+// ordered [`SessionStore::write_snapshot`] discipline and version guard.
+
+/// Bump when the on-disk `cockpit.json` shape changes incompatibly.
+const COCKPIT_VERSION: u32 = 1;
+
+fn default_cockpit_version() -> u32 {
+    1
+}
+
+/// The kind of a persisted docked window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedKind {
+    Agent,
+    Deps,
+    Fleet,
+}
+
+/// One docked window, persisted by *identity* (its issue/root), never by index —
+/// so a restore re-finds it against the reconcile survivor set rather than
+/// trusting a position that may no longer mean the same thing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedWindow {
+    pub kind: PersistedKind,
+    /// The issue (Agent) or root (Deps); `None` for the singleton Fleet window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<String>,
+}
+
+/// The persisted cockpit layout: the docked windows in pin order, the layout
+/// mode, and the focused window's identity. A missing file deserializes to the
+/// empty default — exactly today's behaviour — so persistence ships risk-free
+/// behind no flag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CockpitState {
+    #[serde(default = "default_cockpit_version")]
+    pub version: u32,
+    /// `"filmstrip"` or `"mosaic"`; empty/unknown restores the default.
+    #[serde(default)]
+    pub layout: String,
+    #[serde(default)]
+    pub windows: Vec<PersistedWindow>,
+    /// The focused window's identity, or `None` for the Spine / an unpinned
+    /// preview (which isn't persisted, so focus falls back to the Spine).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<PersistedWindow>,
+}
+
+impl Default for CockpitState {
+    fn default() -> Self {
+        CockpitState {
+            version: COCKPIT_VERSION,
+            layout: String::new(),
+            windows: Vec::new(),
+            focus: None,
+        }
+    }
+}
+
+/// Monotonic ordering seq for cockpit writes. The render thread is the sole
+/// writer, so this only has to make [`SessionStore::write_snapshot`]'s per-path
+/// commit gate happy (and the temp file unique per call).
+static COCKPIT_SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl CockpitState {
+    /// `.lindep/cockpit.json` under a repo root.
+    pub fn path(repo_root: impl AsRef<Path>) -> PathBuf {
+        repo_root.as_ref().join(".lindep").join("cockpit.json")
+    }
+
+    /// Load the layout, or the empty default if the file is absent. A file from a
+    /// newer format is refused (so an older build can't clobber it); a corrupt
+    /// file surfaces as `Parse` so the caller can degrade to the default.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, StateError> {
+        let path = path.as_ref();
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let state: CockpitState =
+                    serde_json::from_slice(&bytes).map_err(|source| StateError::Parse {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                if state.version > COCKPIT_VERSION {
+                    return Err(StateError::Version {
+                        path: path.to_path_buf(),
+                        found: state.version,
+                        supported: COCKPIT_VERSION,
+                    });
+                }
+                Ok(state)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CockpitState::default()),
+            Err(source) => Err(StateError::Read {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    /// Persist atomically + durably via the shared [`SessionStore::write_snapshot`]
+    /// discipline. Synchronous — called only by the render thread (the sole
+    /// writer) on a structural change or on quit, never per keystroke.
+    pub fn save(&self, path: &Path) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(StateError::Serialize)?;
+        let seq = COCKPIT_SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SessionStore::write_snapshot(path, &bytes, seq)
+    }
+}
+
 /// Unix seconds now, as advisory wall-clock metadata only. A clock somehow
 /// before the epoch yields 0 rather than panicking — a nonsensical timestamp is
 /// preferable to taking the cockpit down. Wall-clock can jump backward, so the
@@ -583,6 +701,52 @@ mod tests {
         for s in [Stopped, Done, Failed] {
             assert!(!s.is_live(), "{s:?} is not live — its process is gone");
         }
+    }
+
+    #[test]
+    fn cockpit_state_round_trips_through_its_file() {
+        let path = temp_state_path().with_file_name("cockpit.json");
+        // A missing file is the empty default.
+        assert!(CockpitState::load(&path).unwrap().windows.is_empty());
+
+        let state = CockpitState {
+            layout: "mosaic".into(),
+            windows: vec![
+                PersistedWindow {
+                    kind: PersistedKind::Agent,
+                    issue: Some("ENG-1".into()),
+                },
+                PersistedWindow {
+                    kind: PersistedKind::Deps,
+                    issue: Some("ENG-2".into()),
+                },
+                PersistedWindow {
+                    kind: PersistedKind::Fleet,
+                    issue: None,
+                },
+            ],
+            focus: Some(PersistedWindow {
+                kind: PersistedKind::Agent,
+                issue: Some("ENG-1".into()),
+            }),
+            ..CockpitState::default()
+        };
+        state.save(&path).unwrap();
+        let reloaded = CockpitState::load(&path).unwrap();
+        assert_eq!(reloaded.layout, "mosaic");
+        assert_eq!(reloaded.windows, state.windows);
+        assert_eq!(reloaded.focus, state.focus);
+    }
+
+    #[test]
+    fn cockpit_state_rejects_a_file_from_a_newer_format() {
+        let path = temp_state_path().with_file_name("cockpit.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"version":999,"layout":"","windows":[]}"#).unwrap();
+        assert!(matches!(
+            CockpitState::load(&path),
+            Err(StateError::Version { found: 999, .. })
+        ));
     }
 
     #[test]

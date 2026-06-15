@@ -1,98 +1,49 @@
-//! Interactive application state and input handling. Holds the graph, the
-//! currently focused issue ("root" of the lens), the flattened upstream and
-//! downstream trees, and all view state (search, filter, sort, mode). Rendering
-//! lives in [`crate::ui`]; this module never touches the terminal.
+//! Interactive application state and input handling for the cockpit.
+//!
+//! Cockpit v3 is a tmux-style tiling window manager: a horizontal strip of
+//! focusable [`crate::window::Window`]s — the permanent **Spine** (issue list /
+//! agents roster), live **Agent** PTYs, and **Deps** trees (per-issue or the
+//! Fleet map). The focused window gets your keys; the **prefix** (`Ctrl-a`) is
+//! the sole escape to window-manager verbs. [`crate::window::WindowSet`] is the
+//! source of truth for what's on screen; this module owns the rest of the view
+//! state and routes input. Rendering lives in [`crate::ui`]; this module never
+//! touches the terminal.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::backend::{self, AgentBackend, Lifecycle};
 use crate::event::AppEvent;
 use crate::keymap::{Action, Keymap};
+use crate::layout;
 use crate::model::{Direction, Graph, Issue};
-use crate::session::AgentStatus;
+use crate::session::{AgentStatus, CockpitState, PersistedKind, PersistedWindow};
 use crate::supervisor::SupervisorHandle;
+use crate::window::{DepsCursor, DepsRoot, LayoutMode, WindowId, WindowKind, WindowSet};
 
 /// How many animation frames a node flash lasts (~400 ms at the 100 ms tick).
 const FLASH_FRAMES: u64 = 4;
 
-/// Most chat panes shown at once on the chat wall — below ~a handful of rows a
-/// `claude` PTY preview is unreadable, so we cap rather than slice it thinner.
-const MAX_CHAT_PANES: usize = 4;
+/// Hard ceiling (~20 s at the 100 ms tick) on how long the "resuming N…" spinner
+/// keeps the cockpit animating. A resume that wedges (a stuck `git`, a spawn that
+/// never reports) must not pin the loop awake forever; past this the count is
+/// force-cleared so an idle cockpit goes quiet.
+const RESUME_GRACE_FRAMES: u64 = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pane {
-    List,
-    Upstream,
-    Downstream,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Lens,
-    Overview,
-}
-
-/// What fills the right half of the lens: the dependency trees, or the live
-/// agent chats. Toggled with the `chat` key; the left pane (the navigation
-/// spine) stays put either way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RightView {
-    Deps,
-    Chat,
-}
-
-/// What fills the left pane: the full issue list (the navigation spine) or the
+/// What fills the Spine: the full issue list (the navigation spine) or the
 /// agents roster — every issue that has an agent, sorted by how much it wants
-/// your attention. A "tab" you flip with the `agents` key; selecting a roster
-/// row re-aims the lens (and the chat wall) at that agent.
+/// your attention. A "tab" you flip with the roster key; selecting a roster row
+/// re-aims the spine selection at that agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeftView {
     Issues,
     Agents,
-}
-
-/// How the chat wall splits its space between panes. The default stacks them in
-/// rows (good when the wall is tall and narrow); `Side` puts them in columns
-/// (good on a wide terminal); `Grid` tiles them near-square for three or four
-/// agents at once. Cycled with the `chat-layout` key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatSplit {
-    Stack,
-    Side,
-    Grid,
-}
-
-impl ChatSplit {
-    const fn next(self) -> Self {
-        match self {
-            ChatSplit::Stack => ChatSplit::Side,
-            ChatSplit::Side => ChatSplit::Grid,
-            ChatSplit::Grid => ChatSplit::Stack,
-        }
-    }
-    pub const fn label(self) -> &'static str {
-        match self {
-            ChatSplit::Stack => "stack",
-            ChatSplit::Side => "side",
-            ChatSplit::Grid => "grid",
-        }
-    }
-}
-
-/// An in-progress message being typed to one agent from the chat wall — the
-/// lightweight alternative to a full-screen attach. Holds the agent it targets
-/// (resolved when the composer opens, so it stays put while you type) and the
-/// line buffered locally until you press Enter, when it's written to that
-/// agent's PTY in one go.
-#[derive(Debug, Clone)]
-pub struct Compose {
-    pub target: String,
-    pub buffer: String,
 }
 
 /// A brief, self-extinguishing highlight on an issue's node — the "juice" that
@@ -160,41 +111,30 @@ impl Sort {
     }
 }
 
-/// How a node renders inside a dependency tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeKind {
-    Normal,
-    Cycle,    // back-edge to an ancestor on the current path
-    Ref,      // already drawn elsewhere in this tree (a join, not a cycle)
-    External, // lives outside the project — a terminal leaf
-}
-
-/// One rendered line of a dependency tree.
-pub struct TreeRow {
-    pub key: String,
-    pub prefix: String,
-    pub kind: NodeKind,
-    pub has_children: bool,
-    pub collapsed: bool,
-}
-
 pub struct App {
     pub graph: Graph,
     pub order: Vec<String>,
     pub list_state: ListState,
 
+    /// The Spine's current selection — the issue the detail bar describes and the
+    /// attach/spawn button acts on. Re-aimed by list/roster navigation and the
+    /// cycle / needs-you jumps. (Each Deps window keeps its *own* root.)
     pub root: String,
-    history: Vec<String>,
 
-    pub up_rows: Vec<TreeRow>,
-    pub down_rows: Vec<TreeRow>,
-    pub up_state: ListState,
-    pub down_state: ListState,
-    collapsed: HashSet<String>, // "U:KEY" / "D:KEY"
-    collapsed_for: String,      // the root `collapsed` belongs to; reset on re-root
+    /// The window strip — the source of truth for what's on screen.
+    pub windows: WindowSet,
+    /// Last (rows, cols) each *window's* PTY was resized to, keyed by
+    /// [`WindowId`] (not issue) so zoom — which can show one issue at two
+    /// geometries across the toggle frame — and any duplicate window stay
+    /// unambiguous. We reflow a `claude` only when its window's geometry actually
+    /// changes, so browsing/scrolling never churns SIGWINCHes.
+    pub preview_size: HashMap<WindowId, (u16, u16)>,
+    /// Last known terminal area, set on resize. Lets the input/poll side compute
+    /// the post-scroll *visible* window set (which `draw` also derives from the
+    /// real frame) without `draw` mutating state.
+    pub viewport: Rect,
 
-    pub focus: Pane,
-    pub mode: Mode,
+    pub left_view: LeftView,
     pub filter: Filter,
     pub sort: Sort,
     pub search_query: String,
@@ -203,7 +143,7 @@ pub struct App {
     pub status_msg: Option<String>,
     /// True while `status_msg` holds an unacknowledged "needs you" alert. Routine
     /// high-frequency tool chatter (`AgentAction`) must not bury it; it clears the
-    /// moment the human touches a dashboard key (acknowledging) or a deliberate
+    /// moment the human touches a Spine/Deps key (acknowledging) or a deliberate
     /// event replaces the footer.
     needs_you_alert: bool,
     /// Issues with a launch command in flight (sent to the supervisor, not yet
@@ -216,65 +156,63 @@ pub struct App {
     /// without this, that late hook would re-insert a live status for an agent
     /// with no backend, inflating the live count and re-arming the sticky alert
     /// with nothing left to clear it. A real relaunch clears the tombstone via
-    /// `AgentSpawned`, so it never blocks a fresh agent. (Rehydration at startup
-    /// seeds the fleet *before* anything is reaped, so it is unaffected.)
+    /// `AgentSpawned`, so it never blocks a fresh agent.
     reaped: HashSet<String>,
 
     /// Per-issue agent status, driven by the supervisor + notification bus.
     /// Absence of an entry means "no agent" — the fleet view's resting state.
     pub fleet: HashMap<String, AgentStatus>,
     /// Backend handles for agents we launched, keyed by issue. Used to render
-    /// and drive an agent's PTY when attached.
+    /// and drive an agent's PTY.
     pub backends: HashMap<String, Arc<dyn AgentBackend>>,
-    /// The issue whose PTY the cockpit is currently attached to (`None` = the
-    /// dashboard). While attached, all input is forwarded to that agent.
-    pub attached: Option<String>,
-    /// Last (rows, cols) each agent's PTY was resized to, keyed by issue — for
-    /// both the full-screen attach pane and the smaller chat-preview panes. We
-    /// reflow a `claude` only when *its* geometry actually changes, so browsing
-    /// the chat wall doesn't churn SIGWINCHes.
-    pub preview_size: HashMap<String, (u16, u16)>,
-    /// Which widget fills the right half of the lens (deps trees vs agent chats).
-    pub right_view: RightView,
-    /// Which list fills the left pane (the issue list vs the agents roster).
-    pub left_view: LeftView,
-    /// How the chat wall arranges its panes (stacked rows / side columns / grid).
-    pub chat_split: ChatSplit,
-    /// An open chat composer, or `None`. While `Some`, keystrokes feed the
-    /// message buffer instead of the dashboard bindings (like `search_active`).
-    pub compose: Option<Compose>,
-    /// Issues whose chat is pinned to the chat wall — kept visible while you
-    /// browse other issues. Ordered (a `Vec`, not a set) so pins stay put.
-    pub pinned: Vec<String>,
     /// An issue whose agent we just launched and are waiting to come up, so the
-    /// footer can nudge "ready · t to attach" the moment it spawns. Never an
-    /// auto-takeover — launch is async and a surprise full-screen would jar.
+    /// agent's window opens+focuses the moment it spawns (a user-initiated launch
+    /// is the only `AgentSpawned` that steals focus — background/resume spawns
+    /// just populate the roster).
     pub pending_attach: Option<String>,
-    /// Monotonic animation tick, advanced by the render loop only while
-    /// something is animating. The renderer reads it to drive spinners/pulses;
-    /// it never reads a clock, so `ui::draw` stays a pure function of state.
+    /// Monotonic animation tick, advanced by the render loop only while something
+    /// is animating. The renderer reads it to drive spinners/pulses.
     pub frame: u64,
     /// Transient per-issue node flashes: issue → (kind, frame it expires at).
-    /// Written in `apply_event`, pruned each animation tick ([`App::tick_frame`])
-    /// once expired; read by the renderer (which also gates on the expiry frame).
     pub flash: HashMap<String, (Flash, u64)>,
-    /// While attached with a leader-sequence detach key, the leader chord that's
-    /// been pressed and is awaiting its completion (e.g. `Ctrl-A`, waiting for
-    /// `d`). `None` the rest of the time.
-    pub pending_leader: Option<KeyEvent>,
-    /// Handle to the agent supervisor, when the cockpit is running with one
-    /// (absent in `--demo`, snapshots and unit tests).
+    /// True after the prefix chord, while the next key is read as a verb (or a
+    /// second prefix, forwarded to a focused agent as the literal chord). The v3
+    /// generalisation of v2's single `pending_leader` detach gesture.
+    pub prefix_armed: bool,
+    /// The issue whose agent a `Ctrl-a x` kill is awaiting confirmation for. While
+    /// `Some`, the next key confirms (`y`/Enter) or cancels — kill is destructive,
+    /// so it's never a single keystroke.
+    pub kill_confirm: Option<String>,
+    /// How many docked agents are still pending an auto-resume (Phase 6). Drives
+    /// the "resuming N…" header and keeps the loop animating until it settles.
+    pub resuming_count: usize,
+    /// Frame at which a stuck resume spinner is force-cleared (see
+    /// [`RESUME_GRACE_FRAMES`]).
+    resume_deadline: u64,
+    /// Whether auto-resume is on (off under `--no-resume`, in `--demo`, tests).
+    /// Gates the lazy resume-on-first-focus of docked agents.
+    auto_resume: bool,
+    /// Handle to the agent supervisor, when running with one (absent in `--demo`,
+    /// snapshots and unit tests).
     pub supervisor: Option<SupervisorHandle>,
     /// Active key bindings (defaults, overridden by `config.toml`).
     pub keymap: Keymap,
+
+    /// Where the window layout persists (`.lindep/cockpit.json`), or `None` when
+    /// the control plane is off (`--demo`, snapshots, tests) — those never write.
+    pub cockpit_path: Option<PathBuf>,
+    /// Set when the docked window set / layout / focus changed and the layout
+    /// should be re-persisted. The render thread (the sole cockpit writer) checks
+    /// it after handling input and saves, so a structural change survives a crash.
+    pub cockpit_dirty: bool,
 
     pub should_quit: bool,
 }
 
 impl App {
     pub fn new(graph: Graph) -> Self {
-        // Default focus: the most-connected real issue — usually the spine of
-        // the dependency web — so the lens opens somewhere interesting.
+        // Default selection: the most-connected real issue — usually the spine of
+        // the dependency web — so the cockpit opens somewhere interesting.
         let root = graph
             .keys()
             .iter()
@@ -286,20 +224,23 @@ impl App {
             .cloned()
             .unwrap_or_default();
 
+        let mut windows = WindowSet::new();
+        // Open showing the dependency lens for the default selection, focused on
+        // the Spine — so the cockpit opens like the v2 lens did, ready to browse.
+        if !root.is_empty() {
+            windows.open_or_reroot_deps(root.clone(), &graph);
+            windows.focus = 0;
+        }
+
         let mut app = App {
             graph,
             order: Vec::new(),
             list_state: ListState::default(),
             root,
-            history: Vec::new(),
-            up_rows: Vec::new(),
-            down_rows: Vec::new(),
-            up_state: ListState::default(),
-            down_state: ListState::default(),
-            collapsed: HashSet::new(),
-            collapsed_for: String::new(),
-            focus: Pane::List,
-            mode: Mode::Lens,
+            windows,
+            preview_size: HashMap::new(),
+            viewport: Rect::new(0, 0, 80, 24),
+            left_view: LeftView::Issues,
             filter: Filter::All,
             sort: Sort::Ready,
             search_query: String::new(),
@@ -311,23 +252,21 @@ impl App {
             reaped: HashSet::new(),
             fleet: HashMap::new(),
             backends: HashMap::new(),
-            attached: None,
-            preview_size: HashMap::new(),
-            right_view: RightView::Deps,
-            left_view: LeftView::Issues,
-            chat_split: ChatSplit::Stack,
-            compose: None,
-            pinned: Vec::new(),
             pending_attach: None,
             frame: 0,
             flash: HashMap::new(),
-            pending_leader: None,
+            prefix_armed: false,
+            kill_confirm: None,
+            resuming_count: 0,
+            resume_deadline: 0,
+            auto_resume: false,
             supervisor: None,
             keymap: Keymap::default(),
+            cockpit_path: None,
+            cockpit_dirty: false,
             should_quit: false,
         };
         app.rebuild_order();
-        app.rebuild_trees();
         app
     }
 
@@ -335,15 +274,25 @@ impl App {
         self.graph.get(&self.root)
     }
 
-    // ── Derived list ordering ────────────────────────────────────────────────
+    /// The prefix chord's label (e.g. `Ctrl-A`), for hints/help.
+    pub fn prefix_label(&self) -> String {
+        self.keymap.prefix_label()
+    }
+
+    /// Record the terminal size (on resize / startup) so the visible-window set
+    /// the poll cadence keys off matches what `draw` will place.
+    pub fn set_viewport(&mut self, area: Rect) {
+        self.viewport = area;
+        self.keep_focus_in_view();
+    }
+
+    // ── Derived list ordering (the Spine's issue list) ─────────────────────────
 
     fn rebuild_order(&mut self) {
         let needle = self.search_query.to_lowercase();
         let g = &self.graph;
         let (filter, sort) = (self.filter, self.sort);
 
-        // Decorate each surviving key with its sort key once (so transitive()
-        // isn't recomputed O(log n) times inside the comparator), then sort.
         let mut decorated: Vec<((u8, u64), String)> = g
             .keys()
             .iter()
@@ -369,13 +318,10 @@ impl App {
 
         decorated.sort_by(|(ka, a), (kb, b)| ka.cmp(kb).then_with(|| natural_key_cmp(a, b)));
         self.order = decorated.into_iter().map(|(_, k)| k).collect();
-        // If the active filter/search hid the current root, re-aim the lens at the
-        // first visible issue. Otherwise the left list would highlight order[0]
-        // while the right-hand lens kept describing the now-invisible root, and
-        // the first Down would skip order[0]. An empty list keeps the last root.
+        // If the active filter/search hid the current selection, re-aim it at the
+        // first visible issue so the list highlight and the detail bar agree.
         if !self.order.is_empty() && !self.order.contains(&self.root) {
             self.root = self.order[0].clone();
-            self.rebuild_trees();
         }
         self.sync_list_selection();
     }
@@ -384,238 +330,891 @@ impl App {
         if let Some(i) = self.order.iter().position(|k| *k == self.root) {
             self.list_state.select(Some(i));
         } else {
-            // The root isn't in the visible list — either the list is empty, or a
-            // jump (n / c / ] / enter / back) landed on an issue the active
-            // filter/search hides. Show NO highlight rather than lighting up an
-            // unrelated row: the lens describes the root, the list honestly shows
-            // nothing selected. (A filter/search *change* re-aims the root into
-            // the list first, in `rebuild_order`, so it never reaches here.)
+            // The selection isn't in the visible list — show NO highlight rather
+            // than lighting an unrelated row (a jump can land on a filtered-out
+            // issue; the detail bar still describes it honestly).
             self.list_state.select(None);
         }
     }
 
-    /// Whether the focused root is absent from the visible list (hidden by the
-    /// active filter/search), so the list intentionally shows no highlight. Lets
-    /// a jump explain itself instead of leaving the user staring at a blank
-    /// selection.
+    /// Whether the selection is absent from the visible list (hidden by the
+    /// active filter/search), so the list intentionally shows no highlight.
     fn root_is_hidden(&self) -> bool {
         !self.order.is_empty() && !self.order.contains(&self.root)
     }
 
-    // ── Tree (lens) construction ───────────────────────────────────────────
-
-    fn rebuild_trees(&mut self) {
-        // Collapse state is per-root, so each issue opens fully expanded. Re-rooting
-        // changes `root` and clears it here; a collapse toggle leaves `root`
-        // unchanged (so its state survives its own rebuild).
-        if self.collapsed_for != self.root {
-            self.collapsed.clear();
-            self.collapsed_for = self.root.clone();
-        }
-        self.up_rows = self.build_forest(Direction::Upstream);
-        self.down_rows = self.build_forest(Direction::Downstream);
-        clamp_selection(&mut self.up_state, self.up_rows.len());
-        clamp_selection(&mut self.down_state, self.down_rows.len());
-    }
-
-    fn build_forest(&self, dir: Direction) -> Vec<TreeRow> {
-        let tag = match dir {
-            Direction::Upstream => "U",
-            Direction::Downstream => "D",
-        };
-        let mut rows = Vec::new();
-        let mut drawn = HashSet::new();
-        let mut path = HashSet::new();
-        path.insert(self.root.clone());
-
-        let children = self.graph.neighbours(&self.root, dir);
-        for (i, child) in children.iter().enumerate() {
-            self.walk(
-                child,
-                dir,
-                tag,
-                &mut Vec::new(),
-                i + 1 == children.len(),
-                &mut path,
-                &mut drawn,
-                &mut rows,
-            );
-        }
-        rows
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
-        &self,
-        key: &str,
-        dir: Direction,
-        tag: &str,
-        ancestors: &mut Vec<bool>,
-        is_last: bool,
-        path: &mut HashSet<String>,
-        drawn: &mut HashSet<String>,
-        rows: &mut Vec<TreeRow>,
-    ) {
-        let mut prefix = String::new();
-        for &last in ancestors.iter() {
-            prefix.push_str(if last { "   " } else { "│  " });
-        }
-        prefix.push_str(if is_last { "└─ " } else { "├─ " });
-
-        // Classify before deciding whether to recurse.
-        let kind = if path.contains(key) {
-            NodeKind::Cycle
-        } else if drawn.contains(key) {
-            NodeKind::Ref
-        } else if self.graph.get(key).is_some_and(|i| i.external) {
-            NodeKind::External
-        } else {
-            NodeKind::Normal
-        };
-
-        let children = self.graph.neighbours(key, dir);
-        let has_children = kind == NodeKind::Normal && !children.is_empty();
-        let collapsed = has_children && self.collapsed.contains(&format!("{tag}:{key}"));
-
-        rows.push(TreeRow {
-            key: key.to_string(),
-            prefix,
-            kind,
-            has_children,
-            collapsed,
-        });
-
-        if kind != NodeKind::Normal {
-            return; // Cycle / Ref / External are terminal
-        }
-        drawn.insert(key.to_string());
-        if !has_children || collapsed {
+    /// Re-aim the Spine selection without touching any window's deps history.
+    fn aim_spine(&mut self, key: String) {
+        if key.is_empty() {
             return;
-        }
-
-        path.insert(key.to_string());
-        ancestors.push(is_last);
-        for (i, child) in children.iter().enumerate() {
-            self.walk(
-                child,
-                dir,
-                tag,
-                ancestors,
-                i + 1 == children.len(),
-                path,
-                drawn,
-                rows,
-            );
-        }
-        ancestors.pop();
-        path.remove(key);
-    }
-
-    // ── Focus / navigation ───────────────────────────────────────────────────
-
-    fn set_root(&mut self, key: String, push_history: bool) {
-        if key.is_empty() || key == self.root {
-            return;
-        }
-        if push_history {
-            self.history.push(self.root.clone());
         }
         self.root = key;
         self.sync_list_selection();
-        self.rebuild_trees();
     }
 
-    fn move_selection(&mut self, delta: i32) {
-        // In the overview the only visible cursor is the highlighted root chip,
-        // so arrows always drive the list there regardless of the last pane.
-        let pane = if self.mode == Mode::Overview {
-            Pane::List
-        } else {
-            self.focus
-        };
-        match pane {
-            // The agents roster is its own left-pane "tab": stepping it walks the
-            // salience-sorted agents (relative to where the lens sits) and re-aims
-            // the lens at each, so it drives the chat wall the way the issue list
-            // drives the deps view.
-            Pane::List if self.left_view == LeftView::Agents => self.move_roster(delta),
-            Pane::List => {
-                move_state(&mut self.list_state, self.order.len(), delta);
-                if let Some(i) = self.list_state.selected()
-                    && let Some(k) = self.order.get(i).cloned()
+    // ── Key handling — the window router ───────────────────────────────────────
+
+    pub fn on_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        // 1. Mid-prefix: the next key is a window-manager verb (or a second
+        //    prefix, forwarded to a focused agent as the literal chord).
+        if self.prefix_armed {
+            self.prefix_armed = false;
+            self.on_prefix_key(key);
+            return;
+        }
+
+        // 2. A pending kill confirmation captures the keyboard: y/Enter confirms,
+        //    anything else cancels. Checked before the prefix so the destructive
+        //    gesture can't be half-completed by a stray prefix.
+        if self.kill_confirm.is_some() {
+            self.on_kill_confirm_key(key);
+            return;
+        }
+
+        // 3. The prefix arms; the next key resolves it.
+        if self.keymap.is_prefix(key) {
+            self.prefix_armed = true;
+            return;
+        }
+
+        // 4. Search input captures the keyboard — but only while the Spine (whose
+        //    list it filters) is focused. If focus moved to another window while a
+        //    search was open, commit it (the filter stays applied) and route the
+        //    key to that window, so a key meant for an agent's PTY can never be
+        //    swallowed by the search buffer.
+        if self.search_active {
+            if self.windows.focus == 0 {
+                self.on_search_key(key.code);
+                return;
+            }
+            self.search_active = false;
+        }
+
+        // 5. The help overlay sits above the keymap so a typo can't trap you: any
+        //    key (Esc included) dismisses it.
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+
+        // 6. Route by the focused window's kind.
+        match self.windows.focused_kind().clone() {
+            // An Agent owns the keyboard: every key (Esc too) goes to its PTY.
+            // The prefix above is the only escape.
+            WindowKind::Agent(issue) => self.forward_to_agent(&issue, key),
+            WindowKind::Spine => {
+                self.acknowledge();
+                if key.code != KeyCode::Esc
+                    && let Some(action) = self.keymap.action_for(key)
                 {
-                    // List navigation re-aims the lens without touching history.
-                    self.root = k;
-                    self.rebuild_trees();
+                    self.dispatch_spine(action);
                 }
             }
-            Pane::Upstream => move_state(&mut self.up_state, self.up_rows.len(), delta),
-            Pane::Downstream => move_state(&mut self.down_state, self.down_rows.len(), delta),
-        }
-    }
-
-    fn selected_tree_row(&self) -> Option<&TreeRow> {
-        let (rows, state) = match self.focus {
-            Pane::Upstream => (&self.up_rows, &self.up_state),
-            Pane::Downstream => (&self.down_rows, &self.down_state),
-            Pane::List => return None,
-        };
-        state.selected().and_then(|i| rows.get(i))
-    }
-
-    fn enter(&mut self) {
-        match self.focus {
-            Pane::List => {
-                if !self.up_rows.is_empty() {
-                    self.focus = Pane::Upstream;
-                } else if !self.down_rows.is_empty() {
-                    self.focus = Pane::Downstream;
+            WindowKind::Deps(root) => {
+                self.acknowledge();
+                if key.code != KeyCode::Esc
+                    && let Some(action) = self.keymap.action_for(key)
+                {
+                    self.dispatch_deps(action, root);
                 }
-            }
-            Pane::Upstream | Pane::Downstream => {
-                let Some(row) = self.selected_tree_row() else {
-                    return;
-                };
-                if row.kind == NodeKind::External {
-                    self.status_msg = Some(format!(
-                        "{} is external (team {}) — open it in Linear to follow its chain",
-                        row.key,
-                        self.graph.get(&row.key).map(|i| i.team()).unwrap_or("?")
-                    ));
-                    return;
-                }
-                let key = row.key.clone();
-                self.set_root(key, true);
             }
         }
     }
 
-    fn toggle_collapse(&mut self) {
-        let tag = match self.focus {
-            Pane::Upstream => "U",
-            Pane::Downstream => "D",
-            Pane::List => return,
+    /// A Spine/Deps keypress acknowledges any standing needs-you footer and
+    /// clears the transient status line.
+    fn acknowledge(&mut self) {
+        self.status_msg = None;
+        self.needs_you_alert = false;
+    }
+
+    /// Resolve a key pressed after the prefix.
+    fn on_prefix_key(&mut self, key: KeyEvent) {
+        // Double-prefix → send the literal prefix chord through to a focused
+        // agent (a chosen prefix is never wholly unreachable by the PTY).
+        if self.keymap.is_prefix(key) {
+            if let WindowKind::Agent(issue) = self.windows.focused_kind().clone() {
+                self.forward_to_agent(&issue, self.keymap.prefix_event());
+            }
+            return;
+        }
+        let Some(verb) = self.keymap.verb_for(key) else {
+            return; // an unbound prefix key is a harmless no-op
         };
-        if let Some(row) = self.selected_tree_row()
-            && row.has_children
+        self.dispatch_verb(verb);
+    }
+
+    /// Run a window-manager verb (always reached behind the prefix).
+    fn dispatch_verb(&mut self, verb: Action) {
+        match verb {
+            Action::FocusLeft => {
+                self.windows.focus_left();
+                self.after_focus_change();
+            }
+            Action::FocusRight => {
+                self.windows.focus_right();
+                self.after_focus_change();
+            }
+            Action::ZoomToggle => self.windows.toggle_zoom(),
+            Action::PinWindow => self.pin_window(),
+            Action::CloseWindow => self.close_window(),
+            Action::KillWindow => self.arm_kill(),
+            Action::LayoutToggle => self.toggle_layout(),
+            Action::AttachOrSpawn => self.button(),
+            Action::Quit => self.should_quit = true,
+            Action::StartSearch => {
+                self.windows.focus = 0;
+                self.start_search();
+            }
+            Action::ToggleHelp => self.show_help = !self.show_help,
+            Action::ToggleRoster => {
+                self.windows.focus = 0;
+                self.toggle_roster();
+            }
+            Action::JumpNeedsYou => self.jump_to_needs_you(),
+            // The rest are direct (Spine/Deps) actions, never prefix verbs.
+            _ => {}
+        }
+    }
+
+    /// Direct keys while the Spine is focused.
+    fn dispatch_spine(&mut self, action: Action) {
+        match action {
+            Action::MoveDown => self.move_selection(1),
+            Action::MoveUp => self.move_selection(-1),
+            // Enter / Space are the attach+spawn button on the Spine.
+            Action::Enter | Action::ToggleCollapse => self.button(),
+            Action::OpenDeps => self.open_deps_for_selection(),
+            Action::OpenFleet => {
+                self.windows.open_fleet();
+            }
+            Action::JumpCycle => self.jump_to_cycle(),
+            Action::JumpNeedsYou => self.jump_to_needs_you(),
+            Action::ToggleRoster => self.toggle_roster(),
+            Action::CycleFilter => {
+                self.filter = self.filter.next();
+                self.rebuild_order();
+            }
+            Action::CycleSort => {
+                self.sort = self.sort.next();
+                self.rebuild_order();
+            }
+            Action::StartSearch => self.start_search(),
+            Action::ToggleHelp => self.show_help = !self.show_help,
+            _ => {}
+        }
+    }
+
+    /// Direct keys while a Deps window is focused.
+    fn dispatch_deps(&mut self, action: Action, root: DepsRoot) {
+        // The Fleet map has no per-node cursor; only window verbs (behind the
+        // prefix) and help apply. A per-issue tree drives its own cursor.
+        if root == DepsRoot::Fleet {
+            if action == Action::ToggleHelp {
+                self.show_help = !self.show_help;
+            }
+            return;
+        }
+        // Operations needing the graph are split out so the cursor borrow and the
+        // `&self.graph` borrow don't overlap.
+        match action {
+            Action::MoveDown => self.with_deps(|c| c.move_selection(1)),
+            Action::MoveUp => self.with_deps(|c| c.move_selection(-1)),
+            Action::SwitchSide => self.with_deps(|c| c.switch_side()),
+            Action::Enter => self.deps_enter(),
+            Action::ToggleCollapse => self.deps_collapse(),
+            Action::Back => self.deps_back(),
+            Action::OpenDeps => self.open_deps_for_selection(),
+            Action::OpenFleet => {
+                self.windows.open_fleet();
+            }
+            Action::ToggleHelp => self.show_help = !self.show_help,
+            _ => {}
+        }
+    }
+
+    /// Mutate the focused window's deps cursor, if it has one.
+    fn with_deps(&mut self, f: impl FnOnce(&mut crate::window::DepsCursor)) {
+        if let Some(cursor) = self.windows.focused_mut().deps.as_mut() {
+            f(cursor);
+        }
+    }
+
+    fn deps_enter(&mut self) {
+        let graph = &self.graph;
+        if let Some(cursor) = self.windows.focused_mut().deps.as_mut()
+            && let Err(reason) = cursor.enter(graph)
         {
-            let id = format!("{tag}:{}", row.key);
-            if !self.collapsed.remove(&id) {
-                self.collapsed.insert(id);
-            }
-            self.rebuild_trees();
+            self.status_msg = Some(reason);
         }
     }
 
-    fn go_back(&mut self) {
-        if let Some(prev) = self.history.pop() {
-            self.root = prev;
-            self.sync_list_selection();
-            self.rebuild_trees();
-        } else {
+    fn deps_collapse(&mut self) {
+        let graph = &self.graph;
+        if let Some(cursor) = self.windows.focused_mut().deps.as_mut() {
+            cursor.toggle_collapse(graph);
+        }
+    }
+
+    fn deps_back(&mut self) {
+        let graph = &self.graph;
+        let popped = self
+            .windows
+            .focused_mut()
+            .deps
+            .as_mut()
+            .is_some_and(|c| c.back(graph));
+        if !popped {
             self.status_msg = Some("nothing to go back to".into());
         }
     }
+
+    fn start_search(&mut self) {
+        self.search_active = true;
+        // Search filters the issue list, so surface it (you can't fuzzy-find the
+        // agents roster).
+        self.left_view = LeftView::Issues;
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        if self.left_view == LeftView::Agents {
+            self.move_roster(delta);
+            return;
+        }
+        move_state(&mut self.list_state, self.order.len(), delta);
+        if let Some(i) = self.list_state.selected()
+            && let Some(k) = self.order.get(i).cloned()
+        {
+            self.root = k; // list navigation re-aims the selection
+        }
+    }
+
+    /// Open (or re-root the preview onto) a dependency window for the selection.
+    fn open_deps_for_selection(&mut self) {
+        if self.root.is_empty() {
+            self.status_msg = Some("no issue selected".into());
+            return;
+        }
+        let root = self.root.clone();
+        self.windows.open_or_reroot_deps(root, &self.graph);
+        self.keep_focus_in_view();
+    }
+
+    // ── The attach/spawn button ────────────────────────────────────────────────
+
+    /// Open an agent window on the selection — launching (or resuming) if there's
+    /// no live one. The v3 merge of v2's `launch_agent` + `attach`: one agent per
+    /// issue, never duplicated; a live one is revealed, a terminal one relaunched
+    /// (which resumes its conversation).
+    fn button(&mut self) {
+        let Some(issue) = self.focused_issue() else {
+            self.status_msg = Some("no issue selected".into());
+            return;
+        };
+        if issue.external {
+            let key = issue.key.clone();
+            self.status_msg = Some(format!("{key} is external — launch it in its own project"));
+            return;
+        }
+        let (key, title) = (issue.key.clone(), issue.title.clone());
+
+        // A backend already exists (live, or a finished screen still up): reveal
+        // its window, no relaunch.
+        if self.backends.contains_key(&key) {
+            self.open_agent_window(&key);
+            return;
+        }
+        // A launch already in flight (double-press before it spawns): focus the
+        // starting card rather than spinning up a second.
+        if self.pending_launch.contains(&key) {
+            self.open_agent_window(&key);
+            self.set_footer(format!("already opening an agent on {key}…"));
+            return;
+        }
+        // Absent, or terminal → (re)launch; the supervisor resumes transparently
+        // if a session already exists. Open the window now (a "starting…" card)
+        // so the press registers; `AgentSpawned` fills in the backend.
+        match self.supervisor.clone() {
+            Some(supervisor) => {
+                supervisor.launch(key.clone(), title);
+                self.pending_launch.insert(key.clone());
+                self.pending_attach = Some(key.clone());
+                self.open_agent_window(&key);
+                self.set_footer(format!("opening agent on {key}…"));
+            }
+            None => self.status_msg = Some("agent control plane unavailable".into()),
+        }
+    }
+
+    /// Open (or focus) the Agent window for `issue`, reclaiming the backend of any
+    /// displaced unpinned preview that's already dead.
+    fn open_agent_window(&mut self, issue: &str) {
+        let (_, displaced) = self.windows.open_or_focus_agent(issue);
+        if let Some(w) = displaced {
+            self.preview_size.remove(&w.id);
+            if let Some(di) = w.kind.agent_issue() {
+                self.reclaim_if_dead(di);
+            }
+        }
+        self.keep_focus_in_view();
+    }
+
+    // ── Window-manager verbs ───────────────────────────────────────────────────
+
+    fn pin_window(&mut self) {
+        if self.windows.focus == 0 {
+            self.status_msg = Some("the spine is always pinned".into());
+            return;
+        }
+        let pinned = self.windows.toggle_pin_focused();
+        self.cockpit_dirty = true; // the docked set changed
+        let label = self
+            .windows
+            .focused()
+            .issue()
+            .unwrap_or("window")
+            .to_string();
+        self.status_msg = Some(if pinned {
+            format!("pinned {label} · stays while you browse")
+        } else {
+            format!("unpinned {label}")
+        });
+    }
+
+    fn close_window(&mut self) {
+        let Some(closed) = self.windows.close_focused() else {
+            self.status_msg = Some("the spine stays put".into());
+            return;
+        };
+        if closed.pinned {
+            self.cockpit_dirty = true; // a docked window left the set
+        }
+        self.preview_size.remove(&closed.id);
+        if let Some(issue) = closed.kind.agent_issue() {
+            // Close = undock: a *live* agent keeps running (refind via the
+            // roster), so only reclaim its backend once it's actually dead.
+            self.reclaim_if_dead(issue);
+            self.set_footer(format!("closed {issue} · still running — r to refind"));
+        } else {
+            self.status_msg = Some("closed window".into());
+        }
+        self.keep_focus_in_view();
+    }
+
+    /// Arm a confirmed kill of the focused agent (`Ctrl-a x`). Kill is destructive
+    /// and separate from close, so it's never a single keystroke.
+    fn arm_kill(&mut self) {
+        let WindowKind::Agent(issue) = self.windows.focused_kind().clone() else {
+            self.status_msg = Some("no agent here to kill — Ctrl-a w closes a window".into());
+            return;
+        };
+        if !self.fleet.get(&issue).is_some_and(AgentStatus::is_live) {
+            self.status_msg = Some(format!("agent on {issue} is not running"));
+            return;
+        }
+        self.status_msg = Some(format!(
+            "kill agent on {issue}? y to confirm, any key to cancel"
+        ));
+        self.kill_confirm = Some(issue);
+    }
+
+    fn on_kill_confirm_key(&mut self, key: KeyEvent) {
+        let Some(issue) = self.kill_confirm.take() else {
+            return;
+        };
+        let confirm = matches!(
+            key.code,
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+        );
+        if !confirm {
+            self.status_msg = Some("kill cancelled".into());
+            return;
+        }
+        match self.supervisor.clone() {
+            Some(supervisor) => {
+                supervisor.cancel(issue.clone());
+                self.status_msg = Some(format!("killing agent on {issue}…"));
+            }
+            None => self.status_msg = Some("agent control plane unavailable".into()),
+        }
+    }
+
+    fn toggle_layout(&mut self) {
+        self.windows.layout = self.windows.layout.toggled();
+        self.cockpit_dirty = true;
+        // Every window's Rect moves under the new layout; forget the cached sizes
+        // so the next render reflows each live agent to where it now sits. This
+        // (and zoom) are the *only* moments width reflows — browsing never does.
+        self.preview_size.clear();
+        self.keep_focus_in_view();
+        self.set_footer(format!("layout: {}", self.windows.layout.label()));
+    }
+
+    /// Forward a key to a specific agent's PTY.
+    fn forward_to_agent(&mut self, issue: &str, key: KeyEvent) {
+        let bytes = backend::key_to_bytes(key);
+        if bytes.is_empty() {
+            return;
+        }
+        let Some(backend) = self.backends.get(issue) else {
+            return;
+        };
+        if backend.send_input(&bytes).is_err() {
+            // The PTY is gone — the agent exited out from under us. Surface it; the
+            // window stays (as an EXITED card) until you close it.
+            self.set_footer(format!("agent on {issue} is no longer accepting input"));
+        }
+    }
+
+    // ── Scroll / visibility (filmstrip) ────────────────────────────────────────
+
+    /// Bookkeeping after focus moves between windows: keep the focused column in
+    /// view, commit an in-progress search if focus left the Spine (so keys reach
+    /// the newly-focused window instead of the search buffer — the search filter
+    /// stays applied), and lazy-resume a docked agent that just gained focus.
+    fn after_focus_change(&mut self) {
+        self.keep_focus_in_view();
+        if self.search_active && self.windows.focus != 0 {
+            self.search_active = false; // commit: end input mode, keep the query
+        }
+        self.maybe_resume_focused();
+    }
+
+    /// Keep the focused column in view (filmstrip horizontal scroll). Called from
+    /// focus-move / open / close / layout / resize — never from `draw`.
+    fn keep_focus_in_view(&mut self) {
+        if self.windows.layout != LayoutMode::Filmstrip {
+            return;
+        }
+        self.windows.scroll_x = layout::scroll_offset(
+            self.windows.scroll_x,
+            self.windows.focus_column(),
+            self.windows.non_spine_count(),
+            self.viewport.width,
+        );
+    }
+
+    /// Whether window `idx` is on screen right now (post-scroll). Mosaic shows
+    /// every window; zoom shows only the focused one; filmstrip shows the whole
+    /// columns that fit.
+    fn is_index_visible(&self, idx: usize) -> bool {
+        if self.windows.zoomed {
+            return idx == self.windows.focus;
+        }
+        match self.windows.layout {
+            LayoutMode::Mosaic => idx < self.windows.windows.len(),
+            LayoutMode::Filmstrip => layout::filmstrip_visible(
+                self.windows.windows.len(),
+                self.windows.scroll_x,
+                self.viewport.width,
+                idx,
+            ),
+        }
+    }
+
+    /// Whether `issue`'s live screen is on screen — gates the AgentOutput repaint
+    /// so only visible agents force a redraw (preserving idle-quiet). Allocation-
+    /// free: `AgentOutput` fires per PTY read, so this is a hot path.
+    pub fn is_agent_visible(&self, issue: &str) -> bool {
+        self.windows
+            .windows
+            .iter()
+            .enumerate()
+            .any(|(idx, w)| w.kind.agent_issue() == Some(issue) && self.is_index_visible(idx))
+    }
+
+    /// Whether any *visible* window hosts a live PTY — so the render loop polls
+    /// fast (16 ms) only when an interactive screen is actually on screen, never
+    /// for an idle agent scrolled off the strip.
+    pub fn has_visible_live_agent(&self) -> bool {
+        self.windows.windows.iter().enumerate().any(|(idx, w)| {
+            w.kind
+                .agent_issue()
+                .is_some_and(|i| self.backends.contains_key(i))
+                && self.is_index_visible(idx)
+        })
+    }
+
+    // ── Cockpit layout persistence ──────────────────────────────────────────
+
+    /// Snapshot the docked (pinned) windows, layout mode and focus identity for
+    /// `.lindep/cockpit.json`. Unpinned previews and the Spine are not persisted;
+    /// focus on either persists as `None` (restore falls back to the Spine).
+    pub fn snapshot_cockpit(&self) -> CockpitState {
+        let windows = self
+            .windows
+            .windows
+            .iter()
+            .filter(|w| w.pinned && !matches!(w.kind, WindowKind::Spine))
+            .filter_map(window_to_persisted)
+            .collect();
+        let focused = self.windows.focused();
+        let focus = (focused.pinned && !matches!(focused.kind, WindowKind::Spine))
+            .then(|| window_to_persisted(focused))
+            .flatten();
+        CockpitState {
+            layout: self.windows.layout.label().to_string(),
+            windows,
+            focus,
+            ..CockpitState::default()
+        }
+    }
+
+    /// Rebuild the window strip from a persisted layout, pruning windows whose
+    /// subject didn't survive: Agent windows whose issue isn't in `survivors`
+    /// (the reconcile survivor set), and Deps windows whose root left the graph.
+    /// With no docked windows persisted the cockpit's fresh default strip is kept
+    /// (so a missing file — or a session where nothing was pinned — opens like
+    /// today), while still honouring the saved layout mode. Restored Agent
+    /// windows have no backend yet — they render as "resuming…" cards.
+    pub fn apply_cockpit(&mut self, state: &CockpitState, survivors: &HashSet<String>) {
+        let layout = match state.layout.as_str() {
+            "mosaic" => LayoutMode::Mosaic,
+            _ => LayoutMode::Filmstrip,
+        };
+        // No docked windows → keep the default strip (the save path always writes
+        // a layout label, so we can't gate on that being empty), just adopt the
+        // layout mode so a `mosaic` preference survives a pinless session.
+        if state.windows.is_empty() {
+            self.windows.layout = layout;
+            self.keep_focus_in_view();
+            return;
+        }
+        let mut set = WindowSet::new();
+        set.layout = layout;
+        for pw in &state.windows {
+            match pw.kind {
+                PersistedKind::Agent => {
+                    if let Some(issue) = &pw.issue
+                        && survivors.contains(issue)
+                    {
+                        set.push(WindowKind::Agent(issue.clone()), true, None);
+                    }
+                }
+                PersistedKind::Deps => {
+                    if let Some(root) = &pw.issue
+                        && self.graph.get(root).is_some()
+                    {
+                        let cursor = DepsCursor::new(root.clone(), &self.graph);
+                        set.push(WindowKind::Deps(DepsRoot::Issue), true, Some(cursor));
+                    }
+                }
+                PersistedKind::Fleet => {
+                    set.push(WindowKind::Deps(DepsRoot::Fleet), true, None);
+                }
+            }
+        }
+        // Restore focus by identity, falling back to the Spine.
+        set.focus = state
+            .focus
+            .as_ref()
+            .and_then(|want| {
+                set.windows
+                    .iter()
+                    .position(|w| window_to_persisted(w).as_ref() == Some(want))
+            })
+            .unwrap_or(0);
+        self.windows = set;
+        self.keep_focus_in_view();
+    }
+
+    // ── Auto-resume (Cockpit v3, Phase 6) ────────────────────────────────────
+
+    /// Bring docked agents back on startup: eager-resume the focused docked agent
+    /// plus up to `cap-1` others (so the supervisor's `max_concurrent` isn't
+    /// blown), and lazy-resume the rest on first focus (see
+    /// [`Self::maybe_resume_focused`]). `resumable` is the post-reconcile
+    /// was-live set (never Done/Failed). Enables auto-resume for the session.
+    pub fn begin_resume(&mut self, resumable: &HashSet<String>, cap: usize) {
+        self.auto_resume = true;
+        if self.supervisor.is_none() {
+            return;
+        }
+        // Docked agent windows that are resumable, the focused one first so it
+        // comes back immediately.
+        let mut targets: Vec<String> = Vec::new();
+        if let WindowKind::Agent(issue) = self.windows.focused_kind()
+            && resumable.contains(issue)
+        {
+            targets.push(issue.clone());
+        }
+        for w in &self.windows.windows {
+            if let WindowKind::Agent(issue) = &w.kind
+                && resumable.contains(issue)
+                && !targets.contains(issue)
+            {
+                targets.push(issue.clone());
+            }
+        }
+        let eager = cap.max(1).min(targets.len());
+        for issue in targets.into_iter().take(eager) {
+            self.resume_one(&issue);
+        }
+        if self.resuming_count > 0 {
+            self.resume_deadline = self.frame + RESUME_GRACE_FRAMES;
+        }
+    }
+
+    /// Lazy-resume the focused window if it's a docked agent that was live before
+    /// the restart but has no backend yet — so a deep docked agent comes back the
+    /// moment you focus it, without all of them spawning at once on startup.
+    fn maybe_resume_focused(&mut self) {
+        if !self.auto_resume {
+            return;
+        }
+        let WindowKind::Agent(issue) = self.windows.focused_kind().clone() else {
+            return;
+        };
+        if self.backends.contains_key(&issue) || self.pending_launch.contains(&issue) {
+            return; // already up, or already resuming
+        }
+        // "Was-live" survives rehydration as a live fleet status (Idle/NeedsYou).
+        if self.fleet.get(&issue).is_some_and(AgentStatus::is_live) {
+            self.resume_one(&issue);
+        }
+    }
+
+    /// Fire a single resume launch (no focus-steal — the window already exists).
+    fn resume_one(&mut self, issue: &str) {
+        let Some(supervisor) = self.supervisor.clone() else {
+            return;
+        };
+        if self.pending_launch.contains(issue) {
+            return;
+        }
+        let title = self
+            .graph
+            .get(issue)
+            .map(|i| i.title.clone())
+            .unwrap_or_else(|| issue.to_string());
+        supervisor.launch(issue.to_string(), title);
+        self.pending_launch.insert(issue.to_string());
+        self.resuming_count += 1;
+    }
+
+    // ── Background events ───────────────────────────────────────────────────────
+
+    /// Apply a background [`AppEvent`] to view state, returning whether the
+    /// screen must repaint. The render loop is the single writer of `App`.
+    pub fn apply_event(&mut self, ev: AppEvent) -> bool {
+        match ev {
+            AppEvent::Notification(text) => {
+                self.pending_launch.clear();
+                self.set_footer(text);
+                true
+            }
+            AppEvent::AgentSpawned { issue, backend } => {
+                // Clear the double-launch guard (set by the button AND by a resume).
+                self.pending_launch.remove(&issue);
+                // A real relaunch revives the issue — clear any reaped tombstone.
+                self.reaped.remove(&issue);
+                self.fleet.insert(issue.clone(), AgentStatus::Spawning);
+                self.backends.insert(issue.clone(), backend);
+                self.flash
+                    .insert(issue.clone(), (Flash::Launched, self.frame + FLASH_FRAMES));
+                // One resume settled (Phase 6): drop the spinner once they're all in.
+                self.resuming_count = self.resuming_count.saturating_sub(1);
+                // Only an explicit button launch (pending_attach) opens + focuses
+                // the window; a background/resume spawn just fills the backend of
+                // an already-docked window (or the roster), so a burst of resumes
+                // never yanks focus around.
+                if self.pending_attach.as_deref() == Some(issue.as_str()) {
+                    self.pending_attach = None;
+                    self.open_agent_window(&issue);
+                    self.set_footer(format!("agent on {issue} ready"));
+                }
+                true
+            }
+            // Repaint only when this agent's screen is visible right now.
+            AppEvent::AgentOutput { issue } => self.is_agent_visible(&issue),
+            AppEvent::AgentExited { issue, code } => {
+                self.set_footer(match code {
+                    Some(0) | None => format!("agent on {issue} finished"),
+                    Some(c) => format!("agent on {issue} exited ({c})"),
+                });
+                // Its geometry is meaningless once it's dead; drop it so a relaunch
+                // reflows from scratch.
+                self.drop_preview_sizes_for(&issue);
+                // The process is gone (per this event). Keep the backend only if a
+                // window still references it (its EXITED card); else reclaim.
+                if !self.windows.references_agent(&issue) {
+                    self.backends.remove(&issue);
+                }
+                true
+            }
+            AppEvent::AgentNeedsYou { issue, reason } => {
+                if self.is_terminal(&issue) || self.reaped.contains(&issue) {
+                    return false;
+                }
+                self.fleet.insert(issue.clone(), AgentStatus::NeedsYou);
+                self.status_msg = Some(format!("⚑ {issue} needs you — {reason}"));
+                self.needs_you_alert = true; // sticky until acknowledged
+                true
+            }
+            AppEvent::AgentStatusChanged { issue, status } => {
+                if self.reaped.contains(&issue) {
+                    return false;
+                }
+                if status.is_live() && self.is_terminal(&issue) {
+                    return false;
+                }
+                if !status.needs_you() && self.fleet.get(&issue) == Some(&AgentStatus::NeedsYou) {
+                    self.needs_you_alert = false;
+                }
+                if matches!(status, AgentStatus::Done | AgentStatus::Failed) {
+                    self.flash
+                        .insert(issue.clone(), (Flash::Finished, self.frame + FLASH_FRAMES));
+                }
+                self.fleet.insert(issue, status);
+                true
+            }
+            AppEvent::AgentAction { issue, action } => {
+                if self.is_terminal(&issue) || self.reaped.contains(&issue) {
+                    return false;
+                }
+                if self.fleet.get(&issue) != Some(&AgentStatus::NeedsYou) {
+                    self.fleet.insert(issue.clone(), AgentStatus::Running);
+                }
+                if !self.needs_you_alert {
+                    self.status_msg = Some(format!("{issue}: {action}"));
+                }
+                true
+            }
+            AppEvent::AgentReaped { issue } => {
+                self.reaped.insert(issue.clone());
+                self.fleet.remove(&issue);
+                self.drop_preview_sizes_for(&issue);
+                // Keep the backend only while a window still shows it.
+                if !self.windows.references_agent(&issue) {
+                    self.backends.remove(&issue);
+                }
+                true
+            }
+        }
+    }
+
+    /// Set the transient footer line, superseding (and acknowledging) any
+    /// standing needs-you alert — used by deliberate, low-frequency events.
+    fn set_footer(&mut self, text: String) {
+        self.status_msg = Some(text);
+        self.needs_you_alert = false;
+    }
+
+    /// Drop the cached PTY geometry for every window referencing `issue` —
+    /// AgentExited/Reaped only know the issue, so enumerate its windows.
+    fn drop_preview_sizes_for(&mut self, issue: &str) {
+        let ids: Vec<WindowId> = self
+            .windows
+            .windows
+            .iter()
+            .filter(|w| w.kind.agent_issue() == Some(issue))
+            .map(|w| w.id)
+            .collect();
+        for id in ids {
+            self.preview_size.remove(&id);
+        }
+    }
+
+    /// Reclaim a backend whose agent is dead and no longer shown anywhere. Used on
+    /// close / preview-displacement, where the agent may still be alive (in which
+    /// case its backend is kept for re-open via the roster).
+    fn reclaim_if_dead(&mut self, issue: &str) {
+        let dead = self
+            .backends
+            .get(issue)
+            .is_some_and(|b| matches!(b.status(), Lifecycle::Exited(_)));
+        if dead && !self.windows.references_agent(issue) {
+            self.backends.remove(issue);
+            self.drop_preview_sizes_for(issue);
+        }
+    }
+
+    /// `(live-agents, needs-you)` counts for the header summary. "Agents" counts
+    /// only *live* nodes, not the terminal Stopped/Done/Failed entries that
+    /// linger in `fleet` until reaped — so the number drops the instant you stop
+    /// or finish one.
+    pub fn fleet_summary(&self) -> (usize, usize) {
+        let agents = self.fleet.values().filter(|s| s.is_live()).count();
+        let needs_you = self.fleet.values().filter(|s| s.needs_you()).count();
+        (agents, needs_you)
+    }
+
+    /// Whether `issue`'s agent has reached a terminal state (the process is gone).
+    fn is_terminal(&self, issue: &str) -> bool {
+        matches!(
+            self.fleet.get(issue),
+            Some(AgentStatus::Stopped | AgentStatus::Done | AgentStatus::Failed)
+        )
+    }
+
+    /// Whether anything on screen is animating — a live agent's spinner/pulse, an
+    /// unexpired node flash, or an in-flight auto-resume. The render loop arms its
+    /// animation tick only when this holds.
+    pub fn is_animating(&self) -> bool {
+        self.resuming_count > 0
+            || self.flash.values().any(|&(_, until)| self.frame < until)
+            || self.fleet.values().any(AgentStatus::is_animating)
+    }
+
+    /// Advance the animation frame and drop any expired flash. Also hard-clears a
+    /// stuck "resuming…" spinner past its grace bound, so a wedged resume can't
+    /// pin the cockpit awake forever.
+    pub fn tick_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+        let now = self.frame;
+        self.flash.retain(|_, &mut (_, until)| now < until);
+        if self.resuming_count > 0 && now >= self.resume_deadline {
+            self.resuming_count = 0;
+        }
+    }
+
+    // ── Agents roster (the Spine's "AGENTS" tab) ────────────────────────────────
+
+    /// The agents roster: every issue with an agent, ordered by salience —
+    /// needs-you first, then live work, then idle, then the terminal states that
+    /// linger until reaped. Ties break on the natural issue id.
+    pub fn agent_order(&self) -> Vec<String> {
+        let mut agents: Vec<(&String, AgentStatus)> =
+            self.fleet.iter().map(|(k, s)| (k, *s)).collect();
+        agents.sort_by(|(ka, sa), (kb, sb)| {
+            sa.salience_rank()
+                .cmp(&sb.salience_rank())
+                .then_with(|| natural_key_cmp(ka, kb))
+        });
+        agents.into_iter().map(|(k, _)| k.clone()).collect()
+    }
+
+    /// Step the roster cursor by `delta` (wrapping) and re-aim the selection at
+    /// the agent it lands on, so the detail bar follows. No-op when empty.
+    fn move_roster(&mut self, delta: i32) {
+        let agents = self.agent_order();
+        if agents.is_empty() {
+            return;
+        }
+        let next = match agents.iter().position(|k| *k == self.root) {
+            Some(i) => (i as i32 + delta).rem_euclid(agents.len() as i32) as usize,
+            None if delta >= 0 => 0,
+            None => agents.len() - 1,
+        };
+        self.aim_spine(agents[next].clone());
+    }
+
+    /// Flip the Spine between the issue list and the agents roster.
+    fn toggle_roster(&mut self) {
+        self.left_view = match self.left_view {
+            LeftView::Issues => LeftView::Agents,
+            LeftView::Agents => LeftView::Issues,
+        };
+        if self.left_view == LeftView::Agents && self.fleet.is_empty() {
+            self.status_msg = Some("no agents yet — Enter on an issue to open one".into());
+        }
+    }
+
+    // ── Spine jumps ──────────────────────────────────────────────────────────
 
     fn jump_to_cycle(&mut self) {
         let members = self.graph.cycle_members();
@@ -623,25 +1222,16 @@ impl App {
             self.status_msg = Some("no dependency cycles 🎉".into());
             return;
         }
-        // Advance to the next cycle member after wherever we're standing, derived
-        // from the current root rather than a counter that drifts when you re-root
-        // by other means. Cyclic SCCs always have ≥2 members (self-blocks are
-        // rejected), so this always moves — the status line never claims a jump
-        // that didn't happen.
         let next = match members.iter().position(|k| *k == self.root) {
             Some(i) => (i + 1) % members.len(),
             None => 0,
         };
         let (key, n, total) = (members[next].clone(), next + 1, members.len());
-        // Re-root first, then describe where we landed — so the "hidden by
-        // filter" note reflects the new root's visibility, not the old one's.
-        self.set_root(key.clone(), true);
+        self.aim_spine(key.clone());
         self.status_msg = Some(format!("cycle {n}/{total} — {key}{}", self.hidden_note()));
     }
 
-    /// Jump to the next issue whose agent needs you, in display order, wrapping
-    /// from wherever the lens currently sits — the fleet-view analogue of the
-    /// cycle jump (`c`).
+    /// Jump to the next issue whose agent needs you, in display order, wrapping.
     fn jump_to_needs_you(&mut self) {
         let members: Vec<String> = self
             .graph
@@ -659,835 +1249,20 @@ impl App {
             None => 0,
         };
         let (key, n, total) = (members[next].clone(), next + 1, members.len());
-        self.set_root(key.clone(), true);
+        self.aim_spine(key.clone());
         self.status_msg = Some(format!(
             "needs you {n}/{total} — {key}{}",
             self.hidden_note()
         ));
     }
 
-    // ── Key handling ─────────────────────────────────────────────────────────
-
-    pub fn on_key(&mut self, key: KeyEvent) {
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-
-        // While attached, the agent owns the keyboard — every key is forwarded
-        // to its PTY except the detach chord. Handled before anything else so
-        // the cockpit's own bindings (q, /, …) don't shadow the agent's input.
-        if self.attached.is_some() {
-            self.on_attached_key(key);
-            return;
-        }
-
-        // The chat composer captures the keyboard the same way search does — its
-        // keys build a message, not dashboard actions — so it's checked before the
-        // needs-you acknowledgement and the bindings below. (Typing a reply to an
-        // agent shouldn't silently clear the needs-you alert until it's sent.)
-        if self.compose.is_some() {
-            self.on_compose_key(key);
-            return;
-        }
-
-        // A dashboard keypress acknowledges any standing needs-you footer and
-        // clears the transient status line.
-        self.status_msg = None;
-        self.needs_you_alert = false;
-
-        if self.search_active {
-            self.on_search_key(key.code);
-            return;
-        }
-
-        // Any key dismisses the help overlay (except a Quit binding, which still
-        // quits). The overlay sits above the keymap so a typo can't trap you.
-        if self.show_help {
-            if self.keymap.action_for(key) == Some(Action::Quit) {
-                self.should_quit = true;
-            } else {
-                self.show_help = false;
-            }
-            return;
-        }
-
-        // Esc is a fixed, context-sensitive key (close overview / clear search /
-        // quit) — deliberately not remappable.
-        if key.code == KeyCode::Esc {
-            self.on_escape();
-            return;
-        }
-
-        if let Some(action) = self.keymap.action_for(key) {
-            self.dispatch(action);
-        }
-    }
-
-    /// Run a cockpit action (resolved from the keymap, or a direct call).
-    fn dispatch(&mut self, action: Action) {
-        match action {
-            Action::Quit => self.should_quit = true,
-            Action::MoveDown => self.move_selection(1),
-            Action::MoveUp => self.move_selection(-1),
-            Action::FocusList => self.focus = Pane::List,
-            Action::CyclePane => {
-                self.focus = match self.focus {
-                    Pane::List | Pane::Downstream => Pane::Upstream,
-                    Pane::Upstream => Pane::Downstream,
-                }
-            }
-            Action::CycleFocus => {
-                self.focus = match self.focus {
-                    Pane::List => Pane::Upstream,
-                    Pane::Upstream => Pane::Downstream,
-                    Pane::Downstream => Pane::List,
-                }
-            }
-            Action::Enter => self.enter(),
-            Action::ToggleCollapse => self.toggle_collapse(),
-            Action::Back => self.go_back(),
-            Action::JumpCycle => self.jump_to_cycle(),
-            Action::JumpNeedsYou => self.jump_to_needs_you(),
-            Action::LaunchAgent => self.launch_agent(),
-            Action::CancelAgent => self.cancel_agent(),
-            Action::Attach => self.attach(),
-            // Only meaningful while attached (handled in on_attached_key).
-            Action::Detach => {}
-            Action::ToggleChat => {
-                self.right_view = match self.right_view {
-                    RightView::Deps => RightView::Chat,
-                    RightView::Chat => RightView::Deps,
-                };
-            }
-            Action::TogglePin => self.toggle_pin_current(),
-            Action::CycleChat => self.cycle_chat(1),
-            Action::CycleChatBack => self.cycle_chat(-1),
-            Action::ComposeChat => self.open_compose(),
-            Action::ToggleRoster => self.toggle_roster(),
-            Action::CycleChatLayout => self.cycle_chat_layout(),
-            Action::CycleFilter => {
-                self.filter = self.filter.next();
-                self.rebuild_order();
-            }
-            Action::CycleSort => {
-                self.sort = self.sort.next();
-                self.rebuild_order();
-            }
-            Action::ToggleGraph => {
-                self.mode = match self.mode {
-                    Mode::Lens => Mode::Overview,
-                    Mode::Overview => Mode::Lens,
-                }
-            }
-            Action::StartSearch => {
-                self.search_active = true;
-                self.focus = Pane::List;
-                // Search filters the issue list, so surface it (you can't fuzzy-find
-                // against the agents roster).
-                self.left_view = LeftView::Issues;
-            }
-            Action::ToggleHelp => self.show_help = !self.show_help,
-        }
-    }
-
-    /// Apply a background [`AppEvent`] to view state, returning whether the
-    /// screen must repaint as a result. The render loop is the single writer of
-    /// `App`, so every off-thread update funnels through here — keeping
-    /// rendering a pure function of state.
-    pub fn apply_event(&mut self, ev: AppEvent) -> bool {
-        match ev {
-            AppEvent::Notification(text) => {
-                // A rejected launch (e.g. "already has a running agent" / "at
-                // capacity") arrives as a Notification; clear any optimistic
-                // pending-launch marks so a later retry isn't wrongly refused.
-                self.pending_launch.clear();
-                self.set_footer(text);
-                true
-            }
-            AppEvent::AgentSpawned { issue, backend } => {
-                self.pending_launch.remove(&issue);
-                // A real relaunch revives the issue — clear any reaped tombstone
-                // so this generation's hooks are honoured again.
-                self.reaped.remove(&issue);
-                self.fleet.insert(issue.clone(), AgentStatus::Spawning);
-                self.backends.insert(issue.clone(), backend);
-                self.flash
-                    .insert(issue.clone(), (Flash::Launched, self.frame + FLASH_FRAMES));
-                // If `a` was waiting on this launch, surface the attach nudge now
-                // its terminal is live, and clear the wait.
-                let t = self.keymap.label_for(Action::Attach);
-                if self.pending_attach.as_deref() == Some(issue.as_str()) {
-                    self.pending_attach = None;
-                    self.set_footer(format!("agent on {issue} ready · {t} to attach"));
-                } else {
-                    self.set_footer(format!("agent launched on {issue} · {t} to attach"));
-                }
-                true
-            }
-            // Repaint when the output belongs to an agent whose screen is on
-            // screen right now — attached, or showing as a chat pane. Off-screen
-            // output changes nothing visible, so an idle/closed chat never
-            // busy-repaints.
-            AppEvent::AgentOutput { issue } => self.is_chat_visible(&issue),
-            AppEvent::AgentExited { issue, code } => {
-                // The supervisor's agent task is authoritative for fleet status
-                // (via AgentStatusChanged) — a cancel reads as Stopped, a
-                // self-exit as Done/Failed. Here we only surface a footer line and
-                // reclaim the render handle now the PTY is gone, unless the user
-                // is still attached and looking at its final screen.
-                self.set_footer(match code {
-                    Some(0) | None => format!("agent on {issue} finished"),
-                    Some(c) => format!("agent on {issue} exited ({c})"),
-                });
-                // Its geometry is meaningless once it's dead; drop the bookkeeping
-                // so a relaunch reflows from scratch and the map stays bounded.
-                self.preview_size.remove(&issue);
-                // Reclaim the dead render handle — unless we're attached (reading
-                // its final screen) or it's pinned to the wall (so its final
-                // screen stays as an EXITED card until you unpin it).
-                let keep = self.attached.as_deref() == Some(issue.as_str())
-                    || self.pinned.contains(&issue);
-                if !keep {
-                    self.backends.remove(&issue);
-                }
-                // A composer aimed at this agent now points at a dead PTY (even a
-                // kept, pinned EXITED card can't take input) — close it so the
-                // "✎ …" bar can't outlive the agent it claims to message.
-                self.close_compose_for(&issue);
-                true
-            }
-            AppEvent::AgentNeedsYou { issue, reason } => {
-                // Ignore a hook that arrives after the agent was torn down — it
-                // must not resurrect a terminated node and re-inflate the count.
-                // `is_terminal` covers the pre-reap window (a terminal entry still
-                // lingers); `reaped` covers the post-reap window (the entry is
-                // already gone). Together they span the whole post-mortem.
-                if self.is_terminal(&issue) || self.reaped.contains(&issue) {
-                    return false;
-                }
-                self.fleet.insert(issue.clone(), AgentStatus::NeedsYou);
-                self.status_msg = Some(format!("⚑ {issue} needs you — {reason}"));
-                self.needs_you_alert = true; // sticky until acknowledged
-                true
-            }
-            AppEvent::AgentStatusChanged { issue, status } => {
-                // A reaped agent is gone for good — the supervisor sends its
-                // terminal verdict *before* the reap, so any AgentStatusChanged
-                // arriving after the tombstone is a late hook (e.g. a Stop's Idle)
-                // and must not revive the node. A relaunch clears the tombstone
-                // via AgentSpawned first, so this never blocks a fresh agent.
-                if self.reaped.contains(&issue) {
-                    return false;
-                }
-                // The supervisor's terminal verdict (Stopped/Done/Failed) is
-                // final: a late *live* status from a racing hook (e.g. a Stop
-                // hook's Idle) must not un-terminate the node. A fresh launch
-                // revives it through AgentSpawned, not here.
-                if status.is_live() && self.is_terminal(&issue) {
-                    return false;
-                }
-                // An explicit transition is authoritative — it's the one event
-                // allowed to clear a NeedsYou. Drop the sticky alert if the node
-                // it referred to is no longer waiting on the human.
-                if !status.needs_you() && self.fleet.get(&issue) == Some(&AgentStatus::NeedsYou) {
-                    self.needs_you_alert = false;
-                }
-                // A clean or crashed finish gets a brief node flash so it
-                // registers even if you weren't watching that node.
-                if matches!(status, AgentStatus::Done | AgentStatus::Failed) {
-                    self.flash
-                        .insert(issue.clone(), (Flash::Finished, self.frame + FLASH_FRAMES));
-                }
-                self.fleet.insert(issue, status);
-                true
-            }
-            AppEvent::AgentAction { issue, action } => {
-                // Stale tool-use hook after teardown — drop it whether the
-                // terminal entry still lingers (is_terminal) or the agent has
-                // already been reaped away entirely (reaped tombstone).
-                if self.is_terminal(&issue) || self.reaped.contains(&issue) {
-                    return false;
-                }
-                // Hook-bus PostToolUse chatter must not clobber a pending NeedsYou
-                // the human still has to act on (a queued PostToolUse can arrive
-                // just after a permission prompt), nor let the routine footer bury
-                // an unacknowledged needs-you alert.
-                if self.fleet.get(&issue) != Some(&AgentStatus::NeedsYou) {
-                    self.fleet.insert(issue.clone(), AgentStatus::Running);
-                }
-                if !self.needs_you_alert {
-                    self.status_msg = Some(format!("{issue}: {action}"));
-                }
-                true
-            }
-            AppEvent::AgentReaped { issue } => {
-                // The supervisor dropped this agent from its live map (teardown
-                // complete). Drop it from the fleet so the view stays bounded and
-                // mirrors the supervisor. Keep the backend handle while attached
-                // (reading its final screen) or pinned (so its EXITED card stays
-                // on the wall until you unpin it); otherwise reclaim it.
-                //
-                // Tombstone the issue so a hook that raced in behind the reap
-                // (the forwarder is a separate, slower path) can't re-create a
-                // live entry for an agent that no longer exists.
-                self.reaped.insert(issue.clone());
-                self.fleet.remove(&issue);
-                self.preview_size.remove(&issue);
-                let keep = self.attached.as_deref() == Some(issue.as_str())
-                    || self.pinned.contains(&issue);
-                if !keep {
-                    self.backends.remove(&issue);
-                }
-                self.close_compose_for(&issue);
-                true
-            }
-        }
-    }
-
-    /// Set the transient footer line, superseding (and acknowledging) any
-    /// standing needs-you alert — used by deliberate, low-frequency events.
-    fn set_footer(&mut self, text: String) {
-        self.status_msg = Some(text);
-        self.needs_you_alert = false;
-    }
-
-    /// Open an agent on the focused issue (the `a` key) — the first half of the
-    /// two-step open→attach flow. One agent per issue: a *live* agent (incl. an
-    /// idle one) is never duplicated — we reveal its chat and point at attach; a
-    /// stopped/finished one is relaunched, which resumes its conversation. Always
-    /// switches the right pane to the chat so you see what you opened.
-    fn launch_agent(&mut self) {
-        let Some(issue) = self.focused_issue() else {
-            self.status_msg = Some("no issue selected".into());
-            return;
-        };
-        if issue.external {
-            let key = issue.key.clone();
-            self.status_msg = Some(format!("{key} is external — launch it in its own project"));
-            return;
-        }
-        let (key, title) = (issue.key.clone(), issue.title.clone());
-        let t = self.keymap.label_for(Action::Attach);
-
-        // A live agent already exists (spawning/running/needs-you/idle — all
-        // alive): don't spin up a second. Reveal its chat and point at attach,
-        // rather than print an optimistic "launching…" the supervisor's own
-        // running/capacity guards would contradict a tick later.
-        if let Some(s) = self.fleet.get(&key).copied()
-            && s.is_live()
-        {
-            self.right_view = RightView::Chat;
-            self.status_msg = Some(if s.needs_you() {
-                format!("⚑ {key} needs you · {t} to attach")
-            } else {
-                format!("{key} already has an agent · {t} to attach")
-            });
-            return;
-        }
-        // A launch already in flight (double-press before it spawns).
-        if self.pending_launch.contains(&key) {
-            self.right_view = RightView::Chat;
-            self.set_footer(format!("already opening an agent on {key}…"));
-            return;
-        }
-        // Absent, or terminal (stopped/done/failed) → (re)launch; the supervisor
-        // resumes the conversation transparently if a session already exists.
-        // Clone the handle out so we can also touch `status_msg` without a
-        // borrow conflict; the clone is cheap (an mpsc sender).
-        match self.supervisor.clone() {
-            Some(supervisor) => {
-                supervisor.launch(key.clone(), title);
-                self.pending_launch.insert(key.clone());
-                self.right_view = RightView::Chat;
-                self.pending_attach = Some(key.clone());
-                self.set_footer(format!("opening agent on {key} · {t} to attach when ready"));
-            }
-            None => self.status_msg = Some("agent control plane unavailable".into()),
-        }
-    }
-
-    /// Stop the agent on the focused issue (the `x` key), leaving others running.
-    fn cancel_agent(&mut self) {
-        let Some(issue) = self.focused_issue().map(|i| i.key.clone()) else {
-            return;
-        };
-        // Only a *live* agent can be stopped: a stopped/done/failed entry lingers
-        // briefly for its glyph but the supervisor has already reaped it, so a
-        // Cancel would only earn a contradicting "no agent running" a tick later.
-        if !self.fleet.get(&issue).is_some_and(AgentStatus::is_live) {
-            self.status_msg = Some(format!("agent on {issue} is not running"));
-            return;
-        }
-        match self.supervisor.clone() {
-            Some(supervisor) => {
-                supervisor.cancel(issue.clone());
-                self.status_msg = Some(format!("stopping agent on {issue}…"));
-            }
-            None => self.status_msg = Some("agent control plane unavailable".into()),
-        }
-    }
-
-    /// `(live-agents, needs-you)` counts for the header summary. "Agents" counts
-    /// only *live* nodes ([`AgentStatus::is_live`] — spawning/running/needs-you/
-    /// idle-but-alive), not the terminal Stopped/Done/Failed entries that linger
-    /// in `fleet` until reaped — so the number drops the instant you stop or
-    /// finish one, reflecting what's actually running.
-    pub fn fleet_summary(&self) -> (usize, usize) {
-        let agents = self.fleet.values().filter(|s| s.is_live()).count();
-        let needs_you = self.fleet.values().filter(|s| s.needs_you()).count();
-        (agents, needs_you)
-    }
-
-    /// Whether `issue`'s agent has reached a terminal state (the process is
-    /// gone). Used to make terminal status sticky against a racing late hook.
-    fn is_terminal(&self, issue: &str) -> bool {
-        matches!(
-            self.fleet.get(issue),
-            Some(AgentStatus::Stopped | AgentStatus::Done | AgentStatus::Failed)
-        )
-    }
-
-    /// The issues whose chat is on the chat wall, in render order: pinned first
-    /// (in pin order), then the current selection. Filtered on `backends` — a
-    /// handle exists only while there's a screen to show. The live current
-    /// selection is *always* given a slot (the "follows the cursor" chat is the
-    /// primary feature), dropping the oldest pin only if the wall is already
-    /// full — so a selected agent's chat is never silently hidden.
-    pub fn chat_panes(&self) -> Vec<String> {
-        let mut panes: Vec<String> = self
-            .pinned
-            .iter()
-            .filter(|k| self.backends.contains_key(*k))
-            .cloned()
-            .collect();
-        match self.focused_issue().map(|i| i.key.clone()) {
-            Some(sel) if self.backends.contains_key(&sel) && !panes.contains(&sel) => {
-                if panes.len() >= MAX_CHAT_PANES {
-                    panes.truncate(MAX_CHAT_PANES - 1); // reserve the selection's slot
-                }
-                panes.push(sel);
-            }
-            _ => panes.truncate(MAX_CHAT_PANES),
-        }
-        panes
-    }
-
-    /// Allocation-free predicate for "is there any chat pane to show" — mirrors
-    /// [`App::chat_panes`] membership (a pinned issue with a backend, or the live
-    /// current selection) without materialising the `Vec`. Hot path: the render
-    /// loop calls it every poll tick to pick the chat-wall poll cadence.
-    pub fn has_chat_panes(&self) -> bool {
-        self.pinned.iter().any(|k| self.backends.contains_key(k))
-            || self
-                .focused_issue()
-                .is_some_and(|i| self.backends.contains_key(&i.key))
-    }
-
-    /// Whether `issue`'s live screen is on screen right now — attached, or shown
-    /// as a chat pane. Gates the AgentOutput repaint so only visible agents'
-    /// output forces a redraw (preserving the idle-quiet property). Kept
-    /// allocation-free: `AgentOutput` fires per PTY read, so this is a hot path.
-    pub fn is_chat_visible(&self, issue: &str) -> bool {
-        if self.attached.as_deref() == Some(issue) {
-            return true;
-        }
-        if self.right_view != RightView::Chat || self.mode != Mode::Lens {
-            return false;
-        }
-        // Mirrors `chat_panes` membership without materialising it: a pinned
-        // agent (pins are capped below the wall size, so none is truncated), or
-        // the live current selection (always given a slot).
-        self.pinned.iter().any(|k| k == issue)
-            || (self.backends.contains_key(issue)
-                && self.focused_issue().is_some_and(|i| i.key == issue))
-    }
-
-    /// Whether anything on screen is animating — a live agent's spinner/pulse,
-    /// or an unexpired node flash. The render loop arms its animation tick only
-    /// when this holds, so a cockpit of only resting/terminal agents (or none)
-    /// never busy-repaints.
-    pub fn is_animating(&self) -> bool {
-        self.flash.values().any(|&(_, until)| self.frame < until)
-            || self.fleet.values().any(AgentStatus::is_animating)
-    }
-
-    /// Advance the animation frame and drop any flash that has now expired (so
-    /// the `flash` map stays bounded and `is_animating` settles back to false).
-    /// Called by the render loop on its wall-clock animation cadence.
-    pub fn tick_frame(&mut self) {
-        self.frame = self.frame.wrapping_add(1);
-        let now = self.frame;
-        self.flash.retain(|_, &mut (_, until)| now < until);
-    }
-
-    /// The label of the currently-bound detach key (e.g. `F10`), so the attach
-    /// pane always shows the real key even after a rebind.
-    pub fn detach_key_label(&self) -> String {
-        self.keymap.label_for(Action::Detach)
-    }
-
-    /// Attach to the focused issue's agent, taking over its PTY (the `t` key).
-    fn attach(&mut self) {
-        let Some(issue) = self.focused_issue().map(|i| i.key.clone()) else {
-            return;
-        };
-        if !self.backends.contains_key(&issue) {
-            self.status_msg = Some(format!("no agent on {issue} to attach to"));
-            return;
-        }
-        self.attached = Some(issue.clone());
-        // Drop any cached geometry so the first render resizes the agent to the
-        // full-screen attach pane.
-        self.preview_size.remove(&issue);
-        self.pending_leader = None;
-        let detach = self.keymap.label_for(Action::Detach);
-        self.status_msg = Some(format!("attached to {issue} · {detach} to detach"));
-    }
-
-    /// Pin or unpin the focused issue's chat (the `p` key). A pinned chat stays
-    /// on the wall while you browse other issues — the way to keep several agents
-    /// visible at once. Refuses to overflow the wall rather than silently
-    /// evicting a pin.
-    fn toggle_pin_current(&mut self) {
-        let Some(key) = self.focused_issue().map(|i| i.key.clone()) else {
-            return;
-        };
-        if let Some(pos) = self.pinned.iter().position(|k| *k == key) {
-            self.pinned.remove(pos);
-            // If we were keeping a dead agent's screen alive only because it was
-            // pinned (see AgentExited), reclaim its handle now.
-            if self
-                .backends
-                .get(&key)
-                .is_some_and(|b| matches!(b.status(), Lifecycle::Exited(_)))
-            {
-                self.backends.remove(&key);
-                self.preview_size.remove(&key);
-            }
-            self.status_msg = Some(format!("unpinned {key}"));
-            return;
-        }
-        if !self.backends.contains_key(&key) {
-            self.status_msg = Some(format!("no agent on {key} to pin — a to open one"));
-            return;
-        }
-        // Cap pins one below the wall size so the current selection always keeps
-        // a slot — pinning never hides the chat that follows your cursor.
-        const PIN_CAP: usize = MAX_CHAT_PANES - 1;
-        if self.pinned.len() >= PIN_CAP {
-            self.status_msg = Some(format!("chat wall full ({PIN_CAP} pins) — unpin one first"));
-            return;
-        }
-        self.pinned.push(key.clone());
-        self.right_view = RightView::Chat;
-        self.status_msg = Some(format!("pinned {key} · stays while you browse"));
-    }
-
-    // ── Agents roster (the left "AGENTS" tab) ────────────────────────────────
-
-    /// The agents roster: every issue that currently has an agent, ordered by how
-    /// loudly it's calling for attention — needs-you first, then live work, then
-    /// idle, then the terminal states that linger until reaped. Ties break on the
-    /// natural issue id. This is what the left pane's "AGENTS" tab lists and the
-    /// order the roster cursor steps through.
-    pub fn agent_order(&self) -> Vec<String> {
-        let mut agents: Vec<(&String, AgentStatus)> =
-            self.fleet.iter().map(|(k, s)| (k, *s)).collect();
-        agents.sort_by(|(ka, sa), (kb, sb)| {
-            sa.salience_rank()
-                .cmp(&sb.salience_rank())
-                .then_with(|| natural_key_cmp(ka, kb))
-        });
-        agents.into_iter().map(|(k, _)| k.clone()).collect()
-    }
-
-    /// Step the roster cursor by `delta` (wrapping) and re-aim the lens at the
-    /// agent it lands on — the roster analogue of moving the issue list, so the
-    /// chat wall follows. A no-op when nothing is running.
-    fn move_roster(&mut self, delta: i32) {
-        let agents = self.agent_order();
-        if agents.is_empty() {
-            return;
-        }
-        let next = match agents.iter().position(|k| *k == self.root) {
-            Some(i) => (i as i32 + delta).rem_euclid(agents.len() as i32) as usize,
-            None if delta >= 0 => 0,
-            None => agents.len() - 1,
-        };
-        // Re-aim without touching history — same as issue-list navigation. Sync
-        // the issue-list selection too (every other re-aim path does, via
-        // `set_root`/`move_selection`), so flipping back to the ISSUES tab finds
-        // its highlight on `root`, not stranded on a stale row.
-        self.root = agents[next].clone();
-        self.sync_list_selection();
-        self.rebuild_trees();
-    }
-
-    /// Flip the left pane between the issue list and the agents roster (the
-    /// `agents` key). The lens (and thus the chat wall) is untouched, so an agent
-    /// already in view stays selected when its roster row appears.
-    fn toggle_roster(&mut self) {
-        self.left_view = match self.left_view {
-            LeftView::Issues => LeftView::Agents,
-            LeftView::Agents => LeftView::Issues,
-        };
-        if self.left_view == LeftView::Agents && self.fleet.is_empty() {
-            self.status_msg = Some("no agents yet — a on an issue to open one".into());
-        }
-    }
-
-    // ── Chat wall layout + composer ──────────────────────────────────────────
-
-    /// Cycle the chat wall's split (the `chat-layout` key): stacked rows →
-    /// side-by-side columns → grid. Switches to the chat view so the change is
-    /// visible and drops the cached pane geometry so every shown agent reflows to
-    /// its new Rect.
-    fn cycle_chat_layout(&mut self) {
-        self.chat_split = self.chat_split.next();
-        // Reveal the surface this acts on: the chat wall only renders in the lens,
-        // so from the graph overview this would otherwise be an invisible no-op.
-        self.mode = Mode::Lens;
-        self.right_view = RightView::Chat;
-        // Each pane's Rect moves under the new split; forget the cached sizes so
-        // the next render re-resizes every live agent to where it now sits.
-        self.preview_size.clear();
-        self.set_footer(format!("chat layout: {}", self.chat_split.label()));
-    }
-
-    /// Open the chat composer on the agent under the cursor — message it without
-    /// the full-screen attach takeover (the `compose` key). Targets the live
-    /// selection, else the first pinned live agent; refuses when there's no live
-    /// agent on the wall to talk to. Switches to the chat view so you see the pane
-    /// you're typing into.
-    fn open_compose(&mut self) {
-        // Resolve the target *before* touching the view, so a refusal leaves you
-        // where you were instead of yanking you into an empty chat wall.
-        let Some(target) = self.compose_target() else {
-            self.status_msg =
-                Some("no live agent here to message — a opens one, t attaches".into());
-            return;
-        };
-        // Reveal the pane you're typing into: the composer only renders on the
-        // chat wall in the lens, so force both (else `i` from the graph overview
-        // would silently capture the keyboard into an invisible buffer).
-        self.mode = Mode::Lens;
-        self.right_view = RightView::Chat;
-        self.compose = Some(Compose {
-            target,
-            buffer: String::new(),
-        });
-        self.status_msg = None;
-    }
-
-    /// The agent a freshly-opened composer targets: the live selection if there
-    /// is one, otherwise the first pinned agent still live. Only a running PTY can
-    /// take input, so terminal/exited agents are skipped.
-    fn compose_target(&self) -> Option<String> {
-        let is_live = |k: &str| {
-            self.backends
-                .get(k)
-                .is_some_and(|b| matches!(b.status(), Lifecycle::Running))
-        };
-        if let Some(key) = self.focused_issue().map(|i| i.key.clone())
-            && is_live(&key)
-        {
-            return Some(key);
-        }
-        self.pinned.iter().find(|k| is_live(k)).cloned()
-    }
-
-    /// Handle a key while the composer is open: Enter sends the line, Esc closes
-    /// the composer, Backspace / char edit the buffer — mirroring the search input.
-    fn on_compose_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.compose = None;
-                self.status_msg = None;
-            }
-            KeyCode::Enter => self.send_compose(),
-            KeyCode::Backspace => {
-                if let Some(c) = self.compose.as_mut() {
-                    c.buffer.pop();
-                }
-            }
-            KeyCode::Char(ch) => {
-                if let Some(c) = self.compose.as_mut() {
-                    c.buffer.push(ch);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Write the composed line (plus a carriage return, to submit it) to the
-    /// target agent's PTY, then clear the buffer so you can keep chatting. An
-    /// empty line is ignored; a vanished or closed PTY closes the composer with a
-    /// note rather than dropping keystrokes into a dead terminal.
-    fn send_compose(&mut self) {
-        // Pull what we need out of the immutable borrow first, so the send and the
-        // buffer reset below can take `&mut self` freely.
-        let (issue, line) = match &self.compose {
-            Some(c) if !c.buffer.trim().is_empty() => (c.target.clone(), c.buffer.clone()),
-            _ => return, // no composer, or nothing worth sending
-        };
-        let mut bytes = line.into_bytes();
-        bytes.push(b'\r');
-        let Some(backend) = self.backends.get(&issue) else {
-            self.compose = None;
-            self.set_footer(format!("agent on {issue} is gone"));
-            return;
-        };
-        if backend.send_input(&bytes).is_ok() {
-            if let Some(c) = self.compose.as_mut() {
-                c.buffer.clear();
-            }
-            self.set_footer(format!("sent to {issue}"));
-        } else {
-            self.compose = None;
-            self.set_footer(format!("agent on {issue} is no longer accepting input"));
-        }
-    }
-
-    /// Close the composer if it's aimed at `issue` — called when that agent's PTY
-    /// dies or it's reaped, so a background exit while you're mid-message can't
-    /// leave the "✎ …" bar lying about a target that no longer exists.
-    fn close_compose_for(&mut self, issue: &str) {
-        if self.compose.as_ref().is_some_and(|c| c.target == issue) {
-            self.compose = None;
-            self.set_footer(format!("agent on {issue} is gone — composer closed"));
-        }
-    }
-
-    /// Step the lens to the next/prev issue that has a live agent screen,
-    /// wrapping, and switch to the chat view so you see it — a quick tour of the
-    /// running agents (`]` / `[`). Walks the graph's display order so it visits
-    /// agents even on issues the current filter hides.
-    fn cycle_chat(&mut self, delta: i32) {
-        let agents: Vec<String> = self
-            .graph
-            .keys()
-            .iter()
-            .filter(|k| self.backends.contains_key(*k))
-            .cloned()
-            .collect();
-        if agents.is_empty() {
-            self.status_msg = Some("no agents to switch between — a to open one".into());
-            return;
-        }
-        self.right_view = RightView::Chat;
-        let next = match agents.iter().position(|k| *k == self.root) {
-            Some(i) => (i as i32 + delta).rem_euclid(agents.len() as i32) as usize,
-            None if delta >= 0 => 0,
-            None => agents.len() - 1,
-        };
-        let (key, n, total) = (agents[next].clone(), next + 1, agents.len());
-        self.set_root(key.clone(), true);
-        self.status_msg = Some(format!("chat {n}/{total} · {key}{}", self.hidden_note()));
-    }
-
-    /// A status suffix flagging that the lens jumped to an issue the active
+    /// A status suffix flagging that a jump landed on an issue the active
     /// filter/search hides — so the empty list highlight reads as deliberate.
     fn hidden_note(&self) -> &'static str {
         if self.root_is_hidden() {
             " · hidden by filter (clear it to list)"
         } else {
             ""
-        }
-    }
-
-    /// Detach back to the dashboard, leaving the agent running. If the agent
-    /// exited while we were attached, reclaim its render handle on the way out.
-    fn detach(&mut self) {
-        self.pending_leader = None;
-        if let Some(issue) = self.attached.take() {
-            // Force the next render (chat pane or re-attach) to re-resize this
-            // agent to whatever Rect it lands in.
-            self.preview_size.remove(&issue);
-            let still_running = self
-                .backends
-                .get(&issue)
-                .is_some_and(|b| matches!(b.status(), Lifecycle::Running));
-            if still_running {
-                self.status_msg = Some(format!("detached from {issue} (still running)"));
-            } else {
-                self.backends.remove(&issue);
-                self.status_msg = Some(format!("detached from {issue}"));
-            }
-        }
-    }
-
-    /// Handle a key while attached: the detach key returns to the dashboard;
-    /// everything else is encoded and written to the agent's PTY.
-    fn on_attached_key(&mut self, key: KeyEvent) {
-        // The detach gesture returns to the dashboard; everything else is
-        // forwarded to the agent. Detach is F10 by default (a function key works
-        // on every layout and never collides with claude's line editing), but can
-        // be rebound — including to a tmux-style leader sequence like `Ctrl-A d`,
-        // which works even on keyboards/terminals without usable function keys.
-
-        // Mid-sequence: a leader was pressed and we're waiting for the rest.
-        if let Some(leader) = self.pending_leader.take() {
-            if self.keymap.detach_completes(leader, key) {
-                self.detach();
-            } else {
-                // The leader was a no-op — including a double-tap, where `key` is
-                // the leader itself, so forwarding it sends a single leader chord
-                // through (a chosen leader is never wholly unreachable). The
-                // consumed leader keypress is intentionally not re-sent.
-                self.forward_to_agent(key);
-            }
-            return;
-        }
-
-        // A single-key detach (e.g. the default F10).
-        if self.keymap.action_for(key) == Some(Action::Detach) {
-            self.detach();
-            return;
-        }
-        // Arm a leader sequence; the next key completes or cancels it.
-        if self.keymap.is_detach_leader(key) {
-            self.pending_leader = Some(key);
-            return;
-        }
-        self.forward_to_agent(key);
-    }
-
-    /// Encode a key and write it to the attached agent's PTY.
-    fn forward_to_agent(&mut self, key: KeyEvent) {
-        let bytes = backend::key_to_bytes(key);
-        if bytes.is_empty() {
-            return;
-        }
-        let Some(issue) = self.attached.clone() else {
-            return;
-        };
-        let Some(backend) = self.backends.get(&issue) else {
-            return;
-        };
-        if backend.send_input(&bytes).is_err() {
-            // The PTY is gone — the agent exited out from under us. Surface it and
-            // detach so keystrokes don't silently vanish into a dead terminal.
-            self.set_footer(format!("agent on {issue} is no longer accepting input"));
-            self.attached = None;
-        }
-    }
-
-    /// Whether a detach leader has been pressed and we're awaiting completion.
-    pub fn detach_armed(&self) -> bool {
-        self.pending_leader.is_some()
-    }
-
-    fn on_escape(&mut self) {
-        if self.show_help {
-            self.show_help = false;
-        } else if self.search_active {
-            self.search_active = false;
-            self.search_query.clear();
-            self.rebuild_order();
-        } else if self.mode == Mode::Overview {
-            self.mode = Mode::Lens;
-        } else {
-            self.should_quit = true;
         }
     }
 
@@ -1514,6 +1289,26 @@ impl App {
 
 // ── Free helpers ────────────────────────────────────────────────────────────
 
+/// Map a window to its persistable identity, or `None` for the Spine (never
+/// persisted — it's recreated by `WindowSet::new`).
+fn window_to_persisted(w: &crate::window::Window) -> Option<PersistedWindow> {
+    match &w.kind {
+        WindowKind::Spine => None,
+        WindowKind::Agent(issue) => Some(PersistedWindow {
+            kind: PersistedKind::Agent,
+            issue: Some(issue.clone()),
+        }),
+        WindowKind::Deps(DepsRoot::Issue) => Some(PersistedWindow {
+            kind: PersistedKind::Deps,
+            issue: w.deps.as_ref().map(|c| c.root.clone()),
+        }),
+        WindowKind::Deps(DepsRoot::Fleet) => Some(PersistedWindow {
+            kind: PersistedKind::Fleet,
+            issue: None,
+        }),
+    }
+}
+
 fn move_state(state: &mut ListState, len: usize, delta: i32) {
     if len == 0 {
         state.select(None);
@@ -1522,15 +1317,6 @@ fn move_state(state: &mut ListState, len: usize, delta: i32) {
     let cur = state.selected().unwrap_or(0) as i32;
     let next = (cur + delta).rem_euclid(len as i32) as usize;
     state.select(Some(next));
-}
-
-fn clamp_selection(state: &mut ListState, len: usize) {
-    if len == 0 {
-        state.select(None);
-    } else {
-        let i = state.selected().unwrap_or(0).min(len - 1);
-        state.select(Some(i));
-    }
 }
 
 /// Compare identifiers naturally: same prefix sorts by numeric suffix.
@@ -1547,9 +1333,7 @@ fn natural_key_cmp(a: &str, b: &str) -> Ordering {
 }
 
 /// The once-per-node sort key for the active sort mode. Lower sorts first;
-/// `natural_key_cmp` breaks ties. `Ready` and `Blocked` are mirror images:
-/// both group by blocked-vs-unblocked, then by higher downstream impact (hence
-/// the inversion) — `Ready` surfaces unblocked work, `Blocked` surfaces blocked.
+/// `natural_key_cmp` breaks ties.
 fn sort_key(graph: &Graph, key: &str, sort: Sort) -> (u8, u64) {
     let by_impact = || u64::MAX - graph.transitive(key, Direction::Downstream) as u64;
     match sort {
@@ -1561,8 +1345,7 @@ fn sort_key(graph: &Graph, key: &str, sort: Sort) -> (u8, u64) {
     }
 }
 
-/// Sort rank that surfaces live work first: in-progress → unstarted → backlog →
-/// done.
+/// Sort rank that surfaces live work first.
 fn status_rank(graph: &Graph, key: &str) -> u8 {
     use crate::model::Status::*;
     match graph.get(key).map(|i| i.status) {
@@ -1580,105 +1363,69 @@ fn status_rank(graph: &Graph, key: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::fake::FakeBackend;
     use crate::demo;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn app() -> App {
-        App::new(demo::graph())
+        let mut a = App::new(demo::graph());
+        // A generous viewport so opened windows are placed/visible in tests.
+        a.set_viewport(Rect::new(0, 0, 200, 40));
+        a
     }
 
     fn press(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
+    /// Press the prefix (`Ctrl-a`) then `code` — i.e. invoke a window verb.
+    fn verb(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        press(app, code);
+    }
+
+    fn register(app: &mut App, key: &str) -> Arc<FakeBackend> {
+        let fake = FakeBackend::new(key);
+        app.backends
+            .insert(key.into(), fake.clone() as Arc<dyn AgentBackend>);
+        fake
+    }
+
+    // ── The spine ──────────────────────────────────────────────────────────
+
     #[test]
-    fn default_focus_is_the_most_connected_issue() {
-        // ZAP-204 has the most direct edges in the demo graph.
+    fn default_selection_is_the_most_connected_issue() {
         assert_eq!(app().root, "ZAP-204");
     }
 
     #[test]
-    fn enter_on_a_blocker_re_roots_and_back_returns() {
-        let mut app = app();
-        press(&mut app, KeyCode::Char('l')); // focus upstream tree
-        assert_eq!(app.focus, Pane::Upstream);
-
-        let target = app.up_rows[0].key.clone(); // first blocker of ZAP-204
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.root, target);
-        assert_ne!(app.root, "ZAP-204");
-
-        press(&mut app, KeyCode::Char('b')); // back
-        assert_eq!(app.root, "ZAP-204");
-    }
-
-    #[test]
-    fn list_navigation_re_aims_the_lens() {
-        let mut app = app();
-        let idx0 = app.list_state.selected().unwrap();
-        assert_eq!(app.order[idx0], app.root); // selection tracks the root
-        press(&mut app, KeyCode::Down);
-        let idx1 = app.list_state.selected().unwrap();
-        assert_ne!(idx1, idx0);
-        assert_eq!(app.root, app.order[idx1]); // root re-aimed to new selection
-    }
-
-    #[test]
-    fn collapsing_a_subtree_hides_its_children() {
-        let mut app = app();
-        press(&mut app, KeyCode::Char('l')); // upstream; row 0 = ZAP-188 (has child ZAP-150)
-        let before = app.up_rows.len();
-        press(&mut app, KeyCode::Char(' '));
-        assert!(app.up_rows.len() < before);
-        press(&mut app, KeyCode::Char(' ')); // expand again
-        assert_eq!(app.up_rows.len(), before);
-    }
-
-    #[test]
-    fn collapse_state_resets_when_the_lens_re_roots() {
-        let mut app = app();
-        press(&mut app, KeyCode::Char('l')); // upstream
-        let before = app.up_rows.len();
-        press(&mut app, KeyCode::Char(' ')); // collapse a subtree
-        assert!(app.up_rows.len() < before);
-        press(&mut app, KeyCode::Enter); // re-root onto the collapsed node
-        press(&mut app, KeyCode::Char('b')); // back to the original root
+    fn the_cockpit_opens_with_a_deps_window_on_the_selection() {
+        let app = app();
+        // Spine + a dependency window rooted at the default selection.
+        assert_eq!(app.windows.windows.len(), 2);
+        assert!(matches!(app.windows.windows[0].kind, WindowKind::Spine));
+        assert!(matches!(
+            app.windows.windows[1].kind,
+            WindowKind::Deps(DepsRoot::Issue)
+        ));
         assert_eq!(
-            app.up_rows.len(),
-            before,
-            "the lens re-opens fully expanded after re-rooting"
+            app.windows.windows[1].deps.as_ref().unwrap().root,
+            "ZAP-204"
         );
+        assert_eq!(app.windows.focus, 0, "focus opens on the spine");
     }
 
     #[test]
-    fn cycle_jump_moves_to_a_distinct_member_each_press() {
+    fn list_navigation_re_aims_the_selection() {
         let mut app = app();
-        assert!(app.graph.cycle_members().len() >= 2);
-        press(&mut app, KeyCode::Char('c'));
-        let first = app.root.clone();
-        assert!(app.graph.in_cycle(&first));
-        press(&mut app, KeyCode::Char('c'));
-        assert!(app.graph.in_cycle(&app.root));
-        assert_ne!(
-            first, app.root,
-            "each press lands on a different cycle member"
+        let before = app.root.clone();
+        press(&mut app, KeyCode::Down);
+        assert_ne!(app.root, before, "Down re-aims the selection");
+        assert_eq!(
+            app.order[app.list_state.selected().unwrap()],
+            app.root,
+            "the highlight tracks the selection"
         );
-        assert!(app.status_msg.as_deref().unwrap().contains(&app.root));
-    }
-
-    #[test]
-    fn ready_sort_puts_unblocked_issues_first() {
-        let app = app(); // Sort::Ready is the default
-        assert_eq!(app.sort, Sort::Ready);
-        // The list is partitioned: every unblocked issue precedes every blocked one.
-        let mut seen_blocked = false;
-        for k in &app.order {
-            if app.graph.is_blocked(k) {
-                seen_blocked = true;
-            } else {
-                assert!(!seen_blocked, "unblocked {k} appears after a blocked issue");
-            }
-        }
     }
 
     #[test]
@@ -1692,349 +1439,282 @@ mod tests {
         assert_eq!(app.order, vec!["ZAP-210".to_string()]);
         press(&mut app, KeyCode::Esc);
         assert!(!app.search_active);
-        assert!(app.search_query.is_empty());
         assert!(app.order.len() > 1);
     }
 
     #[test]
-    fn natural_key_cmp_orders_by_numeric_suffix() {
-        assert_eq!(natural_key_cmp("ZAP-9", "ZAP-188"), Ordering::Less);
-        assert_eq!(natural_key_cmp("ZAP-188", "ZAP-9"), Ordering::Greater);
-        // A differing prefix orders lexically by prefix, ignoring the number.
-        assert_eq!(natural_key_cmp("ABC-500", "ZAP-1"), Ordering::Less);
-    }
-
-    #[test]
-    fn filtering_out_the_root_re_aims_the_lens_to_the_visible_selection() {
-        // Searching for an issue other than the default root (ZAP-204) must keep
-        // the list highlight and the lens describing the SAME issue.
+    fn the_roster_tab_drives_the_selection_through_agents() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('/'));
-        for c in "210".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        assert_eq!(app.order, vec!["ZAP-210".to_string()]);
-        let sel = app.list_state.selected().expect("a row stays selected");
-        assert_eq!(app.order[sel], app.root, "highlight and root agree");
-        assert_eq!(app.focused_issue().unwrap().key, "ZAP-210");
-    }
-
-    #[test]
-    fn external_node_cannot_be_re_rooted() {
-        let mut app = app();
-        press(&mut app, KeyCode::Char('l'));
-        // Find the external INFRA-77 row and select it.
-        let idx = app
-            .up_rows
-            .iter()
-            .position(|r| r.kind == NodeKind::External)
-            .expect("demo has an external blocker");
-        app.up_state.select(Some(idx));
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.root, "ZAP-204"); // unchanged
-        assert!(app.status_msg.is_some()); // explained instead
-    }
-
-    #[test]
-    fn cycle_jump_and_mode_and_quit_never_panic() {
-        let mut app = app();
-        press(&mut app, KeyCode::Char('c')); // jump to a cycle member
-        assert!(app.graph.in_cycle(&app.root));
-        for k in ['f', 's', 'g', 'g', '?', '?'] {
-            press(&mut app, KeyCode::Char(k));
-        }
-        press(&mut app, KeyCode::Char('q'));
-        assert!(app.should_quit);
-    }
-
-    #[test]
-    fn jump_to_needs_you_visits_each_flagged_issue_then_reports_when_none() {
-        let mut app = app();
-        // No agents yet → the jump is a no-op that says so.
-        press(&mut app, KeyCode::Char('n'));
-        assert!(app.status_msg.as_deref().unwrap().contains("no agents"));
-
-        app.fleet.insert("ZAP-205".into(), AgentStatus::NeedsYou);
-        app.fleet.insert("ZAP-240".into(), AgentStatus::NeedsYou);
-        app.fleet.insert("ZAP-201".into(), AgentStatus::Running); // not "needs you"
-
-        press(&mut app, KeyCode::Char('n'));
+        let k: Vec<String> = app.order.iter().take(2).cloned().collect();
+        app.fleet.insert(k[0].clone(), AgentStatus::Idle);
+        app.fleet.insert(k[1].clone(), AgentStatus::NeedsYou);
+        press(&mut app, KeyCode::Char('r')); // flip to the roster
+        assert_eq!(app.left_view, LeftView::Agents);
+        press(&mut app, KeyCode::Down);
         let first = app.root.clone();
-        assert!(app.fleet.get(&first).is_some_and(AgentStatus::needs_you));
-        press(&mut app, KeyCode::Char('n'));
-        assert_ne!(
-            app.root, first,
-            "each press advances to a different flagged issue"
+        assert!(app.fleet.contains_key(&first));
+        press(&mut app, KeyCode::Down);
+        assert_ne!(first, app.root, "each step lands on a different agent");
+    }
+
+    // ── The attach/spawn button + agent windows ─────────────────────────────
+
+    #[test]
+    fn the_button_opens_an_agent_window_for_an_existing_backend() {
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        // root is ZAP-204; the spine is focused; Enter is the button.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.windows.focused_kind().agent_issue(),
+            Some("ZAP-204"),
+            "the button opens + focuses the agent window"
         );
-        assert!(app.fleet.get(&app.root).is_some_and(AgentStatus::needs_you));
-        // Running agents are never visited.
-        assert_ne!(app.root, "ZAP-201");
     }
 
     #[test]
-    fn attach_forwards_keys_to_the_agent_then_detaches() {
+    fn opening_the_same_agent_twice_does_not_duplicate() {
         let mut app = app();
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
-        app.backends
-            .insert("ZAP-204".into(), fake.clone() as Arc<dyn AgentBackend>);
-        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
-        app.root = "ZAP-204".into();
+        register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // opens the agent window, focuses it
+        let n = app.windows.windows.len();
+        verb(&mut app, KeyCode::Char('h')); // focus back toward the spine
+        press(&mut app, KeyCode::Enter); // button again on the same selection
+        assert_eq!(app.windows.windows.len(), n, "no duplicate window");
+    }
 
-        press(&mut app, KeyCode::Char('t')); // attach
-        assert_eq!(app.attached.as_deref(), Some("ZAP-204"));
-
-        // A normal key now drives the agent, not the cockpit (note 'q' would
-        // otherwise quit — proof the agent owns the keyboard).
+    #[test]
+    fn keys_go_to_a_focused_agents_pty_and_the_prefix_escapes() {
+        let mut app = app();
+        let fake = register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // focus the agent window
+        assert_eq!(app.windows.focused_kind().agent_issue(), Some("ZAP-204"));
+        // A normal key now drives the agent, not the cockpit ('q' would otherwise
+        // be nothing on the spine, but here it must reach the PTY).
         press(&mut app, KeyCode::Char('q'));
-        assert!(!app.should_quit, "q goes to the agent while attached");
+        assert!(!app.should_quit);
         assert_eq!(fake.inputs.lock().unwrap().last().unwrap(), b"q");
-
-        // F10 detaches, leaving the agent running.
-        press(&mut app, KeyCode::F(10));
-        assert!(app.attached.is_none());
-        // The detach key itself is not sent to the agent.
-        assert_eq!(fake.inputs.lock().unwrap().len(), 1);
     }
 
     #[test]
-    fn agent_exited_frees_the_backend_but_leaves_fleet_status_to_the_supervisor() {
+    fn a_double_prefix_sends_the_literal_chord_to_the_agent() {
         let mut app = app();
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
-        app.backends
-            .insert("ZAP-204".into(), fake as Arc<dyn AgentBackend>);
-        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        let fake = register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // focus the agent
+        // Ctrl-a Ctrl-a → one literal Ctrl-A (0x01) to the PTY, not a verb.
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(!app.prefix_armed);
+        assert_eq!(fake.inputs.lock().unwrap().last().unwrap(), &vec![0x01]);
+    }
 
-        // A nonzero exit must NOT itself flip the node to Failed — the
-        // supervisor's AgentStatusChanged is the authority (so a cancel reads
-        // as Idle, not Failed). AgentExited only reclaims the dead PTY handle.
-        app.apply_event(AppEvent::AgentExited {
-            issue: "ZAP-204".into(),
-            code: Some(1),
-        });
-        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Running));
+    #[test]
+    fn moving_focus_off_the_spine_during_search_routes_keys_to_the_window() {
+        // Regression: an open search must not keep capturing keys once focus moves
+        // to an agent window — the key has to reach the PTY, not the search buffer.
+        let mut app = app();
+        let fake = register(&mut app, "ZAP-204");
+        app.root = "ZAP-204".into();
+        // Start a search on the spine, then open + focus the agent via the prefix
+        // button (reachable mid-search since the prefix arms before the search
+        // capture).
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.search_active);
+        verb(&mut app, KeyCode::Enter); // Ctrl-a Enter = AttachOrSpawn (the button)
+        assert_eq!(app.windows.focused_kind().agent_issue(), Some("ZAP-204"));
+        // A plain key now reaches the agent's PTY; the search committed itself.
+        press(&mut app, KeyCode::Char('q'));
         assert!(
-            !app.backends.contains_key("ZAP-204"),
-            "dead PTY handle reclaimed"
+            !app.search_active,
+            "the search committed when focus left the spine"
         );
-
-        // The supervisor's status event is what actually moves the node.
-        app.apply_event(AppEvent::AgentStatusChanged {
-            issue: "ZAP-204".into(),
-            status: AgentStatus::Failed,
-        });
-        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Failed));
+        assert_eq!(
+            fake.inputs.lock().unwrap().last().unwrap(),
+            b"q",
+            "the key reached the agent, not the search buffer"
+        );
+        assert!(!app.should_quit, "q went to the agent, not Quit");
     }
 
+    // ── Window verbs: focus / close / kill / pin / layout / zoom ─────────────
+
     #[test]
-    fn agent_exited_keeps_the_backend_while_attached() {
+    fn close_undocks_a_window_and_keeps_a_live_agent_running() {
         let mut app = app();
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
-        app.backends
-            .insert("ZAP-204".into(), fake as Arc<dyn AgentBackend>);
-        app.attached = Some("ZAP-204".into());
-        app.apply_event(AppEvent::AgentExited {
-            issue: "ZAP-204".into(),
-            code: Some(0),
-        });
+        register(&mut app, "ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        press(&mut app, KeyCode::Enter); // open + focus the agent window
+        verb(&mut app, KeyCode::Char('w')); // Ctrl-a w = close
+        assert!(
+            app.windows.agent_window("ZAP-204").is_none(),
+            "the window is undocked"
+        );
         assert!(
             app.backends.contains_key("ZAP-204"),
-            "kept so the attached user can read its final screen; freed on detach"
+            "a live agent keeps running (its backend is kept for re-find)"
         );
     }
 
     #[test]
-    fn leader_sequence_detach_arms_completes_and_passes_through() {
+    fn close_reclaims_a_dead_agents_backend() {
         let mut app = app();
-        app.keymap
-            .apply(&[("detach".to_string(), vec!["ctrl-a d".to_string()])]);
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
-        app.backends
-            .insert("ZAP-204".into(), fake.clone() as Arc<dyn AgentBackend>);
-        app.root = "ZAP-204".into();
-        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
-
-        // Attach, then press the leader: it arms without detaching or forwarding.
-        press(&mut app, KeyCode::Char('t'));
-        assert_eq!(app.attached.as_deref(), Some("ZAP-204"));
-        app.on_key(ctrl_a);
-        assert!(app.detach_armed(), "leader arms the sequence");
-        assert!(app.attached.is_some());
+        let fake = register(&mut app, "ZAP-204");
+        fake.finish(Some(0)); // the agent exited
+        press(&mut app, KeyCode::Enter); // open its (EXITED) window
+        verb(&mut app, KeyCode::Char('w')); // close it
         assert!(
-            fake.inputs.lock().unwrap().is_empty(),
-            "leader isn't forwarded"
+            !app.backends.contains_key("ZAP-204"),
+            "a dead, unreferenced agent's handle is reclaimed on close"
         );
-
-        // Completion detaches.
-        press(&mut app, KeyCode::Char('d'));
-        assert!(app.attached.is_none());
-        assert!(!app.detach_armed());
-
-        // Re-attach (the agent is still running, so its backend was kept).
-        press(&mut app, KeyCode::Char('t'));
-        assert_eq!(app.attached.as_deref(), Some("ZAP-204"));
-
-        // Double-tapping the leader sends one Ctrl-A (0x01) through, not detach.
-        app.on_key(ctrl_a);
-        app.on_key(ctrl_a);
-        assert!(app.attached.is_some(), "double-tap doesn't detach");
-        assert_eq!(fake.inputs.lock().unwrap().last().unwrap(), &vec![0x01]);
-
-        // Arm, then a non-completion key cancels and is forwarded.
-        app.on_key(ctrl_a);
-        assert!(app.detach_armed());
-        press(&mut app, KeyCode::Char('z'));
-        assert!(!app.detach_armed());
-        assert!(app.attached.is_some());
-        assert_eq!(fake.inputs.lock().unwrap().last().unwrap(), b"z");
     }
 
     #[test]
-    fn attach_without_an_agent_is_a_no_op_with_a_reason() {
-        let mut app = app(); // no backends registered
-        press(&mut app, KeyCode::Char('t'));
-        assert!(app.attached.is_none());
+    fn closing_the_spine_is_a_no_op() {
+        let mut app = app();
+        app.windows.focus = 0;
+        verb(&mut app, KeyCode::Char('w'));
+        assert!(matches!(app.windows.windows[0].kind, WindowKind::Spine));
+    }
+
+    #[test]
+    fn kill_is_confirmed_and_separate_from_close() {
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        press(&mut app, KeyCode::Enter); // focus the live agent
+        verb(&mut app, KeyCode::Char('x')); // Ctrl-a x = kill (arms confirm)
+        assert_eq!(app.kill_confirm.as_deref(), Some("ZAP-204"));
+        // A non-confirming key cancels; the window survives.
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.kill_confirm.is_none(), "kill cancelled");
+        assert!(app.windows.agent_window("ZAP-204").is_some());
+    }
+
+    #[test]
+    fn kill_is_refused_on_a_non_agent_window() {
+        let mut app = app();
+        // Focus the deps window (index 1).
+        verb(&mut app, KeyCode::Char('l'));
+        assert!(matches!(
+            app.windows.focused_kind(),
+            WindowKind::Deps(DepsRoot::Issue)
+        ));
+        verb(&mut app, KeyCode::Char('x'));
+        assert!(app.kill_confirm.is_none());
         assert!(app.status_msg.as_deref().unwrap().contains("no agent"));
     }
 
     #[test]
-    fn fleet_summary_counts_agents_and_attention() {
+    fn focus_moves_left_and_right_across_windows() {
         let mut app = app();
-        assert_eq!(app.fleet_summary(), (0, 0));
-        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
-        app.fleet.insert("ZAP-205".into(), AgentStatus::NeedsYou);
-        assert_eq!(app.fleet_summary(), (2, 1));
+        register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // windows: [Spine, Deps, Agent], focus=2
+        verb(&mut app, KeyCode::Char('h')); // focus left
+        assert_eq!(app.windows.focus, 1);
+        verb(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.windows.focus, 0);
+        verb(&mut app, KeyCode::Char('h')); // no wrap past the spine
+        assert_eq!(app.windows.focus, 0);
+        verb(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.windows.focus, 1);
     }
 
     #[test]
-    fn stopping_or_finishing_an_agent_drops_it_from_the_live_count() {
-        // The reported bug: the header count never fell when you closed an agent.
+    fn pin_keeps_a_window_off_the_preview_slot() {
         let mut app = app();
-        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
-        app.fleet.insert("ZAP-205".into(), AgentStatus::NeedsYou);
-        assert_eq!(app.fleet_summary(), (2, 1));
-
-        // A stop (Stopped) and a finish (Done) both leave the node in the fleet
-        // — so you can still see it ran — but neither counts as a live agent.
-        app.apply_event(AppEvent::AgentStatusChanged {
-            issue: "ZAP-204".into(),
-            status: AgentStatus::Stopped,
-        });
-        app.apply_event(AppEvent::AgentStatusChanged {
-            issue: "ZAP-205".into(),
-            status: AgentStatus::Done,
-        });
-        assert_eq!(app.fleet_summary(), (0, 0), "the live count drops to zero");
-        assert!(
-            app.fleet.contains_key("ZAP-204") && app.fleet.contains_key("ZAP-205"),
-            "the nodes still record that an agent ran there"
-        );
-    }
-
-    #[test]
-    fn chat_panes_show_pins_first_then_selection_and_cap() {
-        let mut app = app();
-        for key in ["ZAP-150", "ZAP-188", "ZAP-198", "ZAP-201", "ZAP-205"] {
-            let fake = crate::backend::fake::FakeBackend::new(key);
-            app.backends
-                .insert(key.into(), fake as Arc<dyn AgentBackend>);
-        }
-        app.pinned = vec!["ZAP-150".into(), "ZAP-188".into()];
+        register(&mut app, "ZAP-204");
+        register(&mut app, "ZAP-205");
+        app.root = "ZAP-204".into();
+        press(&mut app, KeyCode::Enter); // open ZAP-204 (unpinned preview)
+        verb(&mut app, KeyCode::Char('p')); // pin it (focus stays on the agent)
+        assert!(app.windows.focused().pinned);
         app.root = "ZAP-205".into();
-        assert_eq!(
-            app.chat_panes(),
-            vec!["ZAP-150", "ZAP-188", "ZAP-205"],
-            "pins in order, then the current selection"
-        );
-
-        // Even with the wall full of pins (set directly, bypassing the UI cap),
-        // a live unpinned selection is never silently hidden — it keeps a slot,
-        // dropping the oldest pin instead (the M1 fix).
-        app.pinned = vec![
-            "ZAP-150".into(),
-            "ZAP-188".into(),
-            "ZAP-198".into(),
-            "ZAP-201".into(),
-        ];
-        let panes = app.chat_panes();
-        assert_eq!(panes.len(), 4);
-        assert!(
-            panes.contains(&"ZAP-205".to_string()),
-            "the selected agent's chat always gets a slot"
-        );
+        // The prefix button opens ZAP-205 from any focus; pinned ZAP-204 survives.
+        verb(&mut app, KeyCode::Enter);
+        assert!(app.windows.agent_window("ZAP-204").is_some());
+        assert!(app.windows.agent_window("ZAP-205").is_some());
     }
 
     #[test]
-    fn fleet_summary_excludes_terminal_agents() {
-        // Terminal nodes linger in `fleet` for their glyph but must not inflate
-        // the header's live-agent count. Done/Failed are terminal; Idle is alive.
+    fn layout_toggle_flips_filmstrip_and_mosaic() {
+        let mut app = app();
+        assert_eq!(app.windows.layout, LayoutMode::Filmstrip);
+        verb(&mut app, KeyCode::Char('|'));
+        assert_eq!(app.windows.layout, LayoutMode::Mosaic);
+        verb(&mut app, KeyCode::Char('|'));
+        assert_eq!(app.windows.layout, LayoutMode::Filmstrip);
+    }
+
+    #[test]
+    fn quit_is_only_reachable_through_the_prefix() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('q')); // a bare q does nothing on the spine
+        assert!(!app.should_quit);
+        verb(&mut app, KeyCode::Char('q')); // Ctrl-a q quits
+        assert!(app.should_quit);
+    }
+
+    // ── Deps windows (per-window navigation) ─────────────────────────────────
+
+    #[test]
+    fn a_focused_deps_window_re_roots_and_back_returns() {
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('l')); // focus the deps window
+        let cursor = app.windows.focused().deps.as_ref().unwrap();
+        let target = cursor.up_rows[0].key.clone();
+        press(&mut app, KeyCode::Enter); // re-root onto the first blocker
+        assert_eq!(app.windows.focused().deps.as_ref().unwrap().root, target);
+        press(&mut app, KeyCode::Char('b')); // back
+        assert_eq!(app.windows.focused().deps.as_ref().unwrap().root, "ZAP-204");
+    }
+
+    #[test]
+    fn deps_windows_navigate_independently() {
+        let mut app = app();
+        // Open a second deps window on a different selection (pin the first so the
+        // preview slot doesn't re-root it).
+        verb(&mut app, KeyCode::Char('l')); // focus deps #1 (ZAP-204)
+        verb(&mut app, KeyCode::Char('p')); // pin it
+        app.root = "ZAP-210".into();
+        press(&mut app, KeyCode::Char('d')); // open deps #2 on ZAP-210
+        assert_eq!(app.windows.focused().deps.as_ref().unwrap().root, "ZAP-210");
+        // The first window still roots at ZAP-204 — independent navigation.
+        let first = app
+            .windows
+            .windows
+            .iter()
+            .find(|w| matches!(w.kind, WindowKind::Deps(DepsRoot::Issue)) && w.pinned)
+            .unwrap();
+        assert_eq!(first.deps.as_ref().unwrap().root, "ZAP-204");
+    }
+
+    #[test]
+    fn open_fleet_opens_a_single_overview_window() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('g')); // open the fleet map
+        assert!(matches!(
+            app.windows.focused_kind(),
+            WindowKind::Deps(DepsRoot::Fleet)
+        ));
+        // A second `g` focuses the same one — there's only ever one Fleet window.
+        let n = app.windows.windows.len();
+        app.windows.focus = 0;
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.windows.windows.len(), n);
+    }
+
+    // ── Fleet summary + the preserved late-hook / tombstone invariants ───────
+
+    #[test]
+    fn fleet_summary_counts_only_live_agents() {
         let mut app = app();
         app.fleet.insert("ZAP-201".into(), AgentStatus::Running);
         app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
         app.fleet.insert("ZAP-205".into(), AgentStatus::Done);
         app.fleet.insert("ZAP-210".into(), AgentStatus::Failed);
         app.fleet.insert("ZAP-240".into(), AgentStatus::NeedsYou);
-        // Running + Idle + NeedsYou are live (3); Done/Failed are not. One needs you.
         assert_eq!(app.fleet_summary(), (3, 1));
-    }
-
-    #[test]
-    fn post_tool_use_does_not_clear_a_pending_needs_you() {
-        // A queued PostToolUse (→Running) arriving just after a permission prompt
-        // (→NeedsYou) must not silently downgrade the node the human has to act
-        // on, nor bury the footer alert.
-        let mut app = app();
-        app.apply_event(AppEvent::AgentNeedsYou {
-            issue: "ZAP-204".into(),
-            reason: "permission".into(),
-        });
-        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::NeedsYou));
-        let alert = app.status_msg.clone();
-
-        app.apply_event(AppEvent::AgentAction {
-            issue: "ZAP-204".into(),
-            action: "ran Bash".into(),
-        });
-        assert_eq!(
-            app.fleet.get("ZAP-204"),
-            Some(&AgentStatus::NeedsYou),
-            "tool chatter must not downgrade a NeedsYou node"
-        );
-        assert_eq!(
-            app.status_msg, alert,
-            "tool chatter must not bury the needs-you footer"
-        );
-        // A different agent's action still lands normally.
-        app.apply_event(AppEvent::AgentAction {
-            issue: "ZAP-201".into(),
-            action: "ran Read".into(),
-        });
-        assert_eq!(app.fleet.get("ZAP-201"), Some(&AgentStatus::Running));
-    }
-
-    #[test]
-    fn an_explicit_status_change_resolves_a_needs_you() {
-        // Only a resolving AgentStatusChanged (the supervisor's authority) clears
-        // a NeedsYou — then routine chatter is free to move the node again.
-        let mut app = app();
-        app.apply_event(AppEvent::AgentNeedsYou {
-            issue: "ZAP-204".into(),
-            reason: "permission".into(),
-        });
-        app.apply_event(AppEvent::AgentStatusChanged {
-            issue: "ZAP-204".into(),
-            status: AgentStatus::Running,
-        });
-        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Running));
-        // The sticky footer alert is lifted, so chatter shows again.
-        app.apply_event(AppEvent::AgentAction {
-            issue: "ZAP-204".into(),
-            action: "ran Edit".into(),
-        });
-        assert_eq!(
-            app.status_msg.as_deref(),
-            Some("ZAP-204: ran Edit"),
-            "after resolution, the activity line is restored"
-        );
     }
 
     #[test]
@@ -2045,9 +1725,7 @@ mod tests {
             reason: "permission".into(),
         });
         assert!(app.needs_you_alert);
-        // Any dashboard key acknowledges (here: cycle filter); chatter is no
-        // longer suppressed afterwards.
-        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('f')); // a spine key acknowledges
         assert!(!app.needs_you_alert);
         app.apply_event(AppEvent::AgentAction {
             issue: "ZAP-204".into(),
@@ -2057,62 +1735,25 @@ mod tests {
     }
 
     #[test]
-    fn cancel_is_refused_on_a_terminal_or_absent_agent() {
+    fn post_tool_use_does_not_clear_a_pending_needs_you() {
         let mut app = app();
-        app.root = "ZAP-204".into();
-        // No agent at all.
-        app.dispatch(Action::CancelAgent);
-        assert!(
-            app.status_msg.as_deref().unwrap().contains("not running"),
-            "{:?}",
-            app.status_msg
-        );
-        // A reaped Done entry lingers in fleet but is not a live cancel target.
-        app.fleet.insert("ZAP-204".into(), AgentStatus::Done);
-        app.dispatch(Action::CancelAgent);
-        assert!(app.status_msg.as_deref().unwrap().contains("not running"));
-        // A live agent is a valid target (no supervisor here, so it reports the
-        // missing control plane rather than the "not running" guard).
-        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
-        app.dispatch(Action::CancelAgent);
-        assert!(
-            !app.status_msg.as_deref().unwrap().contains("not running"),
-            "a live agent passes the guard"
-        );
-    }
-
-    #[test]
-    fn pinning_caps_at_one_below_the_wall_and_keeps_the_selection_visible() {
-        let mut app = app();
-        for key in ["ZAP-150", "ZAP-188", "ZAP-198", "ZAP-201"] {
-            let fake = crate::backend::fake::FakeBackend::new(key);
-            app.backends
-                .insert(key.into(), fake as Arc<dyn AgentBackend>);
-        }
-        // Pin three (the cap, reserving the 4th slot for the selection).
-        for key in ["ZAP-150", "ZAP-188", "ZAP-198"] {
-            app.root = key.into();
-            press(&mut app, KeyCode::Char('p'));
-        }
-        assert_eq!(app.pinned.len(), 3);
-        // The fourth pin is refused.
-        app.root = "ZAP-201".into();
-        press(&mut app, KeyCode::Char('p'));
-        assert_eq!(app.pinned.len(), 3, "the cap holds");
-        assert!(app.status_msg.as_deref().unwrap().contains("full"));
-        // …and ZAP-201's chat still shows as the selection's reserved pane.
-        let panes = app.chat_panes();
-        assert_eq!(panes.len(), 4);
-        assert!(panes.contains(&"ZAP-201".to_string()));
+        app.apply_event(AppEvent::AgentNeedsYou {
+            issue: "ZAP-204".into(),
+            reason: "permission".into(),
+        });
+        let alert = app.status_msg.clone();
+        app.apply_event(AppEvent::AgentAction {
+            issue: "ZAP-204".into(),
+            action: "ran Bash".into(),
+        });
+        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::NeedsYou));
+        assert_eq!(app.status_msg, alert, "chatter must not bury the alert");
     }
 
     #[test]
     fn a_late_hook_cannot_resurrect_a_terminated_agent() {
-        // Guards the headline count fix against a hook racing the teardown.
         let mut app = app();
         app.fleet.insert("ZAP-204".into(), AgentStatus::Done);
-
-        // Stray PostToolUse / Notification / Stop hooks after teardown are ignored.
         assert!(!app.apply_event(AppEvent::AgentAction {
             issue: "ZAP-204".into(),
             action: "ran grep".into(),
@@ -2126,26 +1767,13 @@ mod tests {
             status: AgentStatus::Idle,
         }));
         assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Done));
-        assert_eq!(app.fleet_summary(), (0, 0), "the count stays at zero");
-
-        // But a fresh launch legitimately revives it through AgentSpawned.
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
-        app.apply_event(AppEvent::AgentSpawned {
-            issue: "ZAP-204".into(),
-            backend: fake as Arc<dyn AgentBackend>,
-        });
-        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Spawning));
+        assert_eq!(app.fleet_summary(), (0, 0));
     }
 
     #[test]
     fn a_late_hook_cannot_resurrect_a_reaped_agent() {
-        // The post-reap window the terminal guard alone misses: once AgentReaped
-        // has removed the fleet entry, `is_terminal` is false (no entry), so a
-        // final hook forwarded by the dying agent must be stopped by the reaped
-        // tombstone instead — or it would re-create a live, backend-less node,
-        // inflating the count and re-arming a sticky alert nothing can clear.
         let mut app = app();
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        let fake = FakeBackend::new("ZAP-204");
         app.apply_event(AppEvent::AgentSpawned {
             issue: "ZAP-204".into(),
             backend: fake as Arc<dyn AgentBackend>,
@@ -2161,13 +1789,10 @@ mod tests {
             !app.fleet.contains_key("ZAP-204"),
             "the reaped agent is gone"
         );
-        assert_eq!(app.fleet_summary(), (0, 0));
-
-        // All three late hook events for the reaped agent are ignored: no
-        // repaint, no resurrected entry, no sticky alert.
+        // All three late hooks are ignored.
         assert!(!app.apply_event(AppEvent::AgentNeedsYou {
             issue: "ZAP-204".into(),
-            reason: "late prompt".into(),
+            reason: "late".into(),
         }));
         assert!(!app.apply_event(AppEvent::AgentAction {
             issue: "ZAP-204".into(),
@@ -2177,292 +1802,111 @@ mod tests {
             issue: "ZAP-204".into(),
             status: AgentStatus::Idle,
         }));
-        assert!(
-            !app.fleet.contains_key("ZAP-204"),
-            "no late hook revived the reaped agent"
-        );
-        assert_eq!(app.fleet_summary(), (0, 0), "live count stays zero");
-        assert!(!app.needs_you_alert, "no phantom sticky needs-you alert");
-
-        // A genuine relaunch clears the tombstone, so the new generation's hooks
-        // work again.
-        let fake2 = crate::backend::fake::FakeBackend::new("ZAP-204");
+        assert!(!app.fleet.contains_key("ZAP-204"));
+        assert!(!app.needs_you_alert, "no phantom sticky alert");
+        // A genuine relaunch clears the tombstone.
+        let fake2 = FakeBackend::new("ZAP-204");
         app.apply_event(AppEvent::AgentSpawned {
             issue: "ZAP-204".into(),
             backend: fake2 as Arc<dyn AgentBackend>,
         });
         assert!(app.apply_event(AppEvent::AgentNeedsYou {
             issue: "ZAP-204".into(),
-            reason: "real prompt".into(),
+            reason: "real".into(),
         }));
         assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::NeedsYou));
     }
 
     #[test]
-    fn launch_is_refused_while_an_agent_is_already_live() {
-        let mut app = app();
-        app.root = "ZAP-204".into();
-        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
-        app.dispatch(Action::LaunchAgent);
-        assert!(
-            app.status_msg
-                .as_deref()
-                .unwrap()
-                .contains("already has an agent"),
-            "{:?}",
-            app.status_msg
-        );
-    }
+    fn agent_exited_reclaims_an_unreferenced_backend_but_keeps_a_windowed_one() {
+        // No window references it → AgentExited reclaims the dead handle.
+        {
+            let mut app = app();
+            let fake = FakeBackend::new("ZAP-201");
+            app.backends
+                .insert("ZAP-201".into(), fake as Arc<dyn AgentBackend>);
+            app.fleet.insert("ZAP-201".into(), AgentStatus::Running);
+            app.apply_event(AppEvent::AgentExited {
+                issue: "ZAP-201".into(),
+                code: Some(1),
+            });
+            assert!(
+                !app.backends.contains_key("ZAP-201"),
+                "an unreferenced dead PTY handle is reclaimed"
+            );
+            // Status stays the supervisor's authority (unchanged by AgentExited).
+            assert_eq!(app.fleet.get("ZAP-201"), Some(&AgentStatus::Running));
+        }
 
-    #[test]
-    fn a_second_launch_is_refused_while_the_first_is_in_flight() {
-        // The double-press window: a pending launch (sent, not yet AgentSpawned)
-        // blocks a second optimistic "launching…". AgentSpawned then clears it.
+        // A windowed agent keeps its handle (its EXITED card) until the window closes.
         let mut app = app();
-        app.root = "ZAP-204".into();
-        // Simulate the in-flight mark the supervisor path would set.
-        app.pending_launch.insert("ZAP-204".into());
-        app.dispatch(Action::LaunchAgent);
-        assert!(
-            app.status_msg
-                .as_deref()
-                .unwrap()
-                .contains("already opening"),
-            "{:?}",
-            app.status_msg
-        );
-        // The spawn acknowledgement clears the pending mark.
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
-        app.apply_event(AppEvent::AgentSpawned {
-            issue: "ZAP-204".into(),
-            backend: fake as Arc<dyn AgentBackend>,
-        });
-        assert!(!app.pending_launch.contains("ZAP-204"));
-    }
-
-    #[test]
-    fn a_pinned_agents_screen_survives_its_exit_until_unpinned() {
-        let mut app = app();
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-205");
-        app.backends
-            .insert("ZAP-205".into(), fake.clone() as Arc<dyn AgentBackend>);
-        app.pinned = vec!["ZAP-205".into()];
-
-        // It exits — but because it's pinned, its final screen stays on the wall.
-        fake.finish(Some(0));
+        register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // open a window referencing ZAP-204
         app.apply_event(AppEvent::AgentExited {
-            issue: "ZAP-205".into(),
+            issue: "ZAP-204".into(),
             code: Some(0),
         });
         assert!(
-            app.backends.contains_key("ZAP-205"),
-            "kept for the EXITED card while pinned"
+            app.backends.contains_key("ZAP-204"),
+            "a windowed agent keeps its final screen"
         );
+    }
 
-        // Unpinning the dead agent reclaims its handle.
+    #[test]
+    fn agent_output_repaints_only_when_its_window_is_visible() {
+        let mut app = app();
+        register(&mut app, "ZAP-205");
         app.root = "ZAP-205".into();
-        press(&mut app, KeyCode::Char('p'));
-        assert!(app.pinned.is_empty());
+        press(&mut app, KeyCode::Enter); // open + focus ZAP-205's window
         assert!(
-            !app.backends.contains_key("ZAP-205"),
-            "reclaimed on unpin once it's dead"
+            app.apply_event(AppEvent::AgentOutput {
+                issue: "ZAP-205".into()
+            }),
+            "a visible agent's output forces a redraw"
         );
-    }
-
-    #[test]
-    fn a_jump_to_a_filtered_out_agent_clears_the_highlight_and_says_so() {
-        let mut app = app();
-        // ZAP-198 is unblocked, so filtering to Blocked hides it from the list.
-        app.fleet.insert("ZAP-198".into(), AgentStatus::NeedsYou);
-        app.filter = Filter::Blocked;
-        app.rebuild_order();
-        assert!(
-            !app.order.contains(&"ZAP-198".to_string()),
-            "precondition: the filter hides the agent's issue"
-        );
-
-        press(&mut app, KeyCode::Char('n')); // jump to the needs-you agent
-        assert_eq!(app.root, "ZAP-198", "the lens jumps to the agent");
-        assert_eq!(
-            app.list_state.selected(),
-            None,
-            "the list shows no highlight rather than lighting an unrelated row"
-        );
-        assert!(
-            app.status_msg
-                .as_deref()
-                .unwrap()
-                .contains("hidden by filter"),
-            "and the jump explains why the list looks empty"
-        );
-
-        // Clearing the filter brings it back into the list, highlighted in sync.
-        app.filter = Filter::All;
-        app.rebuild_order();
-        assert_eq!(
-            app.list_state.selected(),
-            app.order.iter().position(|k| *k == "ZAP-198"),
-            "revealed and highlighted once the filter no longer hides it"
-        );
-    }
-
-    #[test]
-    fn tick_frame_advances_and_expires_flashes() {
-        let mut app = app();
-        // A launch flash makes the cockpit animate until the flash expires.
-        app.flash.insert("ZAP-204".into(), (Flash::Launched, 3));
-        assert!(app.is_animating());
-        for _ in 0..3 {
-            app.tick_frame();
-        }
-        assert!(
-            !app.is_animating(),
-            "the flash expired and nothing else animates → the loop goes quiet"
-        );
-        assert!(app.flash.is_empty(), "the expired flash was pruned");
-    }
-
-    #[test]
-    fn agent_output_repaints_only_when_its_chat_is_on_screen() {
-        let mut app = app();
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-205");
-        app.backends
-            .insert("ZAP-205".into(), fake as Arc<dyn AgentBackend>);
-        app.root = "ZAP-205".into();
-
-        // Deps view: the screen isn't shown, so output changes nothing.
-        app.right_view = RightView::Deps;
-        assert!(!app.apply_event(AppEvent::AgentOutput {
-            issue: "ZAP-205".into()
-        }));
-
-        // Chat view with it selected: its pane is on screen → repaint.
-        app.right_view = RightView::Chat;
-        assert!(app.apply_event(AppEvent::AgentOutput {
-            issue: "ZAP-205".into()
-        }));
-
-        // An off-screen agent's output still changes nothing visible.
+        // An agent with no window changes nothing visible.
         assert!(!app.apply_event(AppEvent::AgentOutput {
             issue: "ZAP-999".into()
         }));
     }
 
     #[test]
-    fn is_animating_is_false_for_a_fleet_of_only_resting_agents() {
-        let mut app = app();
-        assert!(!app.is_animating(), "no agents → nothing animates");
-        app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
-        app.fleet.insert("ZAP-205".into(), AgentStatus::Done);
-        app.fleet.insert("ZAP-201".into(), AgentStatus::Stopped);
-        assert!(
-            !app.is_animating(),
-            "idle/done/stopped rest quietly — the cockpit doesn't busy-repaint"
-        );
-        app.fleet.insert("ZAP-240".into(), AgentStatus::Running);
-        assert!(app.is_animating(), "a working agent drives the tick");
-    }
-
-    #[test]
-    fn opening_an_already_live_agent_shows_its_chat_instead_of_duplicating() {
-        let mut app = app();
-        app.root = "ZAP-205".into();
-        app.fleet.insert("ZAP-205".into(), AgentStatus::Running);
-        // The live-guard returns before any supervisor command, so no duplicate.
-        press(&mut app, KeyCode::Char('a'));
-        assert_eq!(app.right_view, RightView::Chat, "a reveals the chat");
-        assert!(
-            app.status_msg
-                .as_deref()
-                .unwrap()
-                .contains("already has an agent")
-        );
-    }
-
-    #[test]
-    fn pending_attach_is_cleared_and_a_flash_set_when_the_agent_spawns() {
+    fn spawning_for_a_pending_button_opens_and_focuses_the_window() {
         let mut app = app();
         app.pending_attach = Some("ZAP-205".into());
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-205");
+        let fake = FakeBackend::new("ZAP-205");
         app.apply_event(AppEvent::AgentSpawned {
             issue: "ZAP-205".into(),
             backend: fake as Arc<dyn AgentBackend>,
         });
-        assert!(app.pending_attach.is_none(), "the wait clears once it's up");
-        assert!(app.status_msg.as_deref().unwrap().contains("ready"));
+        assert!(app.pending_attach.is_none());
+        assert_eq!(app.windows.focused_kind().agent_issue(), Some("ZAP-205"));
         assert!(app.flash.contains_key("ZAP-205"), "a launch flash is set");
     }
 
     #[test]
-    fn pin_toggles_and_refuses_without_an_agent() {
+    fn a_background_spawn_does_not_steal_focus() {
         let mut app = app();
-        app.root = "ZAP-205".into();
-        // No agent yet → can't pin.
-        press(&mut app, KeyCode::Char('p'));
-        assert!(app.pinned.is_empty());
-        assert!(app.status_msg.as_deref().unwrap().contains("no agent"));
-
-        // With a live screen, p pins then unpins.
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-205");
-        app.backends
-            .insert("ZAP-205".into(), fake as Arc<dyn AgentBackend>);
-        press(&mut app, KeyCode::Char('p'));
-        assert_eq!(app.pinned, vec!["ZAP-205".to_string()]);
-        press(&mut app, KeyCode::Char('p'));
-        assert!(app.pinned.is_empty(), "a second p unpins");
+        let focus_before = app.windows.focus;
+        let fake = FakeBackend::new("ZAP-205");
+        app.apply_event(AppEvent::AgentSpawned {
+            issue: "ZAP-205".into(),
+            backend: fake as Arc<dyn AgentBackend>,
+        });
+        // No pending_attach / pending_launch → the roster gains it, focus stays put.
+        assert_eq!(app.windows.focus, focus_before);
+        assert!(app.windows.agent_window("ZAP-205").is_none());
+        assert_eq!(app.fleet.get("ZAP-205"), Some(&AgentStatus::Spawning));
     }
 
     #[test]
-    fn v_toggles_the_right_pane_and_stop_needs_a_live_agent() {
-        let mut app = app();
-        assert_eq!(app.right_view, RightView::Deps);
-        press(&mut app, KeyCode::Char('v'));
-        assert_eq!(app.right_view, RightView::Chat);
-        press(&mut app, KeyCode::Char('v'));
-        assert_eq!(app.right_view, RightView::Deps);
-
-        // x on a stopped (not live) node reports rather than firing a no-op stop.
-        app.root = "ZAP-205".into();
-        app.fleet.insert("ZAP-205".into(), AgentStatus::Stopped);
-        press(&mut app, KeyCode::Char('x'));
-        assert!(app.status_msg.as_deref().unwrap().contains("not running"));
-    }
-
-    #[test]
-    fn empty_list_navigation_keeps_root_and_never_panics() {
-        // A search that matches nothing empties the list; navigation must be a
-        // safe no-op and the lens must keep its last valid root + trees.
-        let mut app = app();
-        let root = app.root.clone();
-        press(&mut app, KeyCode::Char('/'));
-        for c in "zzzznomatch".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        assert!(app.order.is_empty());
-        for code in [
-            KeyCode::Down,
-            KeyCode::Up,
-            KeyCode::Enter,
-            KeyCode::Char(' '),
-            KeyCode::Tab,
-        ] {
-            press(&mut app, code);
-        }
-        assert_eq!(app.root, root);
-        assert!(!app.up_rows.is_empty());
-    }
-
-    // ── Cockpit v2: roster, composer, split orientation ──────────────────────
-
-    #[test]
-    fn agent_order_sorts_by_salience_not_by_id() {
+    fn agent_order_sorts_by_salience_not_id() {
         let mut app = app();
         let k: Vec<String> = app.order.iter().take(4).cloned().collect();
         app.fleet.insert(k[0].clone(), AgentStatus::Done);
         app.fleet.insert(k[1].clone(), AgentStatus::NeedsYou);
         app.fleet.insert(k[2].clone(), AgentStatus::Running);
         app.fleet.insert(k[3].clone(), AgentStatus::Idle);
-        // needs-you → running → idle → done, regardless of issue id.
         assert_eq!(
             app.agent_order(),
             vec![k[1].clone(), k[2].clone(), k[3].clone(), k[0].clone()]
@@ -2470,107 +1914,162 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_tab_drives_the_lens_through_running_agents() {
+    fn is_animating_is_false_for_only_resting_agents() {
         let mut app = app();
-        let k: Vec<String> = app.order.iter().take(2).cloned().collect();
-        app.fleet.insert(k[0].clone(), AgentStatus::Idle);
-        app.fleet.insert(k[1].clone(), AgentStatus::NeedsYou);
+        assert!(!app.is_animating());
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
+        app.fleet.insert("ZAP-205".into(), AgentStatus::Done);
+        assert!(!app.is_animating());
+        app.fleet.insert("ZAP-240".into(), AgentStatus::Running);
+        assert!(app.is_animating(), "a working agent drives the tick");
+    }
 
-        press(&mut app, KeyCode::Char('r')); // flip the left pane to the roster
-        assert_eq!(app.left_view, LeftView::Agents);
-
-        press(&mut app, KeyCode::Down);
-        let first = app.root.clone();
-        assert!(
-            app.fleet.contains_key(&first),
-            "the roster re-aims the lens at an agent"
-        );
-        press(&mut app, KeyCode::Down);
-        assert_ne!(first, app.root, "each step lands on a different agent");
-        assert!(app.fleet.contains_key(&app.root));
-
-        press(&mut app, KeyCode::Char('r')); // flip back to the issue list
-        assert_eq!(app.left_view, LeftView::Issues);
-        // Roster navigation must keep the issue-list selection in lockstep with
-        // `root` (the single source of truth) — else the list highlights a stale,
-        // unrelated row when you flip back.
+    #[test]
+    fn resuming_keeps_the_cockpit_animating_then_the_grace_clears_it() {
+        let mut app = app();
+        // An in-flight resume keeps the loop awake…
+        app.resuming_count = 2;
+        app.resume_deadline = app.frame + RESUME_GRACE_FRAMES;
+        assert!(app.is_animating());
+        // …but a stuck resume can't pin it forever: past the grace it hard-clears.
+        for _ in 0..=RESUME_GRACE_FRAMES {
+            app.tick_frame();
+        }
         assert_eq!(
-            app.list_state.selected(),
-            app.order.iter().position(|k| *k == app.root),
-            "the issue-list highlight tracks root after roster navigation"
+            app.resuming_count, 0,
+            "the grace bound cleared a stuck resume"
+        );
+        assert!(!app.is_animating());
+    }
+
+    #[test]
+    fn an_agent_spawn_decrements_the_resume_count() {
+        let mut app = app();
+        app.resuming_count = 2;
+        let fake = FakeBackend::new("ZAP-205");
+        app.apply_event(AppEvent::AgentSpawned {
+            issue: "ZAP-205".into(),
+            backend: fake as Arc<dyn AgentBackend>,
+        });
+        assert_eq!(
+            app.resuming_count, 1,
+            "each resumed agent that comes up settles one"
         );
     }
 
     #[test]
-    fn refusing_to_compose_leaves_the_view_untouched() {
+    fn tick_frame_advances_and_expires_flashes() {
         let mut app = app();
-        assert_eq!(app.right_view, RightView::Deps);
-        press(&mut app, KeyCode::Char('i')); // no live agent → refused
-        assert!(app.compose.is_none());
-        // A refusal must not yank you out of the deps view into an empty chat wall.
-        assert_eq!(app.right_view, RightView::Deps);
+        app.flash.insert("ZAP-204".into(), (Flash::Launched, 3));
+        assert!(app.is_animating());
+        for _ in 0..3 {
+            app.tick_frame();
+        }
+        assert!(!app.is_animating());
+        assert!(app.flash.is_empty());
+    }
+
+    // ── Persistence (Phase 5) ────────────────────────────────────────────────
+
+    #[test]
+    fn cockpit_snapshot_persists_only_docked_windows() {
+        let mut app = app(); // [Spine, Deps(ZAP-204) unpinned]
+        register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // open Agent(ZAP-204) unpinned, focus it
+        verb(&mut app, KeyCode::Char('p')); // pin the agent
+        let state = app.snapshot_cockpit();
+        // The pinned agent is docked; the unpinned startup deps preview is not.
+        assert_eq!(state.windows.len(), 1);
+        assert_eq!(state.windows[0].kind, PersistedKind::Agent);
+        assert_eq!(state.windows[0].issue.as_deref(), Some("ZAP-204"));
+        assert_eq!(state.layout, "filmstrip");
+        assert_eq!(state.focus.unwrap().issue.as_deref(), Some("ZAP-204"));
     }
 
     #[test]
-    fn an_open_composer_closes_when_its_target_agent_is_reaped() {
+    fn apply_cockpit_restores_docked_windows_and_prunes_dead_ones() {
+        let state = CockpitState {
+            layout: "mosaic".into(),
+            windows: vec![
+                PersistedWindow {
+                    kind: PersistedKind::Agent,
+                    issue: Some("ZAP-204".into()),
+                },
+                PersistedWindow {
+                    kind: PersistedKind::Agent,
+                    issue: Some("GONE-1".into()),
+                },
+                PersistedWindow {
+                    kind: PersistedKind::Deps,
+                    issue: Some("ZAP-205".into()),
+                },
+                PersistedWindow {
+                    kind: PersistedKind::Fleet,
+                    issue: None,
+                },
+            ],
+            focus: Some(PersistedWindow {
+                kind: PersistedKind::Deps,
+                issue: Some("ZAP-205".into()),
+            }),
+            ..CockpitState::default()
+        };
         let mut app = app();
-        let issue = app.root.clone();
-        app.compose = Some(Compose {
-            target: issue.clone(),
-            buffer: "half a message".into(),
-        });
-        // A background teardown of the very agent you're messaging must not leave
-        // the "✎ …" bar lying about a target that no longer exists.
-        app.apply_event(AppEvent::AgentReaped {
-            issue: issue.clone(),
-        });
-        assert!(app.compose.is_none(), "the composer closes with its target");
-    }
-
-    #[test]
-    fn the_chat_layout_key_cycles_stack_side_grid() {
-        let mut app = app();
-        assert_eq!(app.chat_split, ChatSplit::Stack);
-        press(&mut app, KeyCode::Char('|'));
-        assert_eq!(app.chat_split, ChatSplit::Side);
-        // Cycling the layout reveals the wall so the change is visible.
-        assert_eq!(app.right_view, RightView::Chat);
-        press(&mut app, KeyCode::Char('|'));
-        assert_eq!(app.chat_split, ChatSplit::Grid);
-        press(&mut app, KeyCode::Char('|'));
-        assert_eq!(app.chat_split, ChatSplit::Stack);
-    }
-
-    #[test]
-    fn composing_refuses_when_there_is_no_live_agent_to_message() {
-        let mut app = app(); // no backends in a plain demo app
-        press(&mut app, KeyCode::Char('i'));
-        assert!(app.compose.is_none());
+        let survivors: HashSet<String> = ["ZAP-204"].into_iter().map(String::from).collect();
+        app.apply_cockpit(&state, &survivors);
+        // Spine + 3 restored windows; the non-survivor agent (GONE-1) is pruned.
+        assert_eq!(app.windows.windows.len(), 4);
+        assert!(app.windows.agent_window("ZAP-204").is_some());
         assert!(
-            app.status_msg
-                .as_deref()
-                .unwrap_or_default()
-                .contains("no live agent"),
-            "it explains why instead of silently doing nothing"
+            app.windows.agent_window("GONE-1").is_none(),
+            "a non-survivor agent window is pruned on restore"
+        );
+        assert_eq!(app.windows.layout, LayoutMode::Mosaic);
+        assert!(
+            matches!(
+                app.windows.focused_kind(),
+                WindowKind::Deps(DepsRoot::Issue)
+            ),
+            "focus is restored by identity to the deps window"
         );
     }
 
     #[test]
-    fn the_composer_captures_keys_and_esc_closes_it() {
+    fn an_empty_persisted_layout_keeps_the_default_strip() {
         let mut app = app();
-        // Drive the composer state directly (opening it needs a live PTY).
-        app.compose = Some(Compose {
-            target: "ZAP-1".into(),
-            buffer: String::new(),
-        });
-        // A letter binding (`i` = compose) builds the message, it doesn't re-fire.
-        press(&mut app, KeyCode::Char('h'));
-        press(&mut app, KeyCode::Char('i'));
-        assert_eq!(app.compose.as_ref().unwrap().buffer, "hi");
-        press(&mut app, KeyCode::Backspace);
-        assert_eq!(app.compose.as_ref().unwrap().buffer, "h");
-        press(&mut app, KeyCode::Esc); // esc closes the composer (not the app)
-        assert!(app.compose.is_none());
-        assert!(!app.should_quit);
+        let before = app.windows.windows.len();
+        app.apply_cockpit(&CockpitState::default(), &HashSet::new());
+        assert_eq!(
+            app.windows.windows.len(),
+            before,
+            "a missing/empty file leaves the fresh default untouched"
+        );
+    }
+
+    #[test]
+    fn a_saved_layout_with_no_docked_windows_still_keeps_the_default_strip() {
+        // The save path ALWAYS writes a layout label (e.g. "filmstrip"), so a
+        // session that pinned nothing round-trips to {layout:"filmstrip",
+        // windows:[]}. Reloading that must keep the default deps window — not
+        // rebuild to a bare spine — while still adopting the layout mode.
+        let mut app = app();
+        let before = app.windows.windows.len();
+        let state = CockpitState {
+            layout: "mosaic".into(),
+            windows: vec![],
+            focus: None,
+            ..CockpitState::default()
+        };
+        app.apply_cockpit(&state, &HashSet::new());
+        assert_eq!(
+            app.windows.windows.len(),
+            before,
+            "no docked windows → the default strip survives"
+        );
+        assert_eq!(
+            app.windows.layout,
+            LayoutMode::Mosaic,
+            "but the saved layout mode is adopted"
+        );
     }
 }

@@ -1,7 +1,8 @@
-//! All terminal rendering for the app. Reads [`App`] state and paints either
-//! the focus lens or the layered overview, plus the header, detail bar and help
-//! overlay. No state mutation beyond the `ListState` scroll offsets ratatui
-//! needs.
+//! All terminal rendering for the cockpit. Reads [`App`] state and paints the
+//! window strip (the Spine, live Agent PTYs, and Deps trees) plus the header,
+//! detail bar and help overlay. No state mutation beyond the `ListState` scroll
+//! offsets and the per-window `preview_size` ratatui/PTY resize bookkeeping
+//! needs — the documented render-mutation contract.
 
 use std::sync::Arc;
 
@@ -10,31 +11,27 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph,
+    Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph,
 };
 use tui_term::widget::PseudoTerminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, ChatSplit, Flash, LeftView, Mode, NodeKind, Pane, RightView, TreeRow};
-use crate::backend::{AgentBackend, Lifecycle};
+use crate::app::{App, Flash, LeftView};
+use crate::backend::Lifecycle;
+use crate::keymap::Action;
+use crate::layout::{self, Placement};
 use crate::model::{Direction, Graph, Status};
 use crate::session::AgentStatus;
 use crate::theme::{self, *};
+use crate::window::{DepsRoot, DepsSide, LayoutMode, NodeKind, TreeRow, WindowId, WindowKind};
 
-const LIST_WIDTH: u16 = 44;
 const MAX_TITLE: usize = 64;
-/// Below this inner width a `claude` PTY preview is unreadable, so a chat pane
-/// narrower than this (e.g. a thin column under a side/grid split) collapses to a
-/// one-line summary instead of rendering a garbled screen.
-const MIN_CHAT_PREVIEW_W: u16 = 24;
+/// Below this inner width a `claude` PTY preview is unreadable, so a window
+/// narrower than this (a thin mosaic tile, or a letterboxed lone column on a
+/// cramped terminal) collapses to a one-line summary instead of a garbled grid.
+const MIN_PTY_W: u16 = 24;
 
 pub fn draw(app: &mut App, frame: &mut Frame) {
-    // Attached to an agent: its PTY takes over the whole screen.
-    if app.attached.is_some() {
-        render_attached(app, frame);
-        return;
-    }
-
     let [header, body, detail, hints] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -44,10 +41,7 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     .areas(frame.area());
 
     render_header(app, frame, header);
-    match app.mode {
-        Mode::Lens => render_lens(app, frame, body),
-        Mode::Overview => render_overview(app, frame, body),
-    }
+    render_strip(app, frame, body);
     render_detail(app, frame, detail);
     render_hints(app, frame, hints);
 
@@ -56,107 +50,7 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     }
 }
 
-// ── Attach pane (live agent PTY) ─────────────────────────────────────────────
-
-/// Full-screen takeover rendering one agent's live terminal via tui-term, with
-/// a racing-green frame and a detach hint so "attached" is unmistakable.
-fn render_attached(app: &mut App, frame: &mut Frame) {
-    let [header, body, hints] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
-
-    let Some(issue) = app.attached.clone() else {
-        return;
-    };
-    // Clone the Arc out so we can both read its parser and mutate `app` (the
-    // resize bookkeeping) without overlapping borrows.
-    let Some(backend) = app.backends.get(&issue).cloned() else {
-        // The agent vanished from under us. Rendering is a pure function of
-        // state — it must not mutate `app.attached` (that's apply_event/on_key's
-        // job, the single funnel). Paint an empty pane this frame; the next tick
-        // resets attachment. This branch is currently unreachable (no apply_event
-        // removes a backend we're attached to), so it's only defensive.
-        return;
-    };
-
-    // Sample the volatile lifecycle once: the wait thread can flip
-    // Running→Exited at any moment, so reading status() repeatedly would let the
-    // title, border and resize guard disagree within one frame.
-    let lifecycle = backend.status();
-    let exited = matches!(lifecycle, Lifecycle::Exited(_));
-    let detach = app.detach_key_label();
-    // A dead agent is shown as a frozen, amber EXITED pane rather than a live
-    // racing-green one, so "this agent is gone" is unmistakable.
-    let (title, header_style, border) = if let Lifecycle::Exited(code) = lifecycle {
-        let code = code.map_or_else(|| "signal".to_string(), |c| c.to_string());
-        let key = app
-            .graph
-            .get(&issue)
-            .map_or(issue.as_str(), |i| i.key.as_str());
-        (
-            format!(" ○ EXITED ({code})  {key}  · {detach} to leave "),
-            Style::new().fg(INK).bg(AMBER_500).bold(),
-            AMBER_400,
-        )
-    } else {
-        let label = match app.graph.get(&issue) {
-            Some(i) => format!(" ● ATTACHED  {}  {} ", i.key, truncate(&i.title, MAX_TITLE)),
-            None => format!(" ● ATTACHED  {issue} "),
-        };
-        (
-            label,
-            Style::new().fg(GREEN_100).bg(GREEN_700).bold(),
-            GREEN_500,
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(title, header_style))),
-        header,
-    );
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(border))
-        .title(Line::from(Span::styled(
-            " agent ",
-            Style::new().fg(border).bold(),
-        )));
-    let inner = block.inner(body);
-    frame.render_widget(block, body);
-
-    // Keep a live agent's terminal sized to its pane (parser + PTY master both),
-    // but only when it actually changed — this covers attach and live resize. A
-    // dead agent keeps its final screen, so we don't resize it.
-    let size = (inner.height, inner.width);
-    if !exited && inner.area() > 0 && app.preview_size.get(&issue) != Some(&size) {
-        let _ = backend.resize(inner.height, inner.width);
-        app.preview_size.insert(issue.clone(), size);
-    }
-
-    if inner.area() > 0
-        && let Ok(parser) = backend.parser().read()
-    {
-        frame.render_widget(PseudoTerminal::new(parser.screen()), inner);
-    }
-
-    let hint = if exited {
-        format!(" agent has exited · {detach} to return to the dashboard")
-    } else if app.detach_armed() {
-        format!(" detach: finish the chord ({detach}) · repeat the leader to send it through")
-    } else {
-        format!(" keys go to the agent · {detach} to detach · resize reflows")
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, Style::new().fg(MUTED))))
-            .style(Style::new().bg(WELL)),
-        hints,
-    );
-}
-
-// ── Header ──────────────────────────────────────────────────────────────────
+// ── Header ────────────────────────────────────────────────────────────────
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     let g = &app.graph;
@@ -184,13 +78,24 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
             Style::new().fg(GREEN_400).bold(),
         ));
         if needs_you > 0 {
-            // Pulses in step with the per-node flags, so the header's call for
-            // help breathes rather than sitting static.
             spans.push(Span::styled(
                 format!(" · {needs_you} needs you ⚑"),
                 theme::needs_you_style(app.frame),
             ));
         }
+    }
+    // Auto-resume spinner: while docked agents are still coming back, the header
+    // breathes a "resuming N…" so the cockpit reads as busy, not stalled.
+    if app.resuming_count > 0 {
+        spans.push(Span::styled(" · ", Style::new().fg(BORDER)));
+        spans.push(Span::styled(
+            format!(
+                "{} resuming {}…",
+                theme::agent_spinner(app.frame),
+                app.resuming_count
+            ),
+            Style::new().fg(ORANGE_400).bold(),
+        ));
     }
 
     let right = if app.search_active || !app.search_query.is_empty() {
@@ -216,8 +121,6 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         ])
     };
 
-    // Reserve the right side's width so the two halves never overwrite each
-    // other on a narrow terminal; the left content truncates cleanly instead.
     let right_w = u16::try_from(right.width()).unwrap_or(u16::MAX);
     let [left, right_area] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(right_w)]).areas(area);
@@ -228,28 +131,82 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     );
 }
 
-// ── Lens (two-pane focus view) ───────────────────────────────────────────────
+// ── The window strip ──────────────────────────────────────────────────────
 
-fn render_lens(app: &mut App, frame: &mut Frame, area: Rect) {
-    let [left, right] =
-        Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Min(0)]).areas(area);
-
-    // The left pane is a two-tab navigation spine — the full issue list, or the
-    // agents roster — and the right pane swaps between the dependency trees and
-    // the live agent chats. The two axes are independent.
-    match app.left_view {
-        LeftView::Issues => render_issue_list(app, frame, left),
-        LeftView::Agents => render_agent_roster(app, frame, left),
+fn render_strip(app: &mut App, frame: &mut Frame, area: Rect) {
+    if area.area() == 0 {
+        return;
     }
-    match app.right_view {
-        RightView::Deps => render_focus_panes(app, frame, right),
-        RightView::Chat => render_chat_panes(app, frame, right),
+    let n = app.windows.windows.len();
+    let placements: Vec<Placement> = if app.windows.zoomed {
+        layout::zoomed(area, app.windows.focus)
+    } else {
+        match app.windows.layout {
+            LayoutMode::Filmstrip => layout::filmstrip(area, n, app.windows.scroll_x),
+            LayoutMode::Mosaic => layout::mosaic(area, n),
+        }
+    };
+
+    for placement in placements {
+        let idx = placement.index;
+        if idx >= app.windows.windows.len() {
+            continue;
+        }
+        let focused = idx == app.windows.focus;
+        // Clone the small per-window facts so the render fns can re-borrow `app`
+        // for the specific field each needs (PTY backend, deps cursor, list).
+        let id = app.windows.windows[idx].id;
+        let pinned = app.windows.windows[idx].pinned;
+        let kind = app.windows.windows[idx].kind.clone();
+        match kind {
+            WindowKind::Spine => render_spine(app, frame, placement.rect, focused),
+            WindowKind::Agent(issue) => {
+                render_agent_window(app, frame, placement.rect, id, &issue, focused, pinned)
+            }
+            WindowKind::Deps(DepsRoot::Issue) => {
+                render_deps_window(app, frame, placement.rect, idx, focused, pinned)
+            }
+            WindowKind::Deps(DepsRoot::Fleet) => {
+                render_fleet_window(app, frame, placement.rect, focused, pinned)
+            }
+        }
     }
 }
 
-/// The left pane's tab strip — ISSUES | AGENTS, the active tab lit, each with its
-/// count — so the agents roster is a discoverable flip of the navigation spine
-/// rather than a hidden mode.
+/// The focused window's border = a steady violet double frame; an unfocused one
+/// = a thin frame in its status hue (a needs-you agent breathes).
+fn window_block(
+    title: Line<'static>,
+    focused: bool,
+    hue: Color,
+    breathe: bool,
+    frame: u64,
+) -> Block<'static> {
+    let (border_type, border_style) = if focused {
+        (BorderType::Double, theme::focus_border_style())
+    } else if breathe {
+        (BorderType::Plain, theme::needs_you_style(frame))
+    } else {
+        (BorderType::Plain, Style::new().fg(hue))
+    };
+    // The focused window gets a bright violet focus bar leading its title, so the
+    // focus is unmistakable even where a double border is subtle.
+    let mut title = title;
+    if focused {
+        title
+            .spans
+            .insert(0, Span::styled("▌", Style::new().fg(VIOLET_200)));
+    }
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        .border_style(border_style)
+        .title(title)
+}
+
+// ── Spine (issue list / agents roster) ─────────────────────────────────────
+
+/// The Spine's tab strip — ISSUES | AGENTS, the active tab lit with its count.
 fn left_tabs_title(app: &App) -> Line<'static> {
     let tab = |label: &str, count: usize, active: bool| {
         let style = if active {
@@ -266,13 +223,50 @@ fn left_tabs_title(app: &App) -> Line<'static> {
     ])
 }
 
-fn render_issue_list(app: &mut App, frame: &mut Frame, area: Rect) {
-    let active = app.focus == Pane::List;
-    let block = pane_block(left_tabs_title(app), active);
+fn render_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bool) {
+    let block = window_block(left_tabs_title(app), focused, BORDER, false, app.frame);
 
-    let items: Vec<ListItem> = app.order.iter().map(|k| issue_item(app, k)).collect();
+    match app.left_view {
+        LeftView::Issues => {
+            let items: Vec<ListItem> = app.order.iter().map(|k| issue_item(app, k)).collect();
+            let list = list_widget(items, block, focused);
+            frame.render_stateful_widget(list, area, &mut app.list_state);
+        }
+        LeftView::Agents => {
+            let agents = app.agent_order();
+            if agents.is_empty() {
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "  no agents running",
+                            Style::new().fg(MUTED).italic(),
+                        )),
+                        Line::from(Span::styled(
+                            "  Enter on an issue opens one",
+                            Style::new().fg(BORDER),
+                        )),
+                    ]),
+                    inner,
+                );
+                return;
+            }
+            // The roster highlight tracks the selection (the single source of
+            // truth), derived fresh — no second persistent selection to sync.
+            let selected = agents.iter().position(|k| *k == app.root);
+            let items: Vec<ListItem> = agents.iter().map(|k| issue_item(app, k)).collect();
+            let list = list_widget(items, block, focused);
+            let mut state = ListState::default();
+            state.select(selected);
+            frame.render_stateful_widget(list, area, &mut state);
+        }
+    }
+}
 
-    let list = List::new(items)
+fn list_widget<'a>(items: Vec<ListItem<'a>>, block: Block<'a>, active: bool) -> List<'a> {
+    List::new(items)
         .block(block)
         .highlight_symbol(if active { "▸ " } else { "  " })
         .highlight_spacing(HighlightSpacing::Always)
@@ -280,89 +274,150 @@ fn render_issue_list(app: &mut App, frame: &mut Frame, area: Rect) {
             theme::cursor_active()
         } else {
             theme::cursor_idle()
-        });
-    frame.render_stateful_widget(list, area, &mut app.list_state);
+        })
 }
 
-/// The agents roster — the left pane's "AGENTS" tab. Lists every issue with an
-/// agent, salience-sorted (needs-you → working → idle → terminal), each row the
-/// same whole-row-tinted [`issue_item`] the issue list uses. The cursor tracks
-/// whichever agent the lens currently sits on, so the roster and the chat wall
-/// move together. With nothing running it teaches the open flow rather than
-/// showing a blank pane.
-fn render_agent_roster(app: &mut App, frame: &mut Frame, area: Rect) {
-    let active = app.focus == Pane::List;
-    let block = pane_block(left_tabs_title(app), active);
+// ── Agent windows (live PTY screens) ────────────────────────────────────────
 
-    let agents = app.agent_order();
-    if agents.is_empty() {
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+#[allow(clippy::too_many_arguments)]
+fn render_agent_window(
+    app: &mut App,
+    frame: &mut Frame,
+    rect: Rect,
+    id: WindowId,
+    issue: &str,
+    focused: bool,
+    pinned: bool,
+) {
+    if rect.area() == 0 {
+        return;
+    }
+    let status = app.fleet.get(issue).copied();
+    let backend = app.backends.get(issue).map(Arc::clone);
+    let exited = backend
+        .as_ref()
+        .is_some_and(|b| matches!(b.status(), Lifecycle::Exited(_)));
+    let (hue, label) = theme::window_status_hue(status, exited);
+    let breathe = !focused && status == Some(AgentStatus::NeedsYou);
+
+    let (mark, mstyle) = match status {
+        Some(s) => theme::agent_marker(s, app.frame),
+        None => ("○", Style::new().fg(hue)),
+    };
+    let key = app.graph.get(issue).map_or(issue, |i| i.key.as_str());
+    let mut title = vec![
+        Span::raw(" "),
+        Span::styled(mark, mstyle),
+        Span::styled(format!(" {label}  "), Style::new().fg(hue).bold()),
+        Span::styled(format!("{key} "), Style::new().fg(INK).bold()),
+    ];
+    if pinned {
+        title.push(Span::styled("⊙ pin ", Style::new().fg(ORANGE_400)));
+    }
+    let block = window_block(Line::from(title), focused, hue, breathe, app.frame);
+    let pane = block.inner(rect);
+    frame.render_widget(block, rect);
+    if pane.area() == 0 {
+        return;
+    }
+
+    // No backend yet (a just-pressed button, or a docked window awaiting its
+    // auto-resume): a calm card, never a parser/resize. The render is otherwise a
+    // pure function of state, so it must not synthesise a PTY here.
+    let Some(backend) = backend else {
+        let msg = if status.is_some() {
+            format!("  ◌ resuming {key}…")
+        } else {
+            format!("  ◌ starting agent on {key}…")
+        };
         frame.render_widget(
             Paragraph::new(vec![
                 Line::raw(""),
-                Line::from(Span::styled(
-                    "  no agents running",
-                    Style::new().fg(MUTED).italic(),
-                )),
-                Line::from(Span::styled(
-                    "  a on an issue opens one",
-                    Style::new().fg(BORDER),
-                )),
+                Line::from(Span::styled(msg, Style::new().fg(MUTED).italic())),
             ]),
-            inner,
+            pane,
+        );
+        return;
+    };
+
+    // Too small for a real preview — collapse to a one-line summary.
+    if pane.height < 2 || pane.width < MIN_PTY_W {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {key} · {label}"),
+                Style::new().fg(MUTED),
+            ))),
+            pane,
         );
         return;
     }
 
-    // The roster highlight tracks `root` (the single source of truth), derived
-    // fresh each frame — no second persistent selection to keep in sync.
-    let selected = agents.iter().position(|k| *k == app.root);
-    let items: Vec<ListItem> = agents.iter().map(|k| issue_item(app, k)).collect();
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol(if active { "▸ " } else { "  " })
-        .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(if active {
-            theme::cursor_active()
-        } else {
-            theme::cursor_idle()
-        });
-    let mut state = ListState::default();
-    state.select(selected);
-    frame.render_stateful_widget(list, area, &mut state);
+    // Reflow a live agent to its window only on a real geometry change (so
+    // browsing/scrolling never churns SIGWINCHes). A dead agent keeps its frozen
+    // final screen. Keyed by WindowId so zoom's two geometries don't collide.
+    let size = (pane.height, pane.width);
+    if !exited && app.preview_size.get(&id) != Some(&size) {
+        let _ = backend.resize(pane.height, pane.width);
+        app.preview_size.insert(id, size);
+    }
+    if let Ok(parser) = backend.parser().read() {
+        frame.render_widget(PseudoTerminal::new(parser.screen()), pane);
+    }
 }
 
-fn render_focus_panes(app: &mut App, frame: &mut Frame, area: Rect) {
-    // Title of the right pane = the focused issue itself, with its agent marker
-    // when one's running so the deps view still shows agent state at a glance.
-    let title = match app.focused_issue() {
-        Some(i) => {
-            let mut spans = vec![
-                Span::styled(" ◆ ", Style::new().fg(GREEN_500)),
-                Span::styled(format!("{}  ", i.key), Style::new().fg(INK).bold()),
-                Span::styled(truncate(&i.title, MAX_TITLE), Style::new().fg(MUTED)),
-                Span::raw(" "),
-            ];
-            if let Some(status) = app.fleet.get(&i.key) {
-                let (mark, mstyle) = theme::agent_marker(*status, app.frame);
-                spans.push(Span::styled(mark, mstyle));
-                spans.push(Span::raw(" "));
-            }
-            Line::from(spans)
-        }
-        None => Line::from(" no issue "),
-    };
-    let active = matches!(app.focus, Pane::Upstream | Pane::Downstream);
-    let block = pane_block(title, active);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+// ── Deps windows (per-issue dependency tree) ────────────────────────────────
 
-    let up_n = app.graph.direct_count(&app.root, Direction::Upstream);
-    let up_t = app.graph.transitive(&app.root, Direction::Upstream);
-    let down_n = app.graph.direct_count(&app.root, Direction::Downstream);
-    let down_t = app.graph.transitive(&app.root, Direction::Downstream);
+fn render_deps_window(
+    app: &mut App,
+    frame: &mut Frame,
+    rect: Rect,
+    idx: usize,
+    focused: bool,
+    pinned: bool,
+) {
+    if rect.area() == 0 {
+        return;
+    }
+    // The deps root drives the title; clone what we need so the cursor's
+    // ListStates can be borrowed mutably for the stateful tree render.
+    let root = app.windows.windows[idx]
+        .deps
+        .as_ref()
+        .map(|c| c.root.clone())
+        .unwrap_or_default();
+    let status = app.fleet.get(&root).copied();
+    let breathe = !focused && status == Some(AgentStatus::NeedsYou);
+
+    let mut title = vec![
+        Span::styled(" ◆ ", Style::new().fg(GREEN_500)),
+        Span::styled(format!("{root}  "), Style::new().fg(INK).bold()),
+    ];
+    if let Some(issue) = app.graph.get(&root) {
+        title.push(Span::styled(
+            truncate(&issue.title, MAX_TITLE.saturating_sub(12)),
+            Style::new().fg(MUTED),
+        ));
+        title.push(Span::raw(" "));
+    }
+    if let Some(s) = status {
+        let (mark, mstyle) = theme::agent_marker(s, app.frame);
+        title.push(Span::styled(mark, mstyle));
+        title.push(Span::raw(" "));
+    }
+    if pinned {
+        title.push(Span::styled("⊙ pin ", Style::new().fg(ORANGE_400)));
+    }
+    let block = window_block(Line::from(title), focused, GREEN_500, breathe, app.frame);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.area() == 0 {
+        return;
+    }
+
+    let up_n = app.graph.direct_count(&root, Direction::Upstream);
+    let up_t = app.graph.transitive(&root, Direction::Upstream);
+    let down_n = app.graph.direct_count(&root, Direction::Downstream);
+    let down_t = app.graph.transitive(&root, Direction::Downstream);
 
     let [up_head, up_body, down_head, down_body] = Layout::vertical([
         Constraint::Length(1),
@@ -376,30 +431,39 @@ fn render_focus_panes(app: &mut App, frame: &mut Frame, area: Rect) {
         section_header("▲ UPSTREAM", "must finish first", up_n, up_t),
         up_head,
     );
-    render_tree(app, frame, up_body, Direction::Upstream);
-
+    render_tree(app, frame, up_body, idx, Direction::Upstream, focused);
     frame.render_widget(
         section_header("▼ DOWNSTREAM", "this unblocks", down_n, down_t),
         down_head,
     );
-    render_tree(app, frame, down_body, Direction::Downstream);
+    render_tree(app, frame, down_body, idx, Direction::Downstream, focused);
 }
 
-fn section_header(label: &str, sub: &str, direct: usize, total: usize) -> Paragraph<'static> {
-    Paragraph::new(Line::from(vec![
-        Span::styled(format!("{label} "), Style::new().fg(GREEN_400).bold()),
-        Span::styled(format!("· {sub} "), Style::new().fg(MUTED)),
-        Span::styled(
-            format!("({direct} direct · {total} total)"),
-            Style::new().fg(BORDER),
-        ),
-    ]))
-}
-
-fn render_tree(app: &mut App, frame: &mut Frame, area: Rect, dir: Direction) {
-    let (rows, active) = match dir {
-        Direction::Upstream => (&app.up_rows, app.focus == Pane::Upstream),
-        Direction::Downstream => (&app.down_rows, app.focus == Pane::Downstream),
+fn render_tree(
+    app: &mut App,
+    frame: &mut Frame,
+    area: Rect,
+    idx: usize,
+    dir: Direction,
+    focused: bool,
+) {
+    // The active tree is highlighted only when this window is focused *and* it's
+    // the side the cursor is on.
+    let (rows, active, state): (&[TreeRow], bool, &mut ListState) = {
+        let cursor = match app.windows.windows[idx].deps.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+        match dir {
+            Direction::Upstream => {
+                let active = focused && cursor.side == DepsSide::Up;
+                (&cursor.up_rows, active, &mut cursor.up_state)
+            }
+            Direction::Downstream => {
+                let active = focused && cursor.side == DepsSide::Down;
+                (&cursor.down_rows, active, &mut cursor.down_state)
+            }
+        }
     };
 
     if rows.is_empty() {
@@ -421,7 +485,6 @@ fn render_tree(app: &mut App, frame: &mut Frame, area: Rect, dir: Direction) {
         .iter()
         .map(|r| ListItem::new(tree_line(&app.graph, r, dir)))
         .collect();
-
     let list = List::new(items)
         .highlight_symbol(if active { "▸ " } else { "  " })
         .highlight_spacing(HighlightSpacing::Always)
@@ -430,340 +493,39 @@ fn render_tree(app: &mut App, frame: &mut Frame, area: Rect, dir: Direction) {
         } else {
             theme::cursor_idle()
         });
-
-    let state = match dir {
-        Direction::Upstream => &mut app.up_state,
-        Direction::Downstream => &mut app.down_state,
-    };
     frame.render_stateful_widget(list, area, state);
 }
 
-// ── Chat wall (live agent screens, read-only) ────────────────────────────────
+// ── Fleet window (the layered overview map) ─────────────────────────────────
 
-/// The right pane in chat mode: a vertical stack of read-only `claude` screens —
-/// pinned chats first, then the current selection — each reflowed to its pane so
-/// you can watch several agents at once without a full-screen attach.
-fn render_chat_panes(app: &mut App, frame: &mut Frame, area: Rect) {
-    let panes = app.chat_panes();
-
-    let title = chat_wall_title(app);
-    let block = pane_block(title, true);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
+fn render_fleet_window(app: &mut App, frame: &mut Frame, rect: Rect, focused: bool, pinned: bool) {
+    if rect.area() == 0 {
+        return;
+    }
+    let mut title = vec![Span::styled(
+        " GRAPH OVERVIEW ",
+        Style::new().fg(GREEN_100).bold(),
+    )];
+    if pinned {
+        title.push(Span::styled("⊙ pin ", Style::new().fg(ORANGE_400)));
+    }
+    let block = window_block(Line::from(title), focused, GREEN_500, false, app.frame);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
     if inner.area() == 0 {
         return;
     }
 
-    // The composer, when open, claims the bottom line of the wall; the panes
-    // share what's left. Anchoring it here keeps it put under any split.
-    let (panes_area, composer) = match app.compose {
-        Some(_) if inner.height >= 2 => {
-            let [panes_area, bar] =
-                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
-            (panes_area, Some(bar))
-        }
-        _ => (inner, None),
-    };
-
-    if panes.is_empty() {
-        // Empty state: nothing live to show here. Teach the open/pin flow.
-        let msg = match app.focused_issue() {
-            Some(i) => format!(
-                "  no agent on {} — a to open one · p to pin its chat",
-                i.key
-            ),
-            None => "  no agents running · select an issue and press a to open one".to_string(),
-        };
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::raw(""),
-                Line::from(Span::styled(msg, Style::new().fg(MUTED).italic())),
-                Line::raw(""),
-                Line::from(Span::styled(
-                    "  v returns to the dependency view",
-                    Style::new().fg(BORDER),
-                )),
-            ]),
-            panes_area,
-        );
-    } else {
-        // Clone the backend handles (and pinned-ness) out BEFORE the loop so no
-        // borrow of `app.backends` overlaps the `&mut app.preview_size` writes each
-        // pane makes. The Arc clones are cheap (a refcount bump).
-        let target = app.compose.as_ref().map(|c| c.target.clone());
-        let agents: Vec<(String, Arc<dyn AgentBackend>, bool)> = panes
-            .iter()
-            .filter_map(|k| {
-                app.backends
-                    .get(k)
-                    .map(|b| (k.clone(), Arc::clone(b), app.pinned.iter().any(|p| p == k)))
-            })
-            .collect();
-
-        for ((issue, backend, pinned), rect) in
-            agents
-                .into_iter()
-                .zip(chat_layout(panes_area, panes.len(), app.chat_split))
-        {
-            let is_target = target.as_deref() == Some(issue.as_str());
-            render_one_chat(
-                app,
-                frame,
-                rect,
-                &issue,
-                backend.as_ref(),
-                pinned,
-                is_target,
-            );
-        }
-    }
-
-    if let Some(bar) = composer {
-        render_composer(app, frame, bar);
-    }
-}
-
-/// The chat composer bar — a single highlighted line naming the agent your
-/// message reaches and echoing what you've typed, with a caret. Enter sends the
-/// line to that agent's PTY; Esc closes it. The lightweight alternative to a
-/// full-screen attach when you just need to nudge or answer one agent.
-fn render_composer(app: &App, frame: &mut Frame, area: Rect) {
-    let Some(compose) = &app.compose else {
-        return;
-    };
-    let chip = Style::new().fg(GREEN_100).bg(GREEN_700).bold();
-    let field = Style::new().fg(INK).bg(WELL);
-    let chip_text = format!(" ✎ {} ", compose.target);
-    let hint = "  ⏎ send · esc done";
-    // Window the buffer so the caret (its tail) stays on screen as the message
-    // grows past the bar — a plain left-aligned line would scroll exactly what
-    // you're typing off the right edge. Reserve the chip, the leading space, the
-    // caret cell and the hint; show the trailing slice that fits the rest.
-    let avail = (area.width as usize)
-        .saturating_sub(UnicodeWidthStr::width(chip_text.as_str()))
-        .saturating_sub(UnicodeWidthStr::width(hint))
-        .saturating_sub(2) // leading space + caret cell
-        .max(1);
-    let shown = tail_fit(&compose.buffer, avail);
-    let line = Line::from(vec![
-        Span::styled(chip_text, chip),
-        Span::styled(" ", field),
-        Span::styled(shown, field),
-        Span::styled("▏", Style::new().fg(GREEN_400).bg(WELL)),
-        Span::styled(hint, Style::new().fg(MUTED).bg(WELL)),
-    ]);
-    frame.render_widget(Paragraph::new(line).style(Style::new().bg(WELL)), area);
-}
-
-/// The chat wall's outer title: the focused issue, a CHAT badge, and the current
-/// split mode (so the `chat-layout` key's effect is labelled, not guessed).
-fn chat_wall_title(app: &App) -> Line<'static> {
-    let mut spans = match app.focused_issue() {
-        Some(i) => vec![
-            Span::styled(" ◆ ", Style::new().fg(GREEN_500)),
-            Span::styled(format!("{}  ", i.key), Style::new().fg(INK).bold()),
-            Span::styled(
-                truncate(&i.title, MAX_TITLE.saturating_sub(16)),
-                Style::new().fg(MUTED),
-            ),
-        ],
-        None => Vec::new(),
-    };
-    spans.push(Span::styled(" CHAT ", Style::new().fg(ORANGE_400).bold()));
-    spans.push(Span::styled(
-        format!("· {} ", app.chat_split.label()),
-        Style::new().fg(MUTED),
-    ));
-    Line::from(spans)
-}
-
-/// Render one agent's chat pane: a state-coloured frame, then its live (or
-/// frozen, if exited) PTY screen. Resizes the agent to the pane only on a real
-/// geometry change, and never resizes a dead one.
-fn render_one_chat(
-    app: &mut App,
-    frame: &mut Frame,
-    rect: Rect,
-    issue: &str,
-    backend: &dyn AgentBackend,
-    pinned: bool,
-    is_target: bool,
-) {
-    if rect.area() == 0 {
-        return;
-    }
-    let status = app.fleet.get(issue).copied();
-    let exited = matches!(backend.status(), Lifecycle::Exited(_));
-    let (status_border, label) = chat_pane_chrome(status, exited);
-    // The composer's target pane is framed racing-green (the house "active
-    // affordance" colour), so it's unmistakable which agent your typing reaches.
-    let border = if is_target { GREEN_500 } else { status_border };
-    // `issue` is itself the graph key (the graph never shrinks), so no lookup.
-    let key = issue;
-
-    // The marker follows the fleet status — so a finished pane reads ✓/✗, not a
-    // stale spinner — falling back to a neutral dot only when status is unknown.
-    let (mark, mstyle) = match status {
-        Some(s) => theme::agent_marker(s, app.frame),
-        None => ("○", Style::new().fg(border)),
-    };
-    let mut title = vec![
-        Span::raw(" "),
-        Span::styled(mark, mstyle),
-        Span::styled(format!(" {label}  "), Style::new().fg(border).bold()),
-        Span::styled(format!("{key} "), Style::new().fg(INK).bold()),
-    ];
-    if pinned {
-        // A single-width pin marker — every glyph in this UI is one cell, so a
-        // wide emoji (which terminals size inconsistently) would skew the title.
-        title.push(Span::styled("⊙ pin ", Style::new().fg(ORANGE_400)));
-    }
-    if is_target {
-        title.push(Span::styled("✎ typing ", Style::new().fg(GREEN_400).bold()));
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(border))
-        .title(Line::from(title));
-    let pane = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    if pane.area() == 0 {
-        return;
-    }
-    // Too small for a real terminal preview — too few rows, or too narrow under a
-    // side/grid split — so collapse to a one-line summary rather than render a
-    // garbled screen.
-    if pane.height < 2 || pane.width < MIN_CHAT_PREVIEW_W {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {key} · {label}"),
-                Style::new().fg(MUTED),
-            ))),
-            pane,
-        );
-        return;
-    }
-
-    // Reflow a live agent to fit this pane (only when its geometry actually
-    // changed — so browsing doesn't churn SIGWINCHes). A dead agent keeps its
-    // frozen final screen untouched.
-    let size = (pane.height, pane.width);
-    if !exited && app.preview_size.get(issue) != Some(&size) {
-        let _ = backend.resize(pane.height, pane.width);
-        app.preview_size.insert(issue.to_string(), size);
-    }
-    if let Ok(parser) = backend.parser().read() {
-        frame.render_widget(PseudoTerminal::new(parser.screen()), pane);
-    }
-}
-
-/// Border colour + short label for a chat pane. The fleet status (the
-/// supervisor's verdict) drives it, so a finished agent reads DONE/FAILED/
-/// STOPPED rather than a transient amber EXITED. The bare amber EXITED is only
-/// the fallback for the sub-frame window where the PTY is gone but no terminal
-/// status has landed yet.
-fn chat_pane_chrome(status: Option<AgentStatus>, exited: bool) -> (Color, &'static str) {
-    match status {
-        Some(AgentStatus::Spawning) => (GREEN_400, "STARTING"),
-        Some(AgentStatus::Running) => (ORANGE_400, "WORKING"),
-        Some(AgentStatus::NeedsYou) => (AMBER_400, "NEEDS YOU"),
-        Some(AgentStatus::Idle) => (STATUS_400, "IDLE"),
-        Some(AgentStatus::Stopped) => (MUTED, "STOPPED"),
-        Some(AgentStatus::Done) => (STATUS_400, "DONE"),
-        Some(AgentStatus::Failed) => (RED_400, "FAILED"),
-        None if exited => (AMBER_400, "EXITED"),
-        None => (BORDER, "AGENT"),
-    }
-}
-
-/// Split `area` into `k` chat panes according to `split`:
-/// - [`ChatSplit::Stack`] — stacked rows (the original behaviour).
-/// - [`ChatSplit::Side`] — side-by-side columns.
-/// - [`ChatSplit::Grid`] — a near-square tiling, row-major.
-///
-/// Empty for `k == 0` or a zero-area `area`; a pane can come back zero-sized when
-/// `k` exceeds the cells available — callers guard on `rect.area()` before
-/// drawing.
-fn chat_layout(area: Rect, k: usize, split: ChatSplit) -> Vec<Rect> {
-    if k == 0 || area.area() == 0 {
-        return Vec::new();
-    }
-    match split {
-        ChatSplit::Stack => split_1d(area, k, true),
-        ChatSplit::Side => split_1d(area, k, false),
-        ChatSplit::Grid => split_grid(area, k),
-    }
-}
-
-/// Split `area` into `k` strips along one axis, giving the remainder to the first
-/// strips (so sizes differ by at most one). `vertical` stacks rows; otherwise it
-/// lays out columns.
-fn split_1d(area: Rect, k: usize, vertical: bool) -> Vec<Rect> {
-    let k = k as u16;
-    let total = if vertical { area.height } else { area.width };
-    let base = total / k;
-    let extra = total % k;
-    let mut rects = Vec::with_capacity(k as usize);
-    let mut pos = if vertical { area.y } else { area.x };
-    for i in 0..k {
-        let size = base + u16::from(i < extra);
-        rects.push(if vertical {
-            Rect::new(area.x, pos, area.width, size)
-        } else {
-            Rect::new(pos, area.y, size, area.height)
-        });
-        pos = pos.saturating_add(size);
-    }
-    rects
-}
-
-/// Tile `area` into `k` near-square cells, row-major: `ceil(√k)` columns and the
-/// rows needed to hold them. A short final row spreads its cells across the full
-/// width, so there's no ragged gap.
-fn split_grid(area: Rect, k: usize) -> Vec<Rect> {
-    // Smallest `c` with `c² ≥ k` — `ceil(√k)`, integer-only (no float casts).
-    let cols = (1..=k).find(|c| c * c >= k).unwrap_or(1);
-    let rows = k.div_ceil(cols);
-    let mut cells = Vec::with_capacity(k);
-    for (r, row_rect) in split_1d(area, rows, true).into_iter().enumerate() {
-        // The final row holds only the leftover panes.
-        let in_row = if r + 1 == rows { k - r * cols } else { cols };
-        for cell in split_1d(row_rect, in_row, false) {
-            cells.push(cell);
-            if cells.len() == k {
-                return cells;
-            }
-        }
-    }
-    cells
-}
-
-// ── Overview (layered, edge-free) ────────────────────────────────────────────
-
-fn render_overview(app: &App, frame: &mut Frame, area: Rect) {
     let g = &app.graph;
-    let block = pane_block(
+    let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            " GRAPH OVERVIEW ",
-            Style::new().fg(GREEN_100).bold(),
+            " flow: roots (no blockers) ───▶ leaves (block nothing)",
+            Style::new().fg(MUTED),
         )),
-        false,
-    );
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        " flow: roots (no blockers) ───▶ leaves (block nothing)",
-        Style::new().fg(MUTED),
-    )));
-    lines.push(Line::raw(""));
+        Line::raw(""),
+    ];
 
     let bands = g.levels();
-    // Lay every issue out, wrapping each level across as many rows as it needs
-    // (no "+N more" truncation) so the overview is a genuine full top-down map.
     let chips_per_row = ((inner.width.saturating_sub(6)) / 14).max(1) as usize;
     let mut root_line: Option<usize> = None;
     for (level, band) in bands.iter().enumerate() {
@@ -839,8 +601,7 @@ fn render_overview(app: &App, frame: &mut Frame, area: Rect) {
         }
     }
 
-    // Scroll to keep the highlighted root in view as you arrow through issues.
-    // Lines are pre-wrapped (one visual row each), so a plain line offset is exact.
+    // Scroll to keep the highlighted selection in view as you arrow the spine.
     let height = inner.height as usize;
     let offset = match root_line {
         Some(l) if lines.len() > height => {
@@ -856,11 +617,14 @@ fn render_overview(app: &App, frame: &mut Frame, area: Rect) {
 
 fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
     if let Some(msg) = &app.status_msg {
+        // A pending kill confirmation is the one destructive prompt, so flag it red.
+        let style = if app.kill_confirm.is_some() {
+            Style::new().fg(RED_400).bold()
+        } else {
+            Style::new().fg(AMBER_400)
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {msg}"),
-                Style::new().fg(AMBER_400),
-            ))),
+            Paragraph::new(Line::from(Span::styled(format!(" {msg}"), style))),
             area,
         );
         return;
@@ -904,20 +668,34 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Context-sensitive hint line, built live from the keymap so a rebind shows
+/// correctly. The prefix (`Ctrl-a`) leads the verbs; direct keys vary by the
+/// focused window's kind.
 fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
-    let text: String = if let Some(c) = &app.compose {
-        format!(
-            " ✎ message {} · ⏎ send · esc done · t attaches for full control",
-            c.target
-        )
-    } else if app.search_active {
+    let p = app.prefix_label();
+    let text: String = if app.search_active {
         " type to filter · ⏎ accept · esc clear".to_string()
-    } else if app.mode == Mode::Overview {
-        " ↑↓ move · a open · t attach · x stop · n needs-you · r agents · g lens · f filter · s sort · ? help · q quit".to_string()
-    } else if app.right_view == RightView::Chat {
-        " ↑↓ pick · i write · p pin · | layout · ]/[ next · t attach · x stop · v deps · r roster · n needs-you · ? help".to_string()
+    } else if app.kill_confirm.is_some() {
+        " y / ⏎ confirm kill · any other key cancels".to_string()
+    } else if app.prefix_armed {
+        format!(
+            " {p} armed: ←→ focus · z zoom · p pin · w close · x kill · | layout · q quit · ? help · {p} again → agent"
+        )
     } else {
-        " ↑↓ move · ←→/tab pane · a open · t attach · v chat · r roster · p pin · n needs-you · b back · / find · g graph · ? help · q quit".to_string()
+        match app.windows.focused_kind() {
+            WindowKind::Agent(_) => {
+                format!(" keys → agent · {p} to escape · {p} ←→ focus · {p} w close · {p} x kill")
+            }
+            WindowKind::Deps(DepsRoot::Issue) => format!(
+                " ↑↓ move · ←→ side · ⏎ re-root · space collapse · b back · {p} ←→ focus · {p} w close · ? help"
+            ),
+            WindowKind::Deps(DepsRoot::Fleet) => {
+                format!(" the project map · {p} ←→ focus · {p} w close · ? help")
+            }
+            WindowKind::Spine => format!(
+                " ↑↓ move · ⏎ open agent · d deps · g map · r roster · n needs-you · / find · f filter · {p} q quit · ? help"
+            ),
+        }
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(text, Style::new().fg(MUTED))))
@@ -927,63 +705,92 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_help(app: &App, frame: &mut Frame) {
-    use crate::keymap::Action::*;
+    let direct = |action| app.keymap.label_for(action);
+    let verb = |action| app.keymap.verb_label(action);
 
-    let k = |action| app.keymap.label_for(action);
-    // Key column built live from the active keymap, so a rebind shows correctly.
     let rows: Vec<(String, &str)> = vec![
+        ("— the spine —".to_string(), ""),
         (
-            format!("{} {}", k(MoveUp), k(MoveDown)),
-            "move within the active pane",
+            format!("{} {}", direct(Action::MoveUp), direct(Action::MoveDown)),
+            "move the selection",
         ),
         (
-            format!("{} {}", k(FocusList), k(CyclePane)),
-            "switch pane (list ↔ up ↔ down)",
-        ),
-        (k(CycleFocus), "cycle focus through the three panes"),
-        (k(Enter), "focus list → trees; on a node, re-root the lens"),
-        ("— agents —".to_string(), ""),
-        (
-            k(LaunchAgent),
-            "open an agent on the issue (resumes if it ran before)",
+            direct(Action::Enter),
+            "open / focus an agent on the selection",
         ),
         (
-            format!("{} / {}", k(Attach), k(Detach)),
-            "attach to its terminal / detach (while attached)",
-        ),
-        (k(CancelAgent), "stop the agent on the focused issue"),
-        (k(ToggleChat), "right pane: dependencies ↔ live chats"),
-        (k(ToggleRoster), "left pane: issue list ↔ agents roster"),
-        (k(TogglePin), "pin / unpin this issue's chat to the wall"),
-        (
-            format!("{} / {}", k(CycleChat), k(CycleChatBack)),
-            "switch to the next / previous agent's chat",
+            direct(Action::OpenDeps),
+            "open a dependency window for the selection",
         ),
         (
-            k(ComposeChat),
-            "message the selected agent (no full attach)",
+            direct(Action::OpenFleet),
+            "open the project overview (Fleet) window",
         ),
-        (k(CycleChatLayout), "chat wall split: stack / side / grid"),
-        (k(JumpNeedsYou), "jump to the next agent that needs you"),
-        ("— graph —".to_string(), ""),
-        (k(Back), "back to the previously focused issue"),
-        (k(ToggleCollapse), "collapse / expand the selected subtree"),
-        (k(StartSearch), "fuzzy-find issues by id or title"),
-        (k(CycleFilter), "cycle filter: all / blocked / has-deps"),
         (
-            k(CycleSort),
-            "cycle sort: ready / blocked / status / priority / id",
+            direct(Action::ToggleRoster),
+            "flip the spine: issues ↔ agents roster",
         ),
-        (k(JumpCycle), "jump through issues that sit on a cycle"),
-        (k(ToggleGraph), "toggle the layered graph overview"),
         (
-            format!("{} / Esc", k(Quit)),
-            "quit (esc first closes overlays)",
+            direct(Action::StartSearch),
+            "fuzzy-find issues by id or title",
         ),
+        (
+            format!(
+                "{} {}",
+                direct(Action::CycleFilter),
+                direct(Action::CycleSort)
+            ),
+            "cycle the filter / sort",
+        ),
+        (
+            direct(Action::JumpNeedsYou),
+            "jump to the next agent that needs you",
+        ),
+        (direct(Action::JumpCycle), "jump through issues on a cycle"),
+        ("— a dependency window —".to_string(), ""),
+        (
+            direct(Action::SwitchSide),
+            "switch the active tree (up ↔ down)",
+        ),
+        (
+            direct(Action::Enter),
+            "re-root the lens onto the selected node",
+        ),
+        (
+            direct(Action::ToggleCollapse),
+            "collapse / expand the subtree",
+        ),
+        (direct(Action::Back), "back to the previous root"),
+        (format!("— windows ({} prefix) —", app.prefix_label()), ""),
+        (
+            format!("{} {}", verb(Action::FocusLeft), verb(Action::FocusRight)),
+            "focus the window left / right",
+        ),
+        (
+            verb(Action::AttachOrSpawn),
+            "open / focus an agent (from any window)",
+        ),
+        (
+            verb(Action::ZoomToggle),
+            "zoom the focused window (non-destructive)",
+        ),
+        (
+            verb(Action::PinWindow),
+            "pin / unpin the focused window (persists)",
+        ),
+        (
+            verb(Action::CloseWindow),
+            "close = undock (an agent keeps running)",
+        ),
+        (
+            verb(Action::KillWindow),
+            "kill the focused agent (confirmed)",
+        ),
+        (verb(Action::LayoutToggle), "toggle filmstrip ⇄ mosaic"),
+        (verb(Action::Quit), "quit the cockpit"),
     ];
 
-    // Size the overlay to its content (clamped to the screen by centered_rect).
-    let area = centered_rect(74, rows.len() as u16 + 7, frame.area());
+    let area = centered_rect(78, rows.len() as u16 + 7, frame.area());
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
@@ -992,21 +799,20 @@ fn render_help(app: &App, frame: &mut Frame) {
     ];
     for (key, desc) in &rows {
         if desc.is_empty() {
-            // A section divider (empty description) — a quiet group label.
             lines.push(Line::from(Span::styled(
                 format!("  {key}"),
                 Style::new().fg(MUTED),
             )));
         } else {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<16}"), Style::new().fg(GREEN_400).bold()),
+                Span::styled(format!("  {key:<18}"), Style::new().fg(GREEN_400).bold()),
                 Span::styled(*desc, Style::new().fg(INK)),
             ]));
         }
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  rebind any of these in ~/.config/lindep/config.toml  [keys]",
+        "  rebind any of these in ~/.config/lindep/config.toml  [keys] / [verbs]",
         Style::new().fg(MUTED),
     )));
 
@@ -1022,10 +828,8 @@ fn render_help(app: &App, frame: &mut Frame) {
 
 // ── Line builders ─────────────────────────────────────────────────────────
 
-/// One issue row for the left list: a leading agent gutter bar · status ·
-/// priority · KEY · title (· blocked · cycle · animated agent marker). The
-/// gutter and marker make "this issue has an agent, in this state" scannable
-/// from the left edge; `flash` briefly pops the KEY on a launch/finish.
+/// One issue row for the spine list / roster: gutter · status · priority · KEY ·
+/// title (· blocked · cycle · animated agent marker).
 fn issue_line<'a>(
     graph: &Graph,
     key: &str,
@@ -1039,21 +843,15 @@ fn issue_line<'a>(
     let (glyph, color) = theme::status_glyph(issue.status);
     let (pmark, pcolor) = theme::priority_marker(issue.priority);
 
-    // Leading gutter: a state-coloured bar marks an issue that has an agent as a
-    // scannable left column; a blank keeps the column aligned otherwise. It sits
-    // outside the row's selection highlight, so a selected row still reads green.
     let gutter = match agent {
         Some(status) => Span::styled("▎", Style::new().fg(theme::agent_glyph(status).1)),
         None => Span::raw(" "),
     };
-
-    // The KEY span pops for a few frames on a launch/finish flash.
     let key_style = match flash {
         Some(Flash::Launched) => Style::new().fg(INK).bg(GREEN_700).bold(),
         Some(Flash::Finished) => Style::new().fg(GREEN_100).bg(STATUS_600).bold(),
         None => Style::new().fg(INK).bold(),
     };
-
     let mut spans = vec![
         gutter,
         Span::styled(format!("{glyph} "), Style::new().fg(color)),
@@ -1075,13 +873,8 @@ fn issue_line<'a>(
     Line::from(spans)
 }
 
-/// One issue row as a list item, carrying the whole-row status tint. The tint
-/// lives on the *item* style (not the inner [`Line`]) deliberately: ratatui
-/// paints the item style across the full row — including the highlight-symbol
-/// gutter — whereas a `Line` background only covers the content, leaving a 2-cell
-/// notch. So the colour signal really spans the *entire* row, not just an edge.
-/// The active-pane selection still wins (its `cursor_active` background patches
-/// over this one on the focused row). Shared by the issue list and the roster.
+/// One issue row as a list item, carrying the whole-row status tint on the
+/// *item* style (so it spans the full row including the highlight gutter).
 fn issue_item<'a>(app: &App, key: &str) -> ListItem<'a> {
     let flash = app
         .flash
@@ -1167,6 +960,17 @@ fn tree_line<'a>(graph: &Graph, row: &TreeRow, dir: Direction) -> Line<'a> {
 
 // ── Small helpers ─────────────────────────────────────────────────────────
 
+fn section_header(label: &str, sub: &str, direct: usize, total: usize) -> Paragraph<'static> {
+    Paragraph::new(Line::from(vec![
+        Span::styled(format!("{label} "), Style::new().fg(GREEN_400).bold()),
+        Span::styled(format!("· {sub} "), Style::new().fg(MUTED)),
+        Span::styled(
+            format!("({direct} direct · {total} total)"),
+            Style::new().fg(BORDER),
+        ),
+    ]))
+}
+
 fn status_for(graph: &Graph, key: &str) -> (&'static str, ratatui::style::Color) {
     match graph.get(key) {
         Some(i) => theme::status_glyph(i.status),
@@ -1187,16 +991,9 @@ fn status_label(status: Status) -> &'static str {
     }
 }
 
-fn pane_block(title: Line<'static>, active: bool) -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(if active { GREEN_500 } else { BORDER }))
-        .title(title)
-}
-
 /// Truncate to a display-*width* budget (cells), not a char count, so wide
-/// (CJK / emoji) characters don't overflow the column. Reserves one cell for
-/// the ellipsis.
+/// (CJK / emoji) characters don't overflow the column. Reserves one cell for the
+/// ellipsis.
 fn truncate(s: &str, max: usize) -> String {
     if UnicodeWidthStr::width(s) <= max {
         return s.to_string();
@@ -1216,30 +1013,6 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// The trailing slice of `s` that fits in `max` display *columns*, prefixed with
-/// '…' when it had to drop the head — the mirror of [`truncate`], which keeps the
-/// head. Used by the composer so a growing line keeps its caret (the tail) on
-/// screen instead of scrolling it off the right edge.
-fn tail_fit(s: &str, max: usize) -> String {
-    if UnicodeWidthStr::width(s) <= max {
-        return s.to_string();
-    }
-    let budget = max.saturating_sub(1); // reserve a column for the ellipsis
-    let mut w = 0;
-    let mut tail = String::new();
-    for c in s.chars().rev() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-        if w + cw > budget {
-            break;
-        }
-        w += cw;
-        tail.push(c);
-    }
-    let mut out = String::from("…");
-    out.extend(tail.chars().rev());
-    out
-}
-
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
@@ -1250,16 +1023,15 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    // Rendering is exercised end-to-end by the snapshot tests in `main.rs`
+    // (`render_snapshot`), which drive `draw` against a `TestBackend` at many
+    // sizes. The pure geometry helpers live in `crate::layout` with their own
+    // unit tests.
     use super::*;
 
     #[test]
-    fn tail_fit_keeps_the_tail_visible_with_a_leading_ellipsis() {
-        // Fits whole → unchanged (no ellipsis).
-        assert_eq!(tail_fit("hello", 10), "hello");
-        // Overflows → keep the END (where the caret sits), drop the head.
-        assert_eq!(tail_fit("abcdefghij", 4), "…hij");
-        // Degenerate widths never panic and still show the caret context.
-        assert_eq!(tail_fit("abcdef", 1), "…");
-        assert_eq!(tail_fit("", 5), "");
+    fn truncate_respects_a_width_budget() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 5), "hell…");
     }
 }

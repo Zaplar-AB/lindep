@@ -1,16 +1,25 @@
 //! Remappable key bindings for the cockpit.
 //!
-//! Every cockpit action has a default key but can be rebound in a `[keys]` table
-//! in `config.toml`, read from two places (later wins, so personal overrides a
-//! repo's): `<repo>/.lindep/config.toml` then `~/.config/lindep/config.toml` —
-//! mirroring how `.env` is loaded.
+//! Cockpit v3 has **one input rule**: the focused window gets your keys, and the
+//! **prefix** (`Ctrl-a` by default) is the sole escape to window-manager
+//! commands — identical whether an Agent, Deps or the Spine has focus. So there
+//! are two binding tables:
+//!
+//! * **`[keys]`** — *direct* keys, consulted only when a non-Agent window
+//!   (Spine / Deps) is focused: movement, search, the roster toggle, re-root,
+//!   collapse. An Agent window forwards every direct key to its PTY.
+//! * **`[verbs]`** — *prefix* keys, reached as `<prefix> <key>` from any focus:
+//!   focus-move, zoom, pin, close, kill, layout, the attach/spawn button, quit,
+//!   search, help, roster.
 //!
 //! ```toml
+//! prefix = "ctrl-a"        # the escape chord (pressed twice → literal Ctrl-A)
+//!
 //! [keys]
-//! detach = "f10"          # the one that varies by keyboard/terminal
-//! # detach = "ctrl-a d"   # …or a tmux-style leader sequence (detach only)
-//! launch-agent = "a"
-//! jump-needs-you = ["n", "ctrl-n"]   # an action may have several keys
+//! jump-needs-you = ["n", "ctrl-n"]   # a direct action may take several keys
+//!
+//! [verbs]
+//! kill = "k"               # rebind the prefixed kill verb Ctrl-a k
 //! ```
 //!
 //! Accepted key syntax: `a`, `/`, `?` (single chars); `f1`..`f12`; the named keys
@@ -18,12 +27,6 @@
 //! `end` `pageup` `pagedown` `delete` `insert`; and `ctrl-`/`alt-` prefixes
 //! (`ctrl-<letter>` is the only reliable control combo — see the crossterm note
 //! on [`parse_binding`]). `esc` is reserved (a fixed, context-sensitive key).
-//!
-//! A value with a space (e.g. `"ctrl-a d"`) is a **leader sequence**: press the
-//! leader, then the next key. Only `detach` may be a sequence — a reserved-key
-//! gesture is needed solely while attached, where the agent wants every single
-//! key; the dashboard has plenty of free single keys. Pressing the leader twice
-//! while attached sends it through to the agent, so the leader is never lost.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,80 +34,107 @@ use std::path::{Path, PathBuf};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
-/// A remappable cockpit action. `Esc` and the search/help overlays are fixed and
-/// deliberately absent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A remappable cockpit action. `Esc` is fixed and deliberately absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
-    Quit,
+    // ── Direct keys (Spine / Deps focus) ──────────────────────────────────
     MoveUp,
     MoveDown,
-    FocusList,
-    CyclePane,
-    CycleFocus,
+    /// In a Deps window, flip the active tree (upstream ↔ downstream).
+    SwitchSide,
+    /// Spine: the attach/spawn button. Deps: re-root onto the selected node.
     Enter,
+    /// Deps: collapse / expand the selected subtree. Spine: also the button.
     ToggleCollapse,
+    /// Deps: pop the re-root history.
     Back,
+    /// Spine: open (or re-root) a per-issue dependency window for the selection.
+    OpenDeps,
+    /// Spine: open (or focus) the project-wide Fleet overview window.
+    OpenFleet,
+    /// Spine: jump through issues that sit on a dependency cycle.
     JumpCycle,
+    /// Jump to the next agent that needs you.
     JumpNeedsYou,
-    LaunchAgent,
-    CancelAgent,
-    Attach,
-    Detach,
-    ToggleChat,
-    TogglePin,
-    CycleChat,
-    CycleChatBack,
-    /// Open the chat composer — message the selected/pinned agent without the
-    /// full-screen attach takeover.
-    ComposeChat,
-    /// Flip the left pane between the issue list and the agents roster.
+    /// Flip the Spine between the issue list and the agents roster.
     ToggleRoster,
-    /// Cycle the chat wall's split: stacked rows → side-by-side columns → grid.
-    CycleChatLayout,
+    /// Spine: cycle the issue filter.
     CycleFilter,
+    /// Spine: cycle the issue sort.
     CycleSort,
-    ToggleGraph,
+    /// Fuzzy-find issues (Spine list).
     StartSearch,
     ToggleHelp,
+
+    // ── Prefix verbs (any focus, behind the prefix) ───────────────────────
+    FocusLeft,
+    FocusRight,
+    /// Non-destructive zoom of the focused window to fill the strip.
+    ZoomToggle,
+    /// Pin / unpin the focused window (persistence).
+    PinWindow,
+    /// Close = undock the focused window (an agent keeps running).
+    CloseWindow,
+    /// Kill the focused agent (confirmed) — separate from close.
+    KillWindow,
+    /// Toggle filmstrip ⇄ mosaic.
+    LayoutToggle,
+    /// Open (or focus) an agent on the spine selection — the button, reachable
+    /// from any window via the prefix.
+    AttachOrSpawn,
+    Quit,
 }
 
-/// `(action, config name, default keys)`. The single source of truth for the
-/// default keymap, the accepted config names, and (for `Detach`) the label the
-/// attach pane shows.
-const DEFAULTS: &[(Action, &str, &[&str])] = &[
-    (Action::Quit, "quit", &["q"]),
+/// `(action, config name, default keys)` for the **direct** keys consulted when
+/// the Spine or a Deps window is focused.
+const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::MoveUp, "move-up", &["up", "k"]),
     (Action::MoveDown, "move-down", &["down", "j"]),
-    (Action::FocusList, "focus-list", &["left", "h"]),
-    (Action::CyclePane, "cycle-pane", &["right", "l"]),
-    (Action::CycleFocus, "cycle-focus", &["tab"]),
+    (
+        Action::SwitchSide,
+        "switch-side",
+        &["left", "h", "right", "l", "tab"],
+    ),
     (Action::Enter, "enter", &["enter"]),
     (Action::ToggleCollapse, "toggle-collapse", &["space"]),
     (Action::Back, "back", &["backspace", "b"]),
+    (Action::OpenDeps, "deps", &["d"]),
+    (Action::OpenFleet, "fleet", &["g"]),
     (Action::JumpCycle, "jump-cycle", &["c"]),
     (Action::JumpNeedsYou, "jump-needs-you", &["n"]),
-    (Action::LaunchAgent, "launch-agent", &["a"]),
-    (Action::CancelAgent, "stop-agent", &["x"]),
-    (Action::Attach, "attach", &["t"]),
-    (Action::Detach, "detach", &["f10"]),
-    (Action::ToggleChat, "chat", &["v"]),
-    (Action::TogglePin, "pin-chat", &["p"]),
-    (Action::CycleChat, "cycle-chat", &["]"]),
-    (Action::CycleChatBack, "cycle-chat-back", &["["]),
-    (Action::ComposeChat, "compose", &["i"]),
     (Action::ToggleRoster, "agents", &["r"]),
-    (Action::CycleChatLayout, "chat-layout", &["|"]),
     (Action::CycleFilter, "filter", &["f"]),
     (Action::CycleSort, "sort", &["s"]),
-    (Action::ToggleGraph, "graph", &["g"]),
     (Action::StartSearch, "search", &["/"]),
     (Action::ToggleHelp, "help", &["?"]),
 ];
 
+/// `(action, config name, default keys)` for the **prefix** verbs, reached as
+/// `<prefix> <key>` from any focus.
+const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
+    (Action::FocusLeft, "focus-left", &["left", "h"]),
+    (Action::FocusRight, "focus-right", &["right", "l"]),
+    (Action::ZoomToggle, "zoom", &["z"]),
+    (Action::PinWindow, "pin", &["p"]),
+    (Action::CloseWindow, "close", &["w"]),
+    (Action::KillWindow, "kill", &["x"]),
+    (Action::LayoutToggle, "layout", &["|"]),
+    (Action::AttachOrSpawn, "open", &["enter", "space"]),
+    (Action::Quit, "quit", &["q"]),
+    (Action::StartSearch, "search", &["/"]),
+    (Action::ToggleHelp, "help", &["?"]),
+    (Action::ToggleRoster, "roster", &["r"]),
+    (Action::JumpNeedsYou, "jump-needs-you", &["n"]),
+];
+
+/// The default prefix chord — tmux's `Ctrl-A`, which never collides with
+/// claude's line editing and works on every keyboard/terminal.
+const DEFAULT_PREFIX: &str = "ctrl-a";
+
 /// A normalized key chord: a [`KeyCode`] plus whether Ctrl/Alt were held. Shift
 /// is ignored — it's already reflected in the character a terminal delivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Binding {
+pub struct Binding {
     code: KeyCode,
     ctrl: bool,
     alt: bool,
@@ -117,6 +147,19 @@ impl Binding {
             ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
             alt: key.modifiers.contains(KeyModifiers::ALT),
         }
+    }
+
+    /// Reconstruct a [`KeyEvent`] from this chord — used to forward the literal
+    /// prefix to an agent's PTY on a double-tap (a `bool` alone loses the chord).
+    fn to_key_event(self) -> KeyEvent {
+        let mut mods = KeyModifiers::NONE;
+        if self.ctrl {
+            mods |= KeyModifiers::CONTROL;
+        }
+        if self.alt {
+            mods |= KeyModifiers::ALT;
+        }
+        KeyEvent::new(self.code, mods)
     }
 
     /// Human label, e.g. `F10`, `Ctrl-A`, `Space`, `↑`.
@@ -229,78 +272,79 @@ fn parse_binding(spec: &str) -> Result<Binding, String> {
     Ok(Binding { code, ctrl, alt })
 }
 
-/// Parse a binding string into its chord sequence: space-separated chords, e.g.
-/// `"ctrl-a d"` → a leader (`Ctrl-A`) then `d`. Most bindings are a single chord.
-fn parse_keys(spec: &str) -> Result<Vec<Binding>, String> {
-    let chords = spec
-        .split_whitespace()
-        .map(parse_binding)
-        .collect::<Result<Vec<_>, _>>()?;
-    if chords.is_empty() {
-        return Err(format!("empty key in '{spec}'"));
-    }
-    Ok(chords)
-}
-
-/// The active key → action mapping. Single-chord bindings live in `singles`;
-/// `detach` may *additionally* be a two-key leader sequence — the only action
-/// allowed one, because a reserved-key gesture is only needed while attached
-/// (where the agent wants every single key). See the module docs.
+/// The active key bindings: the prefix chord, the direct keys (Spine/Deps), and
+/// the prefix verbs.
 #[derive(Debug, Clone)]
 pub struct Keymap {
+    prefix: Binding,
     singles: HashMap<Binding, Action>,
-    detach_seqs: Vec<(Binding, Binding)>,
+    verbs: HashMap<Binding, Action>,
 }
 
 impl Default for Keymap {
     fn default() -> Self {
-        let mut singles = HashMap::new();
-        for (action, _name, keys) in DEFAULTS {
-            for key in *keys {
-                if let Ok(binding) = parse_binding(key) {
-                    singles.insert(binding, *action);
+        let load = |table: &[(Action, &str, &[&str])]| {
+            let mut map = HashMap::new();
+            for (action, _name, keys) in table {
+                for key in *keys {
+                    if let Ok(binding) = parse_binding(key) {
+                        map.insert(binding, *action);
+                    }
                 }
             }
-        }
+            map
+        };
         Keymap {
-            singles,
-            detach_seqs: Vec::new(),
+            prefix: parse_binding(DEFAULT_PREFIX).expect("the default prefix parses"),
+            singles: load(DIRECT_DEFAULTS),
+            verbs: load(VERB_DEFAULTS),
         }
     }
 }
 
 impl Keymap {
-    /// The action bound to a single key (dashboard keys + a single-key detach).
+    /// Whether `key` is the prefix chord (the escape to window-manager verbs).
+    pub fn is_prefix(&self, key: KeyEvent) -> bool {
+        Binding::of(key) == self.prefix
+    }
+
+    /// The prefix chord as a [`KeyEvent`], for forwarding the literal chord to an
+    /// agent's PTY on a double-tap.
+    pub fn prefix_event(&self) -> KeyEvent {
+        self.prefix.to_key_event()
+    }
+
+    /// Human label for the prefix, e.g. `Ctrl-A`.
+    pub fn prefix_label(&self) -> String {
+        self.prefix.label()
+    }
+
+    /// The direct action bound to a single key (Spine / Deps focus).
     pub fn action_for(&self, key: KeyEvent) -> Option<Action> {
         self.singles.get(&Binding::of(key)).copied()
     }
 
-    /// Whether `key` is the leader (first chord) of a detach sequence.
-    pub fn is_detach_leader(&self, key: KeyEvent) -> bool {
-        let chord = Binding::of(key);
-        self.detach_seqs.iter().any(|(leader, _)| *leader == chord)
+    /// The verb bound to `key` when reached behind the prefix.
+    pub fn verb_for(&self, key: KeyEvent) -> Option<Action> {
+        self.verbs.get(&Binding::of(key)).copied()
     }
 
-    /// Whether pressing `leader` then `key` completes a detach sequence.
-    pub fn detach_completes(&self, leader: KeyEvent, key: KeyEvent) -> bool {
-        let (l, k) = (Binding::of(leader), Binding::of(key));
-        self.detach_seqs.iter().any(|(a, b)| *a == l && *b == k)
-    }
-
-    /// Joined labels of every binding for `action`, for help and the attach
-    /// pane: e.g. `↑ / k`, or `F10 / Ctrl-A D` when detach has a key and a chord.
+    /// Joined labels of the direct keys bound to `action` (for help/hints):
+    /// e.g. `↑ / k`. `—` when unbound.
     pub fn label_for(&self, action: Action) -> String {
+        join_labels(&self.singles, action)
+    }
+
+    /// Joined labels of the verb keys bound to `action`, each shown with the
+    /// prefix — e.g. `Ctrl-A W`. `—` when unbound.
+    pub fn verb_label(&self, action: Action) -> String {
+        let prefix = self.prefix.label();
         let mut labels: Vec<String> = self
-            .singles
+            .verbs
             .iter()
             .filter(|(_, a)| **a == action)
-            .map(|(b, _)| b.label())
+            .map(|(b, _)| format!("{prefix} {}", b.label()))
             .collect();
-        if action == Action::Detach {
-            for (leader, completion) in &self.detach_seqs {
-                labels.push(format!("{} {}", leader.label(), completion.label()));
-            }
-        }
         labels.sort();
         if labels.is_empty() {
             "—".to_string()
@@ -309,44 +353,31 @@ impl Keymap {
         }
     }
 
-    /// Apply `[keys]` overrides. A named action's bindings are *replaced* by the
-    /// given one(s); a value with a space is a leader sequence (detach only).
-    /// Returns warnings for unknown actions, bad/reserved keys, misplaced
-    /// sequences and conflicts. On any bad entry for an action, that action keeps
-    /// its default.
-    pub fn apply(&mut self, overrides: &[(String, Vec<String>)]) -> Vec<String> {
+    /// Apply config overrides. Each named action's bindings in the chosen table
+    /// (`direct` = `[keys]`, else `[verbs]`) are *replaced* by the given keys.
+    /// Returns warnings for unknown actions, bad/reserved keys and conflicts; a
+    /// bad entry leaves that action at its default.
+    fn apply_table(
+        map: &mut HashMap<Binding, Action>,
+        defaults: &[(Action, &str, &[&str])],
+        overrides: &[(String, Vec<String>)],
+        table_label: &str,
+    ) -> Vec<String> {
         let mut warnings = Vec::new();
         for (name, keys) in overrides {
-            let Some(&(action, _, _)) = DEFAULTS.iter().find(|(_, n, _)| n == name) else {
-                warnings.push(format!("unknown action '{name}'"));
+            let Some(&(action, _, _)) = defaults.iter().find(|(_, n, _)| n == name) else {
+                warnings.push(format!("unknown {table_label} action '{name}'"));
                 continue;
             };
-
-            let mut new_singles = Vec::new();
-            let mut new_seqs = Vec::new();
+            let mut parsed = Vec::new();
             let mut ok = true;
             for spec in keys {
-                match parse_keys(spec) {
-                    Ok(chords) if chords.iter().any(|c| c.code == KeyCode::Esc) => {
+                match parse_binding(spec) {
+                    Ok(b) if b.code == KeyCode::Esc => {
                         warnings.push(format!("'{name}': esc is reserved"));
                         ok = false;
                     }
-                    Ok(chords) if chords.len() == 1 => new_singles.push(chords[0]),
-                    Ok(chords) if chords.len() == 2 && action == Action::Detach => {
-                        new_seqs.push((chords[0], chords[1]));
-                    }
-                    Ok(chords) if chords.len() == 2 => {
-                        warnings.push(format!(
-                            "'{name}': key sequences are only supported for 'detach'"
-                        ));
-                        ok = false;
-                    }
-                    Ok(_) => {
-                        warnings.push(format!(
-                            "'{name}': '{spec}' has too many keys (a key, or a leader + key)"
-                        ));
-                        ok = false;
-                    }
+                    Ok(b) => parsed.push(b),
                     Err(e) => {
                         warnings.push(format!("'{name}': {e}"));
                         ok = false;
@@ -356,51 +387,75 @@ impl Keymap {
             if !ok {
                 continue; // keep the default for this action
             }
-
-            // Replace this action's bindings, refusing to steal another action's.
-            self.singles.retain(|_, a| *a != action);
-            if action == Action::Detach {
-                self.detach_seqs.clear();
-            }
-            for chord in new_singles {
-                match self.singles.get(&chord) {
+            // Replace this action's bindings, refusing to steal another's.
+            map.retain(|_, a| *a != action);
+            for chord in parsed {
+                match map.get(&chord) {
                     Some(other) => warnings.push(format!(
                         "'{name}': {} is already bound to {other:?}; ignored",
                         chord.label()
                     )),
                     None => {
-                        self.singles.insert(chord, action);
+                        map.insert(chord, action);
                     }
                 }
-            }
-            // A sequence whose leader is *also* a detach single-key can never
-            // arm: `on_attached_key` resolves the single-key detach before it
-            // checks for a leader, so the leader detaches immediately and the
-            // completion is never awaited. Reject the dead sequence with a
-            // warning rather than storing a binding `label_for` would advertise
-            // but the input loop would never honour.
-            for (leader, completion) in new_seqs {
-                if self.singles.get(&leader) == Some(&action) {
-                    warnings.push(format!(
-                        "'{name}': {} is both a detach key and a leader; the sequence {} {} is unreachable; ignored",
-                        leader.label(),
-                        leader.label(),
-                        completion.label()
-                    ));
-                    continue;
-                }
-                self.detach_seqs.push((leader, completion));
             }
         }
         warnings
     }
+
+    /// Apply `[keys]` (direct) overrides.
+    pub fn apply(&mut self, overrides: &[(String, Vec<String>)]) -> Vec<String> {
+        Self::apply_table(&mut self.singles, DIRECT_DEFAULTS, overrides, "key")
+    }
+
+    /// Apply `[verbs]` (prefix) overrides.
+    pub fn apply_verbs(&mut self, overrides: &[(String, Vec<String>)]) -> Vec<String> {
+        Self::apply_table(&mut self.verbs, VERB_DEFAULTS, overrides, "verb")
+    }
+
+    /// Set the prefix chord from a config string, warning (and keeping the
+    /// default) on a bad or reserved value.
+    pub fn set_prefix(&mut self, spec: &str) -> Vec<String> {
+        match parse_binding(spec) {
+            Ok(b) if b.code == KeyCode::Esc => {
+                vec!["'prefix': esc is reserved".to_string()]
+            }
+            Ok(b) => {
+                self.prefix = b;
+                Vec::new()
+            }
+            Err(e) => vec![format!("'prefix': {e}")],
+        }
+    }
 }
 
-/// On-disk shape of `config.toml` (only the `[keys]` table matters here).
+/// Joined, sorted labels of every chord in `map` bound to `action`.
+fn join_labels(map: &HashMap<Binding, Action>, action: Action) -> String {
+    let mut labels: Vec<String> = map
+        .iter()
+        .filter(|(_, a)| **a == action)
+        .map(|(b, _)| b.label())
+        .collect();
+    labels.sort();
+    if labels.is_empty() {
+        "—".to_string()
+    } else {
+        labels.join(" / ")
+    }
+}
+
+/// On-disk shape of `config.toml`.
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
+    /// The prefix chord (`Ctrl-a` default).
+    prefix: Option<String>,
+    /// Direct keys (Spine / Deps focus).
     #[serde(default)]
     keys: HashMap<String, KeySpec>,
+    /// Prefix verbs (any focus).
+    #[serde(default)]
+    verbs: HashMap<String, KeySpec>,
 }
 
 /// A binding value: one key or several.
@@ -409,6 +464,15 @@ struct ConfigFile {
 enum KeySpec {
     One(String),
     Many(Vec<String>),
+}
+
+impl KeySpec {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            KeySpec::One(k) => vec![k],
+            KeySpec::Many(ks) => ks,
+        }
+    }
 }
 
 /// Load the keymap: defaults, then `<repo>/.lindep/config.toml`, then
@@ -437,18 +501,21 @@ pub fn load(repo_root: Option<&Path>) -> (Keymap, Vec<String>) {
         };
         match toml::from_str::<ConfigFile>(&text) {
             Ok(cfg) => {
-                let overrides: Vec<(String, Vec<String>)> = cfg
-                    .keys
-                    .into_iter()
-                    .map(|(name, spec)| {
-                        let keys = match spec {
-                            KeySpec::One(k) => vec![k],
-                            KeySpec::Many(ks) => ks,
-                        };
-                        (name, keys)
-                    })
-                    .collect();
-                for w in keymap.apply(&overrides) {
+                let collect = |table: HashMap<String, KeySpec>| -> Vec<(String, Vec<String>)> {
+                    table
+                        .into_iter()
+                        .map(|(name, spec)| (name, spec.into_vec()))
+                        .collect()
+                };
+                if let Some(prefix) = &cfg.prefix {
+                    for w in keymap.set_prefix(prefix) {
+                        warnings.push(format!("{}: {w}", path.display()));
+                    }
+                }
+                for w in keymap.apply(&collect(cfg.keys)) {
+                    warnings.push(format!("{}: {w}", path.display()));
+                }
+                for w in keymap.apply_verbs(&collect(cfg.verbs)) {
                     warnings.push(format!("{}: {w}", path.display()));
                 }
             }
@@ -467,17 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_the_historical_bindings() {
+    fn direct_movement_keeps_arrows_and_vi_letters() {
         let km = Keymap::default();
-        assert_eq!(
-            km.action_for(ev(KeyCode::Char('a'), KeyModifiers::NONE)),
-            Some(Action::LaunchAgent)
-        );
-        assert_eq!(
-            km.action_for(ev(KeyCode::F(10), KeyModifiers::NONE)),
-            Some(Action::Detach)
-        );
-        // Movement keeps both the arrow and the vi-style letter.
         assert_eq!(
             km.action_for(ev(KeyCode::Down, KeyModifiers::NONE)),
             Some(Action::MoveDown)
@@ -489,40 +547,55 @@ mod tests {
     }
 
     #[test]
-    fn the_new_chat_keys_bind_to_their_defaults() {
+    fn the_prefix_is_ctrl_a_by_default() {
+        let km = Keymap::default();
+        assert!(km.is_prefix(ev(KeyCode::Char('a'), KeyModifiers::CONTROL)));
+        assert!(!km.is_prefix(ev(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert_eq!(km.prefix_label(), "Ctrl-A");
+    }
+
+    #[test]
+    fn the_prefix_event_round_trips_to_its_chord() {
+        let km = Keymap::default();
+        let ev = km.prefix_event();
+        assert!(km.is_prefix(ev), "the reconstructed event is the prefix");
+        assert_eq!(ev.code, KeyCode::Char('a'));
+        assert!(ev.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn the_window_verbs_bind_behind_the_prefix() {
         let km = Keymap::default();
         assert_eq!(
-            km.action_for(ev(KeyCode::Char('v'), KeyModifiers::NONE)),
-            Some(Action::ToggleChat)
+            km.verb_for(ev(KeyCode::Char('w'), KeyModifiers::NONE)),
+            Some(Action::CloseWindow)
         );
         assert_eq!(
-            km.action_for(ev(KeyCode::Char('p'), KeyModifiers::NONE)),
-            Some(Action::TogglePin)
+            km.verb_for(ev(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(Action::KillWindow)
         );
         assert_eq!(
-            km.action_for(ev(KeyCode::Char(']'), KeyModifiers::NONE)),
-            Some(Action::CycleChat)
+            km.verb_for(ev(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(Action::Quit)
         );
         assert_eq!(
-            km.action_for(ev(KeyCode::Char('['), KeyModifiers::NONE)),
-            Some(Action::CycleChatBack)
+            km.verb_for(ev(KeyCode::Char('z'), KeyModifiers::NONE)),
+            Some(Action::ZoomToggle)
         );
     }
 
     #[test]
-    fn the_cockpit_v2_keys_bind_to_their_defaults() {
+    fn quit_is_a_prefix_verb_not_a_direct_key() {
+        // q alone no longer quits — it must go through the prefix (so a stray q
+        // on the spine, or to an agent, never tears the cockpit down).
         let km = Keymap::default();
         assert_eq!(
-            km.action_for(ev(KeyCode::Char('i'), KeyModifiers::NONE)),
-            Some(Action::ComposeChat)
+            km.action_for(ev(KeyCode::Char('q'), KeyModifiers::NONE)),
+            None
         );
         assert_eq!(
-            km.action_for(ev(KeyCode::Char('r'), KeyModifiers::NONE)),
-            Some(Action::ToggleRoster)
-        );
-        assert_eq!(
-            km.action_for(ev(KeyCode::Char('|'), KeyModifiers::NONE)),
-            Some(Action::CycleChatLayout)
+            km.verb_for(ev(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(Action::Quit)
         );
     }
 
@@ -540,16 +613,85 @@ mod tests {
     }
 
     #[test]
-    fn rebinding_detach_replaces_the_default() {
+    fn rebinding_a_direct_key_replaces_the_default() {
         let mut km = Keymap::default();
-        let warnings = km.apply(&[("detach".into(), vec!["f8".into()])]);
+        let warnings = km.apply(&[("search".into(), vec!["ctrl-f".into()])]);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(
-            km.action_for(ev(KeyCode::F(8), KeyModifiers::NONE)),
-            Some(Action::Detach)
+            km.action_for(ev(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            Some(Action::StartSearch)
         );
-        // The old F10 no longer detaches.
-        assert_eq!(km.action_for(ev(KeyCode::F(10), KeyModifiers::NONE)), None);
+        // The old `/` no longer starts a direct search.
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('/'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn rebinding_a_verb_replaces_the_default() {
+        let mut km = Keymap::default();
+        let warnings = km.apply_verbs(&[("kill".into(), vec!["k".into()])]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            km.verb_for(ev(KeyCode::Char('k'), KeyModifiers::NONE)),
+            Some(Action::KillWindow)
+        );
+        assert_eq!(
+            km.verb_for(ev(KeyCode::Char('x'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn rebinding_the_prefix_takes_effect() {
+        let mut km = Keymap::default();
+        let warnings = km.set_prefix("ctrl-b");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(km.is_prefix(ev(KeyCode::Char('b'), KeyModifiers::CONTROL)));
+        assert!(!km.is_prefix(ev(KeyCode::Char('a'), KeyModifiers::CONTROL)));
+        assert_eq!(km.prefix_label(), "Ctrl-B");
+    }
+
+    #[test]
+    fn esc_is_reserved_everywhere() {
+        let mut km = Keymap::default();
+        assert!(!km.set_prefix("esc").is_empty());
+        assert_eq!(km.apply(&[("search".into(), vec!["esc".into()])]).len(), 1);
+        assert_eq!(
+            km.apply_verbs(&[("kill".into(), vec!["esc".into()])]).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_conflicting_rebind_is_refused_with_a_warning() {
+        let mut km = Keymap::default();
+        // Bind filter to 'r', which the roster toggle already owns.
+        let w = km.apply(&[("filter".into(), vec!["r".into()])]);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("already bound"));
+        // 'r' still toggles the roster; filter lost its 's'… no — filter lost
+        // its own 'f' (replaced) but didn't steal 'r'.
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Some(Action::ToggleRoster)
+        );
+    }
+
+    #[test]
+    fn bad_config_warns_and_keeps_the_default() {
+        let mut km = Keymap::default();
+        let w = km.apply(&[
+            ("search".into(), vec!["nope-key".into()]),
+            ("bogus-action".into(), vec!["z".into()]),
+        ]);
+        assert_eq!(w.len(), 2, "{w:?}");
+        // search kept its default despite the bad key.
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('/'), KeyModifiers::NONE)),
+            Some(Action::StartSearch)
+        );
     }
 
     #[test]
@@ -567,119 +709,26 @@ mod tests {
     }
 
     #[test]
-    fn bad_config_warns_and_keeps_the_default() {
-        let mut km = Keymap::default();
-        let w = km.apply(&[
-            ("launch-agent".into(), vec!["nope-key".into()]),
-            ("bogus-action".into(), vec!["z".into()]),
-            ("detach".into(), vec!["esc".into()]),
-        ]);
-        assert_eq!(w.len(), 3, "{w:?}");
-        // launch-agent kept its default despite the bad key.
-        assert_eq!(
-            km.action_for(ev(KeyCode::Char('a'), KeyModifiers::NONE)),
-            Some(Action::LaunchAgent)
-        );
+    fn verb_label_shows_the_prefix() {
+        let km = Keymap::default();
+        assert_eq!(km.verb_label(Action::CloseWindow), "Ctrl-A W");
+        assert_eq!(km.verb_label(Action::Quit), "Ctrl-A Q");
     }
 
     #[test]
-    fn a_conflicting_rebind_is_refused_with_a_warning() {
-        let mut km = Keymap::default();
-        // Bind stop-agent to 'a', which launch-agent already owns.
-        let w = km.apply(&[("stop-agent".into(), vec!["a".into()])]);
-        assert_eq!(w.len(), 1);
-        assert!(w[0].contains("already bound"));
-        // 'a' still launches; stop-agent lost its 'x' (replaced) but didn't steal 'a'.
-        assert_eq!(
-            km.action_for(ev(KeyCode::Char('a'), KeyModifiers::NONE)),
-            Some(Action::LaunchAgent)
-        );
-    }
-
-    #[test]
-    fn detach_can_be_a_leader_sequence() {
-        let mut km = Keymap::default();
-        let w = km.apply(&[("detach".into(), vec!["ctrl-a d".into()])]);
-        assert!(w.is_empty(), "{w:?}");
-
-        let ctrl_a = ev(KeyCode::Char('a'), KeyModifiers::CONTROL);
-        let d = ev(KeyCode::Char('d'), KeyModifiers::NONE);
-        assert!(km.is_detach_leader(ctrl_a));
-        assert!(km.detach_completes(ctrl_a, d));
-        assert!(!km.detach_completes(ctrl_a, ev(KeyCode::Char('x'), KeyModifiers::NONE)));
-        // The old F10 single no longer detaches; the label shows the chord.
-        assert_eq!(km.action_for(ev(KeyCode::F(10), KeyModifiers::NONE)), None);
-        assert_eq!(km.label_for(Action::Detach), "Ctrl-A D");
-    }
-
-    #[test]
-    fn detach_can_have_both_a_single_key_and_a_sequence() {
-        let mut km = Keymap::default();
-        km.apply(&[("detach".into(), vec!["f8".into(), "ctrl-a d".into()])]);
-        assert_eq!(
-            km.action_for(ev(KeyCode::F(8), KeyModifiers::NONE)),
-            Some(Action::Detach)
-        );
-        assert!(km.detach_completes(
-            ev(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            ev(KeyCode::Char('d'), KeyModifiers::NONE)
-        ));
-    }
-
-    #[test]
-    fn sequences_are_rejected_for_non_detach_actions() {
-        let mut km = Keymap::default();
-        let w = km.apply(&[("launch-agent".into(), vec!["g a".into()])]);
-        assert_eq!(w.len(), 1);
-        assert!(w[0].contains("only supported for 'detach'"), "{w:?}");
-        // launch-agent kept its default 'a'.
-        assert_eq!(
-            km.action_for(ev(KeyCode::Char('a'), KeyModifiers::NONE)),
-            Some(Action::LaunchAgent)
-        );
-    }
-
-    #[test]
-    fn config_toml_accepts_a_string_or_a_list() {
+    fn config_toml_accepts_prefix_keys_and_verbs_tables() {
         let cfg: ConfigFile = toml::from_str(
             r#"
+            prefix = "ctrl-b"
             [keys]
-            detach = "f8"
             jump-needs-you = ["n", "ctrl-g"]
+            [verbs]
+            kill = "k"
             "#,
         )
         .unwrap();
-        assert!(matches!(cfg.keys.get("detach"), Some(KeySpec::One(s)) if s == "f8"));
+        assert_eq!(cfg.prefix.as_deref(), Some("ctrl-b"));
         assert!(matches!(cfg.keys.get("jump-needs-you"), Some(KeySpec::Many(v)) if v.len() == 2));
-    }
-
-    #[test]
-    fn a_detach_single_key_that_shadows_its_own_leader_is_rejected() {
-        let mut km = Keymap::default();
-        // `f8` as a single detach key AND `f8 d` as a sequence: on_attached_key
-        // resolves the single-key detach first, so the sequence could never arm.
-        // apply() must reject the dead sequence with a warning, not store it.
-        let w = km.apply(&[("detach".into(), vec!["f8".into(), "f8 d".into()])]);
-        assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("unreachable"), "{w:?}");
-        // f8 still detaches as a single key…
-        assert_eq!(
-            km.action_for(ev(KeyCode::F(8), KeyModifiers::NONE)),
-            Some(Action::Detach)
-        );
-        // …but the dead `f8 d` sequence was not stored, and the label stays honest.
-        assert!(!km.detach_completes(
-            ev(KeyCode::F(8), KeyModifiers::NONE),
-            ev(KeyCode::Char('d'), KeyModifiers::NONE)
-        ));
-        assert_eq!(km.label_for(Action::Detach), "F8");
-    }
-
-    #[test]
-    fn label_for_detach_reflects_a_rebind() {
-        let mut km = Keymap::default();
-        assert_eq!(km.label_for(Action::Detach), "F10");
-        km.apply(&[("detach".into(), vec!["f8".into()])]);
-        assert_eq!(km.label_for(Action::Detach), "F8");
+        assert!(matches!(cfg.verbs.get("kill"), Some(KeySpec::One(s)) if s == "k"));
     }
 }

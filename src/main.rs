@@ -8,11 +8,13 @@ mod app;
 mod demo;
 mod event;
 mod keymap;
+mod layout;
 mod linear;
 mod model;
 mod picker;
 mod theme;
 mod ui;
+mod window;
 // Multi-agent spine.
 mod backend;
 mod notify;
@@ -31,6 +33,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event as term_event;
 use ratatui::crossterm::event::Event;
+use ratatui::layout::Rect;
 
 use app::App;
 use event::AppEventRx;
@@ -51,9 +54,15 @@ struct Cli {
     #[arg(long)]
     demo: bool,
 
-    /// Open directly in the layered graph overview instead of the focus lens.
+    /// Open directly in the layered graph overview (a Fleet window) instead of
+    /// the focus lens.
     #[arg(long)]
     graph: bool,
+
+    /// Don't auto-resume docked agents on startup (Cockpit v3). The window layout
+    /// is still restored — only the agents stay dark until you open them.
+    #[arg(long)]
+    no_resume: bool,
 
     /// List every project visible to your API key, then exit.
     #[arg(long)]
@@ -126,7 +135,7 @@ fn real_main() -> Result<(), String> {
         }
         let mut app = App::new(graph);
         if cli.graph {
-            app.mode = app::Mode::Overview;
+            app.windows.open_fleet();
         }
         let (w, h) = parse_size(spec);
         print!("{}", render_snapshot(&mut app, w, h)?);
@@ -153,9 +162,9 @@ fn real_main() -> Result<(), String> {
 
     let mut app = App::new(graph);
     if cli.graph {
-        app.mode = app::Mode::Overview;
+        app.windows.open_fleet();
     }
-    run_tui(app, cli.demo).map_err(|e| e.to_string())
+    run_tui(app, cli.demo, cli.no_resume).map_err(|e| e.to_string())
 }
 
 /// Load `LINEAR_API_KEY` (and anything else) from `.env`: first the current
@@ -213,7 +222,11 @@ fn parse_size(spec: &str) -> (u16, u16) {
 /// Render a single frame to an off-screen buffer and return it as text.
 fn render_snapshot(app: &mut App, w: u16, h: u16) -> Result<String, String> {
     // TestBackend panics on a zero-area buffer; a live terminal is always >=1x1.
-    let backend = TestBackend::new(w.max(1), h.max(1));
+    let (w, h) = (w.max(1), h.max(1));
+    // Sync the viewport so the strip's scroll keeps the focused window in view —
+    // the interactive loop does this on resize; a one-shot snapshot must too.
+    app.set_viewport(Rect::new(0, 0, w, h));
+    let backend = TestBackend::new(w, h);
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
     terminal
         .draw(|frame| ui::draw(app, frame))
@@ -221,7 +234,7 @@ fn render_snapshot(app: &mut App, w: u16, h: u16) -> Result<String, String> {
     Ok(terminal.backend().to_string())
 }
 
-fn run_tui(mut app: App, demo: bool) -> io::Result<()> {
+fn run_tui(mut app: App, demo: bool, no_resume: bool) -> io::Result<()> {
     // Load the keymap from config (repo `.lindep/config.toml`, then personal
     // `~/.config/lindep/config.toml`), surfacing any problems on stderr before
     // we enter the alternate screen. Bad config never aborts — defaults stand in.
@@ -242,24 +255,22 @@ fn run_tui(mut app: App, demo: bool) -> io::Result<()> {
     //
     // `--demo` runs on a synthetic graph of fictional issues, so it MUST stay a
     // read-only viewer (the documented contract) even when launched from inside a
-    // real git repo: arming the control plane there would let `a` shell out a
-    // real `git worktree add` and spawn a real `claude` for a made-up issue, and
+    // real git repo: arming the control plane there would let the button shell out
+    // a real `git worktree add` and spawn a real `claude` for a made-up issue, and
     // reconcile/save would mutate this repo's on-disk session state. Leaving
-    // `app.supervisor = None` makes `launch_agent` report "control plane
-    // unavailable" instead — exactly the non-git degradation path.
+    // `app.supervisor = None` makes the button report "control plane unavailable"
+    // instead — exactly the non-git degradation path. When armed it also restores
+    // the saved window layout and (unless `--no-resume`) brings docked agents back.
     let control_plane = if control_plane_enabled(demo) {
-        start_control_plane(&runtime, tx.clone())
+        start_control_plane(&runtime, tx.clone(), &mut app, no_resume)
     } else {
         None
     };
-    if let Some((handle, _)) = &control_plane {
-        app.supervisor = Some(handle.clone());
-    }
 
     // Greet the user via the event path so the footer shows the cockpit is live.
     {
         let banner = format!(
-            "cockpit live · {} · {} issues — a: launch agent · ? help",
+            "cockpit live · {} · {} issues — Enter: open agent · ? help",
             app.graph.project,
             app.graph.len()
         );
@@ -283,6 +294,12 @@ fn run_tui(mut app: App, demo: bool) -> io::Result<()> {
 
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app, rx);
+
+    // Capture the final window layout (notably the focus, which we don't persist
+    // per-keystroke) so the next launch reopens exactly where you left off.
+    if let Some(path) = app.cockpit_path.clone() {
+        let _ = app.snapshot_cockpit().save(&path);
+    }
 
     // Normal path: stop agents before restoring the terminal. (On a panic the
     // guard's `Drop` does the same during unwind; here we drop it explicitly so
@@ -336,22 +353,32 @@ impl Drop for ControlPlaneGuard<'_> {
 
 /// Whether the cockpit may arm a real agent control plane. `--demo` runs on a
 /// synthetic graph of fictional issues, so it must stay a read-only viewer (the
-/// documented contract) even inside a real git repo — otherwise `a` would shell
-/// out a real `git worktree add` + `claude` for a made-up issue and mutate the
-/// repo's on-disk session state. (Outside a repo `start_control_plane` already
-/// returns `None`; this gate covers the demo-inside-a-repo case it can't see.)
+/// documented contract) even inside a real git repo — otherwise the button would
+/// shell out a real `git worktree add` + `claude` for a made-up issue and mutate
+/// the repo's on-disk session state. (Outside a repo `start_control_plane`
+/// already returns `None`; this gate covers the demo-inside-a-repo case.)
 fn control_plane_enabled(demo: bool) -> bool {
     !demo
 }
 
+/// Most agents the supervisor will host at once. Cockpit v3 raised this from 6
+/// (config-tunability is a follow-up); docking is uncapped above it, with extra
+/// docked agents shown as "resuming…" cards until a slot frees.
+const MAX_CONCURRENT_AGENTS: usize = 12;
+
 /// Build and start the agent control plane: worktree manager, session store
-/// (reconciled against live worktrees), hook endpoint, and the supervisor.
-/// Returns `None` (degrading to a read-only viewer) outside a git repo or if the
-/// loopback endpoint can't bind.
+/// (reconciled against live worktrees), hook endpoint, and the supervisor. Also
+/// wires the supervisor handle into `app`, restores the saved window layout
+/// (pruned against the reconcile survivors), and — unless `no_resume` — brings
+/// docked agents back. Returns `None` (degrading to a read-only viewer) outside a
+/// git repo or if the loopback endpoint can't bind.
 fn start_control_plane(
     runtime: &tokio::runtime::Runtime,
     events: event::AppEventTx,
+    app: &mut App,
+    no_resume: bool,
 ) -> Option<(supervisor::SupervisorHandle, tokio::task::JoinHandle<()>)> {
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     let repo_root = std::env::current_dir().ok()?;
@@ -415,6 +442,22 @@ fn start_control_plane(
         }
     }
 
+    // The post-reconcile survivor set (for pruning the restored window layout) and
+    // the was-live sessions (the auto-resume candidates — never Done/Failed/
+    // Stopped, which aren't `is_live`). Captured from the durable store, not the
+    // fleet (whose rehydration events haven't been drained yet).
+    let (survivors, resumable): (HashSet<String>, HashSet<String>) = match store.lock() {
+        Ok(store) => (
+            store.sessions().map(|s| s.issue.clone()).collect(),
+            store
+                .sessions()
+                .filter(|s| s.status.is_live())
+                .map(|s| s.issue.clone())
+                .collect(),
+        ),
+        Err(_) => (HashSet::new(), HashSet::new()),
+    };
+
     // The hook endpoint must bind before agents launch so their settings can
     // point at it. block_on is safe here — we're on the synchronous main thread.
     let notify::Endpoint {
@@ -427,6 +470,9 @@ fn start_control_plane(
     let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("lindep").to_path_buf());
     let (cols, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
 
+    // Kept for the post-start cockpit-restore notification (the config moves
+    // `events` into the supervisor).
+    let events_back = events.clone();
     let config = supervisor::SupervisorConfig {
         worktree,
         store,
@@ -439,12 +485,39 @@ fn start_control_plane(
         base: "HEAD".to_string(),
         rows,
         cols,
-        max_concurrent: 6,
+        // Cockpit v3 uncaps docking, but live backends are still bounded by the
+        // supervisor — bumped 6→12 (the practical ceiling is now machine
+        // resources + how many ≥80-col columns fit).
+        max_concurrent: MAX_CONCURRENT_AGENTS,
         // Interactive agents use the normal permission flow; budget/turn caps
         // are a headless (phase-3) concern and only apply with `--print`.
         guardrails: vec!["--permission-mode".to_string(), "default".to_string()],
     };
-    Some(supervisor::Supervisor::start(config, runtime.handle()))
+    let (handle, join) = supervisor::Supervisor::start(config, runtime.handle());
+    app.supervisor = Some(handle.clone());
+
+    // Restore the saved window layout (pruned against the survivors), then point
+    // the cockpit at the file so the render thread persists future changes.
+    let cockpit_path = session::CockpitState::path(&repo_root);
+    match session::CockpitState::load(&cockpit_path) {
+        Ok(state) => app.apply_cockpit(&state, &survivors),
+        Err(e) => {
+            let _ = events_back.send(event::AppEvent::Notification(format!(
+                "cockpit layout unreadable ({e}); starting fresh"
+            )));
+        }
+    }
+    app.cockpit_path = Some(cockpit_path);
+
+    // Auto-resume docked agents that were live before the restart — eager for the
+    // focused one + up to cap-1 others, lazy (on first focus) for the rest. Ships
+    // behind `--no-resume`; the lazy path + the None-backend "resuming…" cards
+    // make a >cap fleet come back gracefully.
+    if !no_resume {
+        app.begin_resume(&resumable, MAX_CONCURRENT_AGENTS);
+    }
+
+    Some((handle, join))
 }
 
 fn install_panic_hook() {
@@ -465,6 +538,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
     const ANIM_FRAME: Duration = Duration::from_millis(100);
     let mut last_tick = Instant::now();
 
+    // Seed the viewport so the visible-window set (which paces the poll loop)
+    // matches what `draw` places before the first resize event arrives.
+    if let Ok(size) = terminal.size() {
+        app.set_viewport(Rect::new(0, 0, size.width, size.height));
+    }
+
     // The view is a pure function of state. State changes from three sources:
     // terminal input (key/resize), background `AppEvent`s drained from the
     // channel, and the animation frame tick. We repaint only when one of those
@@ -475,22 +554,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
     while !app.should_quit {
         let mut dirty = false;
 
-        // Bound input latency with a poll timeout; this also paces how often we
-        // check the event channel and the animation clock. The poll itself is
-        // cheap and never repaints, and `term_event::poll` only wakes early on
-        // terminal input — so a background AppEvent (needs-you, a spawn, a hook
-        // notification) isn't seen until the next poll returns. We poll fast
-        // (16 ms) when a live PTY screen is on screen — attached, or a chat wall
-        // of live agents — so input/output feel live; at the animation cadence
-        // (100 ms) when something is merely animating off to the side (a spinner
-        // in the list); and at a short 50 ms idle otherwise, so a needs-you
-        // prompt lights up the node promptly. Only the dirty flag triggers a
-        // redraw (an idle tick sets nothing dirty), so a quiet cockpit never
-        // busy-repaints.
-        let chats_live = app.right_view == app::RightView::Chat
-            && app.mode == app::Mode::Lens
-            && app.has_chat_panes();
-        let timeout = if app.attached.is_some() || chats_live {
+        // Poll fast (16 ms) only when an interactive PTY screen is actually on
+        // the visible strip — so input/output feel live without busy-repainting
+        // for an agent scrolled off-screen; at the animation cadence (100 ms)
+        // when something merely animates; else a short 50 ms idle so a needs-you
+        // prompt lights up promptly. Only the dirty flag triggers a redraw.
+        let timeout = if app.has_visible_live_agent() {
             Duration::from_millis(16)
         } else if app.is_animating() {
             ANIM_FRAME
@@ -503,7 +572,10 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
                     app.on_key(key);
                     dirty = true;
                 }
-                Event::Resize(_, _) => dirty = true,
+                Event::Resize(w, h) => {
+                    app.set_viewport(Rect::new(0, 0, w, h));
+                    dirty = true;
+                }
                 _ => {} // mouse / focus / paste change nothing on screen
             }
         }
@@ -522,10 +594,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
 
         // Advance the animation frame on the wall-clock cadence while something
         // is animating, forcing one repaint per frame. A still cockpit (no live
-        // agents, no flash → `is_animating()` false) never advances the frame and
-        // so never repaints on its own — the idle-quiet property holds. When idle
-        // we keep the clock fresh so the first frame after a lull waits a full
-        // interval rather than firing instantly.
+        // agents, no flash, no resume → `is_animating()` false) never advances the
+        // frame and so never repaints on its own — the idle-quiet property holds.
         if app.is_animating() {
             if last_tick.elapsed() >= ANIM_FRAME {
                 app.tick_frame();
@@ -539,6 +609,18 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
         if dirty {
             terminal.draw(|frame| ui::draw(app, frame))?;
         }
+
+        // Persist the window layout when a structural change asked us to. The
+        // render thread is the sole cockpit-file writer, and this fires only on a
+        // pin/close/layout change (never per keystroke), so the synchronous,
+        // durable write is cheap. Best-effort: the layout is cosmetic, so a write
+        // failure must not interrupt the session.
+        if app.cockpit_dirty {
+            app.cockpit_dirty = false;
+            if let Some(path) = app.cockpit_path.clone() {
+                let _ = app.snapshot_cockpit().save(&path);
+            }
+        }
     }
     Ok(())
 }
@@ -546,12 +628,24 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::AgentStatus;
+    use crate::window::LayoutMode;
+    use std::sync::Arc;
+
+    fn fake(app: &mut App, issue: &str) {
+        let backend = crate::backend::fake::FakeBackend::new(issue);
+        app.backends.insert(
+            issue.into(),
+            backend as Arc<dyn crate::backend::AgentBackend>,
+        );
+    }
 
     #[test]
     fn snapshot_renders_core_chrome() {
+        // The cockpit opens with a dependency window on the default selection, so
+        // the header + both dependency directions + a known issue are all present.
         let mut app = App::new(demo::graph());
         let out = render_snapshot(&mut app, 120, 40).expect("render");
-        // Header + both dependency directions + a known issue are present.
         assert!(out.contains("Inference Platform"), "header missing:\n{out}");
         assert!(out.contains("UPSTREAM"), "upstream header missing");
         assert!(out.contains("DOWNSTREAM"), "downstream header missing");
@@ -560,11 +654,15 @@ mod tests {
     }
 
     #[test]
-    fn overview_renders_levels_and_externals() {
+    fn a_fleet_window_renders_levels_and_externals() {
+        // The old `--graph` overview is now a focusable Fleet window.
         let mut app = App::new(demo::graph());
-        app.mode = app::Mode::Overview;
+        app.windows.open_fleet();
         let out = render_snapshot(&mut app, 120, 40).expect("render");
-        assert!(out.contains("GRAPH OVERVIEW"));
+        assert!(
+            out.contains("GRAPH OVERVIEW"),
+            "the fleet map renders:\n{out}"
+        );
         assert!(out.contains("L0"));
         assert!(out.contains("INFRA-77"), "external blocker missing");
     }
@@ -572,69 +670,41 @@ mod tests {
     #[test]
     fn fleet_overlay_marks_agents_in_header_and_list() {
         let mut app = App::new(demo::graph());
-        app.fleet
-            .insert("ZAP-204".into(), crate::session::AgentStatus::NeedsYou);
-        app.fleet
-            .insert("ZAP-201".into(), crate::session::AgentStatus::Running);
+        app.fleet.insert("ZAP-204".into(), AgentStatus::NeedsYou);
+        app.fleet.insert("ZAP-201".into(), AgentStatus::Running);
         let out = render_snapshot(&mut app, 120, 40).expect("render");
         assert!(out.contains("2 agents"), "header counts agents:\n{out}");
         assert!(out.contains("needs you"), "header flags attention");
-        assert!(
-            out.contains('⚑'),
-            "needs-you flag is visible in the overlay"
-        );
+        assert!(out.contains('⚑'), "needs-you flag is visible");
     }
 
     #[test]
-    fn attached_view_renders_the_agent_pane_without_panic() {
+    fn an_agent_window_renders_its_status_and_key() {
         let mut app = App::new(demo::graph());
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
-        app.backends.insert(
-            "ZAP-204".into(),
-            fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
-        );
-        app.attached = Some("ZAP-204".into());
-        let out = render_snapshot(&mut app, 100, 30).expect("render");
-        assert!(out.contains("ATTACHED"), "attach header shown:\n{out}");
-        assert!(out.contains("detach"), "detach hint shown");
-    }
-
-    #[test]
-    fn chat_view_renders_the_selected_agents_pane() {
-        let mut app = App::new(demo::graph());
-        app.right_view = app::RightView::Chat;
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
-        app.backends.insert(
-            "ZAP-204".into(),
-            fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
-        );
-        app.fleet
-            .insert("ZAP-204".into(), crate::session::AgentStatus::Running);
-        app.root = "ZAP-204".into();
+        app.windows.open_or_focus_agent("ZAP-204");
+        fake(&mut app, "ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
         let out = render_snapshot(&mut app, 120, 40).expect("render");
-        assert!(out.contains("CHAT"), "the chat badge shows:\n{out}");
         assert!(
             out.contains("WORKING"),
-            "a working agent's pane is labelled"
+            "a working agent is labelled:\n{out}"
         );
         assert!(out.contains("ZAP-204"));
     }
 
     #[test]
-    fn chat_view_labels_a_finished_agent_done_not_exited() {
-        // Regression for the review's m3: a finished pinned agent must read DONE,
-        // and a stopped/done agent must not inflate the header count.
+    fn a_finished_agent_window_reads_done_not_exited_and_is_uncounted() {
+        // A finished agent's window reads DONE (the supervisor's verdict), never
+        // the transient amber EXITED, and doesn't inflate the header count.
         let mut app = App::new(demo::graph());
-        app.right_view = app::RightView::Chat;
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-201");
+        app.windows.open_or_focus_agent("ZAP-201");
+        let backend = crate::backend::fake::FakeBackend::new("ZAP-201");
+        backend.finish(Some(0));
         app.backends.insert(
             "ZAP-201".into(),
-            fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
+            backend as Arc<dyn crate::backend::AgentBackend>,
         );
-        app.fleet
-            .insert("ZAP-201".into(), crate::session::AgentStatus::Done);
-        app.pinned = vec!["ZAP-201".into()];
-        app.root = "ZAP-201".into();
+        app.fleet.insert("ZAP-201".into(), AgentStatus::Done);
         let out = render_snapshot(&mut app, 120, 40).expect("render");
         assert!(out.contains("DONE"), "a finished agent reads DONE:\n{out}");
         assert!(!out.contains("EXITED"), "not the transient amber EXITED");
@@ -645,95 +715,72 @@ mod tests {
     }
 
     #[test]
-    fn chat_view_empty_state_teaches_how_to_open_an_agent() {
-        let mut app = App::new(demo::graph());
-        app.right_view = app::RightView::Chat; // no backends → an empty wall
-        let out = render_snapshot(&mut app, 120, 40).expect("render");
-        assert!(out.contains("CHAT"));
-        assert!(
-            out.contains("no agent"),
-            "the empty state nudges opening one:\n{out}"
-        );
-    }
-
-    #[test]
-    fn chat_view_survives_adversarial_sizes() {
-        // A multi-pane chat wall (pins + selection, incl. a dead pinned agent)
-        // must not panic when the split yields tiny or zero-area panes.
-        for (w, h) in [
-            (0u16, 0u16),
-            (1, 1),
-            (3, 2),
-            (5, 3),
-            (20, 4),
-            (44, 6),
-            (80, 10),
-            (120, 40),
-        ] {
-            let mut app = App::new(demo::graph());
-            app.right_view = app::RightView::Chat;
-            for key in ["ZAP-204", "ZAP-201", "ZAP-205"] {
-                let fake = crate::backend::fake::FakeBackend::new(key);
-                app.backends.insert(
-                    key.into(),
-                    fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
-                );
-                app.fleet
-                    .insert(key.into(), crate::session::AgentStatus::Running);
+    fn agent_windows_survive_adversarial_sizes_in_both_layouts() {
+        // A strip of several windows (spine + deps + agents) must not panic at any
+        // size, in either layout — the snap-to-whole-column / mosaic geometry.
+        for layout in [LayoutMode::Filmstrip, LayoutMode::Mosaic] {
+            for (w, h) in [
+                (0u16, 0u16),
+                (1, 1),
+                (3, 2),
+                (5, 3),
+                (20, 4),
+                (44, 6),
+                (80, 10),
+                (120, 40),
+                (200, 60),
+            ] {
+                let mut app = App::new(demo::graph());
+                app.windows.layout = layout;
+                for key in ["ZAP-204", "ZAP-201", "ZAP-205"] {
+                    app.windows.open_or_focus_agent(key);
+                    fake(&mut app, key);
+                    app.fleet.insert(key.into(), AgentStatus::Running);
+                }
+                render_snapshot(&mut app, w, h).expect("the strip must not panic");
             }
-            app.pinned = vec!["ZAP-201".into(), "ZAP-205".into()];
-            app.root = "ZAP-204".into();
-            render_snapshot(&mut app, w, h).expect("chat wall must not panic");
         }
     }
 
     #[test]
-    fn help_overlay_shows_live_bindings_and_the_config_hint() {
+    fn a_docked_agent_without_a_backend_renders_a_resuming_card() {
+        // A restored docked agent (Phase 5/6) has no backend until it resumes —
+        // it must paint a calm card (never touch a parser/resize) and survive.
+        let mut app = App::new(demo::graph());
+        app.windows.open_or_focus_agent("ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Idle); // rehydrated was-live
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(out.contains("ZAP-204"));
+        assert!(
+            out.contains("resuming"),
+            "a backend-less docked agent shows a resuming card:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_resuming_header_spinner_shows_while_resuming() {
+        let mut app = App::new(demo::graph());
+        app.resuming_count = 3;
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(
+            out.contains("resuming 3"),
+            "the resume spinner shows:\n{out}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_shows_the_prefix_and_config_hint() {
         let mut app = App::new(demo::graph());
         app.show_help = true;
-        let out = render_snapshot(&mut app, 90, 30).expect("render");
+        let out = render_snapshot(&mut app, 90, 44).expect("render");
         assert!(
-            out.contains("F10"),
-            "help shows the (default) detach key:\n{out}"
+            out.contains("Ctrl-A"),
+            "help shows the (default) prefix chord:\n{out}"
         );
         assert!(
             out.contains("config.toml"),
             "help points at the config file"
         );
-    }
-
-    #[test]
-    fn attach_pane_reflects_a_rebound_detach_key() {
-        let mut app = App::new(demo::graph());
-        // Rebind detach F10 → F8, as a config file would.
-        app.keymap
-            .apply(&[("detach".to_string(), vec!["f8".to_string()])]);
-        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
-        app.backends.insert(
-            "ZAP-204".into(),
-            fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
-        );
-        app.attached = Some("ZAP-204".into());
-        let out = render_snapshot(&mut app, 100, 30).expect("render");
-        assert!(
-            out.contains("F8 to detach"),
-            "attach pane shows the rebound key:\n{out}"
-        );
-        assert!(!out.contains("F10"), "the old default key is gone");
-    }
-
-    #[test]
-    fn attached_view_survives_adversarial_sizes() {
-        for (w, h) in [(0u16, 0u16), (1, 1), (3, 2), (5, 3), (44, 4), (100, 30)] {
-            let mut app = App::new(demo::graph());
-            let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
-            app.backends.insert(
-                "ZAP-204".into(),
-                fake as std::sync::Arc<dyn crate::backend::AgentBackend>,
-            );
-            app.attached = Some("ZAP-204".into());
-            render_snapshot(&mut app, w, h).expect("attach pane must not panic");
-        }
     }
 
     #[test]
@@ -787,12 +834,11 @@ mod tests {
             (80, 24),
             (200, 60),
         ] {
-            for mode in [app::Mode::Lens, app::Mode::Overview] {
-                let mut app = App::new(demo::graph());
-                app.mode = mode;
-                app.show_help = true; // also exercise the overlay
-                render_snapshot(&mut app, w, h).expect("must not panic");
-            }
+            // Exercise the spine + a deps window + a fleet map + the help overlay.
+            let mut app = App::new(demo::graph());
+            app.windows.open_fleet();
+            app.show_help = true;
+            render_snapshot(&mut app, w, h).expect("must not panic");
         }
     }
 }
