@@ -208,7 +208,8 @@ pub struct PtyAgent {
     lifecycle: Arc<Mutex<Lifecycle>>,
     exit_notify: Arc<Notify>,
     /// Set by the wait thread the moment `child.wait()` reaps the zombie. Gates
-    /// the `killpg` paths so we never signal a pid the OS may have recycled.
+    /// the `killpg` paths to minimize the chance of signalling a pid the OS may
+    /// have recycled (best-effort — see [`PtyAgent::signal_group`]).
     reaped: Arc<AtomicBool>,
     /// Used only to surface a footer diagnostic when a process-group signal fails
     /// for a real reason (EPERM/…) — a leak that otherwise produces no output.
@@ -281,7 +282,8 @@ impl PtyAgent {
         let lifecycle = Arc::new(Mutex::new(Lifecycle::Running));
         let exit_notify = Arc::new(Notify::new());
         // Flipped by the wait thread the instant `child.wait()` reaps the zombie,
-        // so signal paths never killpg() a pid the OS may already have recycled.
+        // so signal paths almost never killpg() a pid the OS may already have
+        // recycled (best-effort — the store narrows but can't fully close it).
         let reaped = Arc::new(AtomicBool::new(false));
 
         // Output pump.
@@ -314,8 +316,9 @@ impl PtyAgent {
                 .name(format!("pty-wait-{issue}"))
                 .spawn(move || {
                     let code = child.wait().ok().map(|s| (s.exit_code() & 0xff) as i32);
-                    // Mark reaped *before* publishing the exit, so any shutdown
-                    // racing in on the notification never signals a recycled pid.
+                    // Mark reaped *before* publishing the exit, so a shutdown
+                    // racing in on the notification almost never signals a
+                    // recycled pid (the store narrows the window; see signal_group).
                     reaped.store(true, Ordering::SeqCst);
                     if let Ok(mut l) = lifecycle.lock() {
                         *l = Lifecycle::Exited(code);
@@ -413,14 +416,20 @@ impl PtyAgent {
     /// Signal the child's process group, but only while it is still un-reaped:
     /// once the wait thread has `wait()`ed the zombie its pid (== pgid) can be
     /// recycled, so signalling it could hit an unrelated, newly-created group.
+    /// The `reaped` gate is best-effort: it narrows, but cannot fully close, the
+    /// window between the wait thread's `wait()` and its `reaped.store(true)`.
     #[cfg(unix)]
     fn signal_group(&self, sig: libc::c_int) {
         if self.reaped.load(Ordering::SeqCst) {
             return; // already reaped — the pid may have been recycled
         }
         let Some(pid) = self.pid else { return };
-        // SAFETY: a plain libc call signalling our own child's process group,
-        // gated above so the pid is still ours.
+        // SAFETY: `killpg` is a plain FFI call — sound to invoke for any pid_t.
+        // The `reaped` gate above narrows (but cannot fully close) the TOCTOU
+        // between the wait thread's `wait()` and its `reaped.store(true)`; the
+        // residual window is accepted — sequential pid allocation makes a recycle
+        // astronomically unlikely, and the worst case is a misdirected signal,
+        // never unsoundness.
         let rc = unsafe { libc::killpg(pid as libc::pid_t, sig) };
         if rc == 0 {
             return;

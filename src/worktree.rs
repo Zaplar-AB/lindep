@@ -239,7 +239,11 @@ impl WorktreeManager {
                 if let Some(p) = line.strip_prefix("worktree ") {
                     path = Some(PathBuf::from(p.trim()));
                 } else if let Some(b) = line.strip_prefix("branch ") {
-                    branch = Some(b.trim().trim_start_matches("refs/heads/").to_string());
+                    // Strip exactly one `refs/heads/` (not `trim_start_matches`,
+                    // which would peel a repeated prefix), leaving any other ref
+                    // form intact.
+                    let raw = b.trim();
+                    branch = Some(raw.strip_prefix("refs/heads/").unwrap_or(raw).to_string());
                 }
             }
             let Some(path) = path else { continue };
@@ -329,9 +333,12 @@ impl WorktreeManager {
     /// the title slug it was first cut with. Matches `<prefix>/<issue>` exactly
     /// and any `<prefix>/<issue>-<slug>` (the issue is lowercased to mirror
     /// [`Self::branch_name`]). When several exist (a title changed across
-    /// recreates) the lexicographically-first is chosen for determinism — any
-    /// of them carries the issue's history, and reusing one beats minting a new
-    /// empty branch from `base` and orphaning that work.
+    /// recreates) the lexicographically-first is chosen purely for determinism;
+    /// if two `<prefix>/<issue>…` branches have diverged (e.g. one introduced
+    /// externally) this resumes one of them by byte order, not by recency — the
+    /// other is left intact but unreferenced here. lindep itself never creates
+    /// the divergent case, and reusing one still beats minting a new empty branch
+    /// from `base` and orphaning that work.
     fn existing_issue_branch(&self, issue: &str) -> Result<Option<String>, WorktreeError> {
         let issue = issue.to_lowercase();
         // List every local branch under `refs/heads/<prefix>/` (one short name
@@ -404,8 +411,6 @@ impl WorktreeManager {
     }
 }
 
-/// `$USER`, then `lindep`. Keeps Felix's `felix/…` namespace off teammates'
-/// branches while matching the design's example for him.
 /// Validate that an issue id is safe as a single path component and git ref
 /// segment. Accepts ASCII alphanumerics plus `-`/`_`, non-empty, no leading `-`.
 /// Defense-in-depth against a `/`, `..`, or control char ever reaching a path or
@@ -424,6 +429,8 @@ pub fn validate_issue_id(issue: &str) -> Result<(), WorktreeError> {
     }
 }
 
+/// Default branch namespace: `$USER`, then `lindep`. Keeps Felix's `felix/…`
+/// namespace off teammates' branches while matching the design's example for him.
 fn default_branch_prefix() -> String {
     std::env::var("USER")
         .ok()

@@ -20,6 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::event::{AppEvent, AppEventTx};
+
 /// Fixed namespace for per-issue session UUIDv5s. Arbitrary but constant — it
 /// only has to be stable across machines and runs.
 const SESSION_NAMESPACE: Uuid = Uuid::from_u128(0x6c69_6e64_6570_5f73_6573_7369_6f6e_7331);
@@ -314,18 +316,15 @@ impl SessionStore {
     /// — including power/kernel loss — leaves either the previous good state or
     /// the new one intact, never a truncated `state.json`.
     ///
-    /// Saves are serialized by the `Arc<Mutex<SessionStore>>` every caller holds
-    /// (supervisor + hook endpoint), so the per-PID temp suffix only has to
-    /// avoid collisions between distinct lindep processes sharing a repo, not
-    /// between concurrent in-process saves.
+    /// This synchronous helper is for callers already holding the store lock; the
+    /// off-lock production paths use [`mutate_and_persist`]. Either way the per-
+    /// path commit gate in [`write_snapshot`](Self::write_snapshot) orders writes
+    /// by their `seq`, so two writers can't revert each other.
     pub fn save(&self) -> Result<(), StateError> {
-        Self::write_snapshot(&self.path, &self.snapshot_bytes()?)
+        let (bytes, seq) = self.snapshot_with_seq()?;
+        Self::write_snapshot(&self.path, &bytes, seq)
     }
 
-    /// Serialize the store to its on-disk JSON bytes (stable issue order so the
-    /// file diffs cleanly). Cheap — callers hold the store lock for this, then
-    /// persist the bytes off the lock via [`write_snapshot`](Self::write_snapshot)
-    /// / [`mutate_and_persist`] so blocking fs I/O never runs under the mutex.
     /// An empty store rooted at `path` — used to degrade gracefully when an
     /// existing `state.json` is corrupt/unreadable: start fresh (the bad file is
     /// overwritten on the first save) rather than disabling the cockpit.
@@ -336,6 +335,10 @@ impl SessionStore {
         }
     }
 
+    /// Serialize the store to its on-disk JSON bytes (stable issue order so the
+    /// file diffs cleanly). Cheap — callers hold the store lock for this, then
+    /// persist the bytes off the lock via [`write_snapshot`](Self::write_snapshot)
+    /// / [`mutate_and_persist`] so blocking fs I/O never runs under the mutex.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, StateError> {
         let mut sessions: Vec<Session> = self.sessions.values().cloned().collect();
         sessions.sort_by(|a, b| a.issue.cmp(&b.issue));
@@ -344,6 +347,19 @@ impl SessionStore {
             sessions,
         };
         serde_json::to_vec_pretty(&persisted).map_err(StateError::Serialize)
+    }
+
+    /// Snapshot the bytes **and** claim a monotonic ordering `seq` in one step,
+    /// to be called under the store lock. The off-lock persists snapshot in lock
+    /// order but their blocking writes finish out of order; passing `seq` into
+    /// [`write_snapshot`](Self::write_snapshot) lets its commit gate drop a
+    /// late-landing older write, so a newer durable transition is never reverted.
+    pub fn snapshot_with_seq(&self) -> Result<(Vec<u8>, u64), StateError> {
+        let bytes = self.snapshot_bytes()?;
+        // Assigned under the caller's lock, so seqs strictly increase in the same
+        // order the mutations were applied.
+        let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok((bytes, seq))
     }
 
     /// The state file this store persists to.
@@ -356,14 +372,22 @@ impl SessionStore {
         self.sessions.values()
     }
 
-    /// Atomically and durably write pre-serialized state bytes to `path`: write a
-    /// sibling temp, `fsync` it, rename over the target, then `fsync` the parent
-    /// dir. A reader never observes a half-written file (rename is atomic), and a
-    /// crash mid-write leaves either the previous good state or the new one, never
-    /// a truncated `state.json`. The temp suffix is unique per (process, call) so
-    /// two concurrent off-lock saves never collide on the same temp file — the
-    /// store mutex no longer serializes the actual write.
-    pub fn write_snapshot(path: &Path, json: &[u8]) -> Result<(), StateError> {
+    /// Atomically, durably, **and in order** write pre-serialized state bytes to
+    /// `path` for the snapshot stamped `seq` (see
+    /// [`snapshot_with_seq`](Self::snapshot_with_seq)): write a sibling temp,
+    /// `fsync` it, then — under a per-path commit gate — rename over the target
+    /// and `fsync` the parent dir.
+    ///
+    /// * **Atomic + durable.** A reader never observes a half-written file (rename
+    ///   is atomic), and a crash mid-write leaves either the previous good state
+    ///   or the new one, never a truncated `state.json`.
+    /// * **Ordered.** The off-lock persists (supervisor + hook bus) snapshot under
+    ///   the store lock but their blocking writes finish in arbitrary order on the
+    ///   pool. The gate skips any write whose `seq` is older than what already
+    ///   committed for this path, so a late-landing older snapshot can never
+    ///   revert a newer durable transition. The gate is keyed by path, so
+    ///   independent state files never block or shadow each other.
+    pub fn write_snapshot(path: &Path, json: &[u8], seq: u64) -> Result<(), StateError> {
         let parent = path.parent();
         if let Some(parent) = parent {
             std::fs::create_dir_all(parent).map_err(|source| StateError::Write {
@@ -372,10 +396,12 @@ impl SessionStore {
             })?;
         }
 
-        let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The temp name carries (pid, seq) so concurrent off-lock writes — even
+        // across distinct lindep processes sharing a repo — never collide.
         let tmp = path.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
         // Write + flush the temp's data blocks to disk *before* the rename, so the
-        // rename can never become visible pointing at unflushed contents.
+        // rename can never become visible pointing at unflushed contents. This
+        // (the slow part) runs OFF the commit gate so writers prepare in parallel.
         let write_tmp = || -> std::io::Result<()> {
             let mut f = File::create(&tmp)?;
             f.write_all(json)?;
@@ -385,6 +411,19 @@ impl SessionStore {
             path: tmp.clone(),
             source,
         })?;
+
+        // Commit under the per-path gate. Holding it across the rename serializes
+        // the durable effect; the seq check drops a stale (older) writer so an
+        // out-of-order completion can't revert newer state.
+        let mut committed = COMMIT_SEQS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let highest = committed.entry(path.to_path_buf()).or_insert(0);
+        if seq < *highest {
+            // A newer snapshot already committed for this path — ours is stale.
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(());
+        }
 
         std::fs::rename(&tmp, path).map_err(|source| {
             // Best-effort cleanup so a failed rename doesn't litter temp files.
@@ -406,14 +445,28 @@ impl SessionStore {
                     source,
                 })?;
         }
+        *highest = seq;
         Ok(())
     }
 }
 
-/// Monotonic counter making each off-lock save's temp file unique within this
-/// process (the store mutex used to serialize saves; off-lock persistence means
-/// it no longer does, so the temp name must carry the uniqueness itself).
+/// Monotonic counter stamping each snapshot with an ordering `seq` (claimed under
+/// the store lock by [`SessionStore::snapshot_with_seq`]). It both makes the temp
+/// file unique per (process, call) and lets the commit gate drop a stale write.
 static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Highest snapshot `seq` already committed, per state-file path. The off-lock
+/// persists snapshot in lock order but finish their blocking writes out of order;
+/// [`SessionStore::write_snapshot`] consults this under the lock so a late older
+/// write is dropped instead of reverting a newer durable transition. Keyed by
+/// path so two independent state files never gate each other.
+static COMMIT_SEQS: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Whether the last off-lock persist failed, so a wedged disk surfaces exactly
+/// one footer notification per failure episode (not one per hook) and goes quiet
+/// again on the next success. See [`persist_snapshot`].
+static PERSIST_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Mutate the store under its lock, then persist the snapshot OFF the lock on the
 /// blocking pool. Holding the std `Mutex` across the (blocking) fs write would
@@ -421,20 +474,54 @@ static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// latency; here the in-memory mutation runs under the lock and only the durable
 /// write happens after it's released. A poisoned lock or serialize error drops
 /// the persist (the in-memory store stays authoritative; the next save recovers).
+/// The snapshot is stamped with an ordering `seq` under the lock so the off-lock
+/// write commits in mutation order; `events` carries a single footer
+/// notification if the durable write itself fails (see [`persist_snapshot`]).
 pub async fn mutate_and_persist(
     store: &std::sync::Arc<std::sync::Mutex<SessionStore>>,
+    events: &AppEventTx,
     mutate: impl FnOnce(&mut SessionStore),
 ) {
-    let Some((path, bytes)) = (match store.lock() {
+    let Some((path, bytes, seq)) = (match store.lock() {
         Ok(mut s) => {
             mutate(&mut s);
-            s.snapshot_bytes().ok().map(|b| (s.path().to_path_buf(), b))
+            s.snapshot_with_seq()
+                .ok()
+                .map(|(b, seq)| (s.path().to_path_buf(), b, seq))
         }
         Err(_) => None,
     }) else {
         return;
     };
-    let _ = tokio::task::spawn_blocking(move || SessionStore::write_snapshot(&path, &bytes)).await;
+    persist_snapshot(events, path, bytes, seq).await;
+}
+
+/// Persist a captured snapshot OFF the lock on the blocking pool, committing in
+/// `seq` order (the commit gate in [`SessionStore::write_snapshot`] drops a
+/// late-landing older write). The in-memory store stays authoritative, so a write
+/// failure doesn't change control flow — but it isn't swallowed either: a genuine
+/// durable-write failure surfaces exactly one footer notification per failure
+/// episode (throttled via [`PERSIST_FAILING`] so a stuck disk doesn't flood the
+/// footer on every hook), going quiet again on the next success.
+pub async fn persist_snapshot(events: &AppEventTx, path: PathBuf, bytes: Vec<u8>, seq: u64) {
+    use std::sync::atomic::Ordering;
+    let outcome =
+        tokio::task::spawn_blocking(move || SessionStore::write_snapshot(&path, &bytes, seq)).await;
+    let error = match outcome {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(join) => Some(format!("persist task aborted: {join}")),
+    };
+    match error {
+        None => PERSIST_FAILING.store(false, Ordering::Relaxed),
+        Some(msg) => {
+            if !PERSIST_FAILING.swap(true, Ordering::Relaxed) {
+                let _ = events.send(AppEvent::Notification(format!(
+                    "session state save failed: {msg}"
+                )));
+            }
+        }
+    }
 }
 
 /// Unix seconds now, as advisory wall-clock metadata only. A clock somehow
@@ -586,6 +673,21 @@ mod tests {
         assert_eq!(store.get("ENG-7").unwrap().status, AgentStatus::Running);
     }
 
+    /// Every `state.json.tmp.{pid}.{seq}` sibling still present next to `path`.
+    /// The real temp carries a per-call `seq` suffix, so a fixed-name `exists()`
+    /// check would never match it — scan the directory for the real artifact.
+    fn lingering_temps(path: &Path) -> Vec<String> {
+        let dir = path.parent().unwrap();
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("state.json.tmp."))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn save_is_atomic_and_leaves_no_temp_behind() {
         let path = temp_state_path();
@@ -593,10 +695,10 @@ mod tests {
         store.save().unwrap();
         assert!(path.exists(), "the state file was written");
         // The unique temp file must have been renamed away, not left behind.
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        let lingering = lingering_temps(&path);
         assert!(
-            !tmp.exists(),
-            "no temp file lingers after a successful save"
+            lingering.is_empty(),
+            "no temp file lingers after a successful save: {lingering:?}"
         );
     }
 
@@ -698,7 +800,50 @@ mod tests {
                 "each task's record survived the concurrent saves"
             );
         }
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        assert!(!tmp.exists(), "no temp file lingers after concurrent saves");
+        let lingering = lingering_temps(&path);
+        assert!(
+            lingering.is_empty(),
+            "no temp file lingers after concurrent saves: {lingering:?}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_order_stale_write_does_not_clobber_a_newer_one() {
+        // The off-lock persist race: a newer snapshot (higher seq) commits, then
+        // an earlier snapshot's delayed write lands. The per-path commit gate must
+        // drop the stale write so the disk keeps the newer transition rather than
+        // reverting to the older one — the durable lost-update the seq guards.
+        let path = temp_state_path();
+
+        let mut earlier = SessionStore::load(&path).unwrap();
+        earlier.ensure("ENG-1", "/wt/ENG-1".into(), "b".into());
+        earlier.set_status("ENG-1", AgentStatus::Running);
+        let (earlier_bytes, earlier_seq) = earlier.snapshot_with_seq().unwrap();
+
+        let mut later = SessionStore::load(&path).unwrap();
+        later.ensure("ENG-1", "/wt/ENG-1".into(), "b".into());
+        later.set_status("ENG-1", AgentStatus::Done);
+        let (later_bytes, later_seq) = later.snapshot_with_seq().unwrap();
+        assert!(
+            earlier_seq < later_seq,
+            "the later transition claims the higher seq"
+        );
+
+        // Commit the LATER snapshot, then let the EARLIER (delayed) write land.
+        SessionStore::write_snapshot(&path, &later_bytes, later_seq).unwrap();
+        SessionStore::write_snapshot(&path, &earlier_bytes, earlier_seq).unwrap();
+
+        // Disk must still reflect the later transition; the stale write was dropped.
+        let reloaded = SessionStore::load(&path).unwrap();
+        assert_eq!(
+            reloaded.get("ENG-1").unwrap().status,
+            AgentStatus::Done,
+            "the stale older write did not revert the newer durable state"
+        );
+        let lingering = lingering_temps(&path);
+        assert!(
+            lingering.is_empty(),
+            "the dropped stale write left no temp behind: {lingering:?}"
+        );
     }
 }

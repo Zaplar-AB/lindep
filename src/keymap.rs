@@ -277,12 +277,6 @@ impl Keymap {
         self.detach_seqs.iter().any(|(a, b)| *a == l && *b == k)
     }
 
-    /// Whether two events are the same chord — used to let a doubled leader pass
-    /// through to the agent.
-    pub fn same_chord(&self, a: KeyEvent, b: KeyEvent) -> bool {
-        Binding::of(a) == Binding::of(b)
-    }
-
     /// Joined labels of every binding for `action`, for help and the attach
     /// pane: e.g. `↑ / k`, or `F10 / Ctrl-A D` when detach has a key and a chord.
     pub fn label_for(&self, action: Action) -> String {
@@ -369,7 +363,24 @@ impl Keymap {
                     }
                 }
             }
-            self.detach_seqs.extend(new_seqs);
+            // A sequence whose leader is *also* a detach single-key can never
+            // arm: `on_attached_key` resolves the single-key detach before it
+            // checks for a leader, so the leader detaches immediately and the
+            // completion is never awaited. Reject the dead sequence with a
+            // warning rather than storing a binding `label_for` would advertise
+            // but the input loop would never honour.
+            for (leader, completion) in new_seqs {
+                if self.singles.get(&leader) == Some(&action) {
+                    warnings.push(format!(
+                        "'{name}': {} is both a detach key and a leader; the sequence {} {} is unreachable; ignored",
+                        leader.label(),
+                        leader.label(),
+                        completion.label()
+                    ));
+                    continue;
+                }
+                self.detach_seqs.push((leader, completion));
+            }
         }
         warnings
     }
@@ -613,6 +624,28 @@ mod tests {
         .unwrap();
         assert!(matches!(cfg.keys.get("detach"), Some(KeySpec::One(s)) if s == "f8"));
         assert!(matches!(cfg.keys.get("jump-needs-you"), Some(KeySpec::Many(v)) if v.len() == 2));
+    }
+
+    #[test]
+    fn a_detach_single_key_that_shadows_its_own_leader_is_rejected() {
+        let mut km = Keymap::default();
+        // `f8` as a single detach key AND `f8 d` as a sequence: on_attached_key
+        // resolves the single-key detach first, so the sequence could never arm.
+        // apply() must reject the dead sequence with a warning, not store it.
+        let w = km.apply(&[("detach".into(), vec!["f8".into(), "f8 d".into()])]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("unreachable"), "{w:?}");
+        // f8 still detaches as a single key…
+        assert_eq!(
+            km.action_for(ev(KeyCode::F(8), KeyModifiers::NONE)),
+            Some(Action::Detach)
+        );
+        // …but the dead `f8 d` sequence was not stored, and the label stays honest.
+        assert!(!km.detach_completes(
+            ev(KeyCode::F(8), KeyModifiers::NONE),
+            ev(KeyCode::Char('d'), KeyModifiers::NONE)
+        ));
+        assert_eq!(km.label_for(Action::Detach), "F8");
     }
 
     #[test]

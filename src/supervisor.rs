@@ -342,18 +342,17 @@ async fn supervise(task: &AgentTask) {
         let session = store.ensure(&task.issue, worktree.path.clone(), worktree.branch.clone());
         let session_id = session.session_id.clone();
         store.set_status(&task.issue, AgentStatus::Spawning);
-        // Snapshot under the lock; persist after dropping it so blocking fs I/O
-        // never runs under the store mutex (a hook waiting on the same lock must
-        // not block behind a disk rename).
+        // Snapshot (+ ordering seq) under the lock; persist after dropping it so
+        // blocking fs I/O never runs under the store mutex (a hook waiting on the
+        // same lock must not block behind a disk rename).
         let snapshot = store
-            .snapshot_bytes()
+            .snapshot_with_seq()
             .ok()
-            .map(|b| (store.path().to_path_buf(), b));
+            .map(|(b, seq)| (store.path().to_path_buf(), b, seq));
         (session_id, resume, snapshot)
     };
-    if let Some((path, bytes)) = snapshot {
-        let _ =
-            tokio::task::spawn_blocking(move || SessionStore::write_snapshot(&path, &bytes)).await;
+    if let Some((path, bytes, seq)) = snapshot {
+        crate::session::persist_snapshot(&task.events, path, bytes, seq).await;
     }
 
     // Hook settings so this agent's notifications find their way back to us.
@@ -394,7 +393,7 @@ async fn supervise(task: &AgentTask) {
     // quiet agent (thinking/streaming before its first PostToolUse) would show
     // `◌ spawning` forever, indistinguishable from a wedged spawn. The hook bus
     // refines this to NeedsYou/Idle once it has something to report.
-    crate::session::mutate_and_persist(&task.store, |store| {
+    crate::session::mutate_and_persist(&task.store, &task.events, |store| {
         store.set_status(&task.issue, AgentStatus::Running);
     })
     .await;
@@ -416,6 +415,14 @@ async fn supervise(task: &AgentTask) {
     // `Exited(code)` before waking us; on a cancel this is `Running` unless the
     // process beat us to it (both select! arms ready) — in which case it carries
     // the real exit code, so a crash racing the cancel isn't laundered into Idle.
+    //
+    // One sub-microsecond window is knowingly left open: the wait thread sets
+    // `reaped` *before* it writes `Exited` (so the killpg gate is conservative —
+    // see backend::signal_group), so a cancel that reads `status()` in between
+    // sees `Running` and grades a just-crashed agent `Stopped` rather than
+    // `Failed`. Closing it would require writing `Exited` before `reaped`, which
+    // trades a cosmetic mis-grade for a real recycled-pid-signal hazard — not a
+    // good trade, so the window stays.
     let pre_shutdown = backend.status();
 
     if cancelled {
@@ -449,7 +456,7 @@ async fn supervise(task: &AgentTask) {
         Lifecycle::Exited(Some(0)) | Lifecycle::Exited(None) => AgentStatus::Done,
         Lifecycle::Exited(Some(_)) => AgentStatus::Failed,
     };
-    crate::session::mutate_and_persist(&task.store, |store| {
+    crate::session::mutate_and_persist(&task.store, &task.events, |store| {
         store.set_status(&task.issue, status);
     })
     .await;

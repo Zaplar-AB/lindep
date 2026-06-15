@@ -44,8 +44,16 @@ impl Client {
     pub fn new(api_key: String) -> Self {
         // Don't treat non-2xx as a transport error — Linear returns HTTP 400
         // with a descriptive GraphQL `errors` body we want to surface.
+        //
+        // Bound every call so a stalled connection (dead network, a hung proxy,
+        // a half-open socket) surfaces as a `Result::Err` the caller can report
+        // instead of hanging the synchronous fetch — and with it the whole
+        // cockpit launch — forever. `timeout_global` caps each request/response
+        // cycle (we issue one per page), `timeout_connect` the dial phase.
         let agent = ureq::config::Config::builder()
             .http_status_as_error(false)
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .timeout_connect(Some(std::time::Duration::from_secs(10)))
             .build()
             .new_agent();
         Client { agent, api_key }
@@ -295,21 +303,35 @@ fn resolve_in(projects: &[ProjectRef], name: &str) -> Result<ProjectRef, String>
     }
 }
 
+/// Strip control characters from a one-line display string sourced from Linear.
+/// Titles and names are rendered into single-line TUI rows, where an embedded
+/// control byte (a stray `\n`/`\t`, or an ESC sequence) would break the layout or
+/// reach the terminal — and `truncate`'s width-based early-return can pass such a
+/// string through untouched — so they're cleaned once, here at the trust boundary.
+fn sanitize_oneline(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// Turn raw issues + relations into a finalized [`Graph`].
 fn build_graph(project_name: &str, raw: Vec<RawIssue>) -> Graph {
-    let mut graph = Graph::new(project_name);
+    let mut graph = Graph::new(sanitize_oneline(project_name));
 
     for ri in &raw {
         graph.add_issue(Issue {
             key: ri.identifier.clone(),
-            title: ri.title.clone(),
+            title: sanitize_oneline(&ri.title),
             status: ri
                 .state
                 .as_ref()
                 .map(|s| Status::from_type(&s.kind))
                 .unwrap_or(Status::Unknown),
             priority: Priority::from_value(ri.priority.unwrap_or(0.0)),
-            assignee: ri.assignee.as_ref().map(|a| a.display_name.clone()),
+            assignee: ri
+                .assignee
+                .as_ref()
+                .map(|a| sanitize_oneline(&a.display_name)),
             external: false,
         });
     }
@@ -322,7 +344,7 @@ fn build_graph(project_name: &str, raw: Vec<RawIssue>) -> Graph {
             if rel.kind == "blocks"
                 && let Some(target) = &rel.other
             {
-                graph.ensure_external(&target.identifier, &target.title);
+                graph.ensure_external(&target.identifier, &sanitize_oneline(&target.title));
                 graph.add_edge(&ri.identifier, &target.identifier);
             }
         }
@@ -330,7 +352,7 @@ fn build_graph(project_name: &str, raw: Vec<RawIssue>) -> Graph {
             if inv.kind == "blocks"
                 && let Some(source) = &inv.other
             {
-                graph.ensure_external(&source.identifier, &source.title);
+                graph.ensure_external(&source.identifier, &sanitize_oneline(&source.title));
                 graph.add_edge(&source.identifier, &ri.identifier);
             }
         }
@@ -595,5 +617,44 @@ mod tests {
         // NOT page (which would `after: null` → re-fetch page 1 and duplicate
         // every relation). Returning None leaves the inline page as-is.
         assert_eq!(page_cursor(&page_info(true, None), "ENG-1"), None);
+    }
+
+    #[test]
+    fn titles_and_names_are_stripped_of_control_chars_at_ingest() {
+        // A title/name/project with an embedded newline, tab or ESC must not
+        // reach the single-line TUI rows intact — `truncate`'s width-based
+        // early-return would pass it straight through and corrupt the layout (or
+        // smuggle an escape sequence to the terminal). Sanitized once at ingest.
+        let g = build_graph(
+            "proj\twith\ttabs",
+            issues(json!([
+                {
+                    "identifier": "A", "title": "line1\nline2\tcol\x1b[2Jx", "priority": null,
+                    "state": null, "assignee": { "displayName": "na\nme" },
+                    "relations": empty_rel(),
+                    "inverseRelations": { "nodes": [
+                        { "type": "blocks", "issue": { "identifier": "INFRA-9", "title": "ext\nernal" } }
+                    ], "pageInfo": { "hasNextPage": false, "endCursor": null } }
+                }
+            ])),
+        );
+        let issue = g.get("A").unwrap();
+        assert_eq!(
+            issue.title, "line1 line2 col [2Jx",
+            "controls become spaces"
+        );
+        assert_eq!(issue.assignee.as_deref(), Some("na me"));
+        assert!(
+            !g.get("INFRA-9")
+                .unwrap()
+                .title
+                .chars()
+                .any(char::is_control),
+            "external endpoint titles are sanitized too"
+        );
+        assert!(
+            !g.project.chars().any(char::is_control),
+            "the project name (rendered in the header) is sanitized"
+        );
     }
 }

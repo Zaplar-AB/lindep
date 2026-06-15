@@ -269,9 +269,9 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
             // frequent surface-only hooks never touch the disk.
             let snapshot = if dirty {
                 store
-                    .snapshot_bytes()
+                    .snapshot_with_seq()
                     .ok()
-                    .map(|b| (store.path().to_path_buf(), b))
+                    .map(|(b, seq)| (store.path().to_path_buf(), b, seq))
             } else {
                 None
             };
@@ -280,9 +280,8 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
         Err(_) => return,
     };
 
-    if let Some((path, bytes)) = snapshot {
-        let _ =
-            tokio::task::spawn_blocking(move || SessionStore::write_snapshot(&path, &bytes)).await;
+    if let Some((path, bytes, seq)) = snapshot {
+        crate::session::persist_snapshot(events, path, bytes, seq).await;
     }
 
     let event = match (issue, event_name) {
@@ -754,6 +753,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(got.unwrap_or_default().contains("unmapped"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_without_a_session_id_routes_by_cwd_worktree() {
+        // The documented fallback in `resolve_issue`: when a hook carries no
+        // usable `session_id`, the `cwd` (the agent's worktree) maps it to an
+        // issue. Every other test wins on `session_id`, so this is the only thing
+        // exercising the cwd arm end to end.
+        let (tx, mut rx) = crate::event::channel();
+        let store = seeded_store();
+        let Endpoint { port, token } = serve(tx, store).await.unwrap();
+
+        // No `session_id` at all → resolution must fall back to cwd = /wt/ENG-2.
+        let body = json!({
+            "cwd": "/wt/ENG-2",
+            "hook_event_name": "Notification", "notification_type": "permission_prompt"
+        })
+        .to_string();
+        post_hook(port, &token, body.as_bytes()).unwrap();
+        let got = drain(&mut rx).await;
+        assert!(
+            got.iter().any(|ev| matches!(
+                ev,
+                AppEvent::AgentNeedsYou { issue, .. } if issue == "ENG-2"
+            )),
+            "a hook with only a cwd routes via the worktree fallback; got {got:?}"
+        );
+
+        // A cwd matching no worktree (and still no session_id) resolves to the
+        // unmapped-session notification — the negative arm of the same fallback.
+        let unmapped = json!({ "cwd": "/nope", "hook_event_name": "Notification" }).to_string();
+        post_hook(port, &token, unmapped.as_bytes()).unwrap();
+        let got = drain(&mut rx).await;
+        assert!(
+            got.iter()
+                .any(|ev| matches!(ev, AppEvent::Notification(t) if t.contains("unmapped"))),
+            "an unmatched cwd surfaces the unmapped-session notification; got {got:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

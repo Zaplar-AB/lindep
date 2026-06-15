@@ -161,6 +161,15 @@ pub struct App {
     /// acknowledged by an `AgentSpawned` or rejected by a `Notification`). Lets
     /// the cockpit refuse a double-press before the fleet entry materializes.
     pending_launch: HashSet<String>,
+    /// Issues the supervisor has fully reaped (`AgentReaped`) this session — a
+    /// tombstone. The agent's hook forwarder is a separate, slower path, so a
+    /// final `Notification`/`Stop`/`PostToolUse` hook can land *after* the reap;
+    /// without this, that late hook would re-insert a live status for an agent
+    /// with no backend, inflating the live count and re-arming the sticky alert
+    /// with nothing left to clear it. A real relaunch clears the tombstone via
+    /// `AgentSpawned`, so it never blocks a fresh agent. (Rehydration at startup
+    /// seeds the fleet *before* anything is reaped, so it is unaffected.)
+    reaped: HashSet<String>,
 
     /// Per-issue agent status, driven by the supervisor + notification bus.
     /// Absence of an entry means "no agent" — the fleet view's resting state.
@@ -243,6 +252,7 @@ impl App {
             status_msg: None,
             needs_you_alert: false,
             pending_launch: HashSet::new(),
+            reaped: HashSet::new(),
             fleet: HashMap::new(),
             backends: HashMap::new(),
             attached: None,
@@ -717,6 +727,9 @@ impl App {
             }
             AppEvent::AgentSpawned { issue, backend } => {
                 self.pending_launch.remove(&issue);
+                // A real relaunch revives the issue — clear any reaped tombstone
+                // so this generation's hooks are honoured again.
+                self.reaped.remove(&issue);
                 self.fleet.insert(issue.clone(), AgentStatus::Spawning);
                 self.backends.insert(issue.clone(), backend);
                 self.flash
@@ -763,7 +776,10 @@ impl App {
             AppEvent::AgentNeedsYou { issue, reason } => {
                 // Ignore a hook that arrives after the agent was torn down — it
                 // must not resurrect a terminated node and re-inflate the count.
-                if self.is_terminal(&issue) {
+                // `is_terminal` covers the pre-reap window (a terminal entry still
+                // lingers); `reaped` covers the post-reap window (the entry is
+                // already gone). Together they span the whole post-mortem.
+                if self.is_terminal(&issue) || self.reaped.contains(&issue) {
                     return false;
                 }
                 self.fleet.insert(issue.clone(), AgentStatus::NeedsYou);
@@ -772,6 +788,14 @@ impl App {
                 true
             }
             AppEvent::AgentStatusChanged { issue, status } => {
+                // A reaped agent is gone for good — the supervisor sends its
+                // terminal verdict *before* the reap, so any AgentStatusChanged
+                // arriving after the tombstone is a late hook (e.g. a Stop's Idle)
+                // and must not revive the node. A relaunch clears the tombstone
+                // via AgentSpawned first, so this never blocks a fresh agent.
+                if self.reaped.contains(&issue) {
+                    return false;
+                }
                 // The supervisor's terminal verdict (Stopped/Done/Failed) is
                 // final: a late *live* status from a racing hook (e.g. a Stop
                 // hook's Idle) must not un-terminate the node. A fresh launch
@@ -795,8 +819,11 @@ impl App {
                 true
             }
             AppEvent::AgentAction { issue, action } => {
-                if self.is_terminal(&issue) {
-                    return false; // stale tool-use hook after teardown
+                // Stale tool-use hook after teardown — drop it whether the
+                // terminal entry still lingers (is_terminal) or the agent has
+                // already been reaped away entirely (reaped tombstone).
+                if self.is_terminal(&issue) || self.reaped.contains(&issue) {
+                    return false;
                 }
                 // Hook-bus PostToolUse chatter must not clobber a pending NeedsYou
                 // the human still has to act on (a queued PostToolUse can arrive
@@ -816,6 +843,11 @@ impl App {
                 // mirrors the supervisor. Keep the backend handle while attached
                 // (reading its final screen) or pinned (so its EXITED card stays
                 // on the wall until you unpin it); otherwise reclaim it.
+                //
+                // Tombstone the issue so a hook that raced in behind the reap
+                // (the forwarder is a separate, slower path) can't re-create a
+                // live entry for an agent that no longer exists.
+                self.reaped.insert(issue.clone());
                 self.fleet.remove(&issue);
                 self.preview_size.remove(&issue);
                 let keep = self.attached.as_deref() == Some(issue.as_str())
@@ -954,6 +986,17 @@ impl App {
             _ => panes.truncate(MAX_CHAT_PANES),
         }
         panes
+    }
+
+    /// Allocation-free predicate for "is there any chat pane to show" — mirrors
+    /// [`App::chat_panes`] membership (a pinned issue with a backend, or the live
+    /// current selection) without materialising the `Vec`. Hot path: the render
+    /// loop calls it every poll tick to pick the chat-wall poll cadence.
+    pub fn has_chat_panes(&self) -> bool {
+        self.pinned.iter().any(|k| self.backends.contains_key(k))
+            || self
+                .focused_issue()
+                .is_some_and(|i| self.backends.contains_key(&i.key))
     }
 
     /// Whether `issue`'s live screen is on screen right now — attached, or shown
@@ -1127,12 +1170,11 @@ impl App {
         if let Some(leader) = self.pending_leader.take() {
             if self.keymap.detach_completes(leader, key) {
                 self.detach();
-            } else if self.keymap.same_chord(leader, key) {
-                // Leader pressed twice — send a single leader chord to the agent,
-                // so a chosen leader is never wholly unreachable.
-                self.forward_to_agent(key);
             } else {
-                // Not a completion: the leader was a no-op; forward this key.
+                // The leader was a no-op — including a double-tap, where `key` is
+                // the leader itself, so forwarding it sends a single leader chord
+                // through (a chosen leader is never wholly unreachable). The
+                // consumed leader keypress is intentionally not re-sent.
                 self.forward_to_agent(key);
             }
             return;
@@ -1834,6 +1876,67 @@ mod tests {
             backend: fake as Arc<dyn AgentBackend>,
         });
         assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Spawning));
+    }
+
+    #[test]
+    fn a_late_hook_cannot_resurrect_a_reaped_agent() {
+        // The post-reap window the terminal guard alone misses: once AgentReaped
+        // has removed the fleet entry, `is_terminal` is false (no entry), so a
+        // final hook forwarded by the dying agent must be stopped by the reaped
+        // tombstone instead — or it would re-create a live, backend-less node,
+        // inflating the count and re-arming a sticky alert nothing can clear.
+        let mut app = app();
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.apply_event(AppEvent::AgentSpawned {
+            issue: "ZAP-204".into(),
+            backend: fake as Arc<dyn AgentBackend>,
+        });
+        app.apply_event(AppEvent::AgentStatusChanged {
+            issue: "ZAP-204".into(),
+            status: AgentStatus::Done,
+        });
+        app.apply_event(AppEvent::AgentReaped {
+            issue: "ZAP-204".into(),
+        });
+        assert!(
+            !app.fleet.contains_key("ZAP-204"),
+            "the reaped agent is gone"
+        );
+        assert_eq!(app.fleet_summary(), (0, 0));
+
+        // All three late hook events for the reaped agent are ignored: no
+        // repaint, no resurrected entry, no sticky alert.
+        assert!(!app.apply_event(AppEvent::AgentNeedsYou {
+            issue: "ZAP-204".into(),
+            reason: "late prompt".into(),
+        }));
+        assert!(!app.apply_event(AppEvent::AgentAction {
+            issue: "ZAP-204".into(),
+            action: "ran grep".into(),
+        }));
+        assert!(!app.apply_event(AppEvent::AgentStatusChanged {
+            issue: "ZAP-204".into(),
+            status: AgentStatus::Idle,
+        }));
+        assert!(
+            !app.fleet.contains_key("ZAP-204"),
+            "no late hook revived the reaped agent"
+        );
+        assert_eq!(app.fleet_summary(), (0, 0), "live count stays zero");
+        assert!(!app.needs_you_alert, "no phantom sticky needs-you alert");
+
+        // A genuine relaunch clears the tombstone, so the new generation's hooks
+        // work again.
+        let fake2 = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.apply_event(AppEvent::AgentSpawned {
+            issue: "ZAP-204".into(),
+            backend: fake2 as Arc<dyn AgentBackend>,
+        });
+        assert!(app.apply_event(AppEvent::AgentNeedsYou {
+            issue: "ZAP-204".into(),
+            reason: "real prompt".into(),
+        }));
+        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::NeedsYou));
     }
 
     #[test]

@@ -489,7 +489,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
         // busy-repaints.
         let chats_live = app.right_view == app::RightView::Chat
             && app.mode == app::Mode::Lens
-            && !app.chat_panes().is_empty();
+            && app.has_chat_panes();
         let timeout = if app.attached.is_some() || chats_live {
             Duration::from_millis(16)
         } else if app.is_animating() {
