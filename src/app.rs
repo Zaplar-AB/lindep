@@ -183,6 +183,11 @@ pub struct App {
     /// second prefix, forwarded to a focused agent as the literal chord). The v3
     /// generalisation of v2's single `pending_leader` detach gesture.
     pub prefix_armed: bool,
+    /// Latched command mode (`Ctrl-a .`): while `true`, keys resolve as window
+    /// verbs *without* the prefix, until Esc or the prefix exits. The one-shot
+    /// `prefix key` rhythm stays available; this only removes the repeats for a run
+    /// of verbs.
+    pub command_mode: bool,
     /// The issue whose agent a `Ctrl-a x` kill is awaiting confirmation for. While
     /// `Some`, the next key confirms (`y`/Enter) or cancels — kill is destructive,
     /// so it's never a single keystroke.
@@ -270,6 +275,7 @@ impl App {
             frame: 0,
             flash: HashMap::new(),
             prefix_armed: false,
+            command_mode: false,
             kill_confirm: None,
             resuming: HashMap::new(),
             resume_cap: 0,
@@ -291,7 +297,20 @@ impl App {
     /// The issue the detail bar / summary overlay describes: the focused coin's
     /// issue, else the Spine selection. `None` only when nothing is selected.
     pub fn detail_key(&self) -> Option<&str> {
-        match self.windows.focused().issue() {
+        let w = self.windows.focused();
+        // A coin on its deps face describes the issue its cursor is *currently*
+        // rooted at — re-rooting explores other issues — not the coin's fixed
+        // identity, so the detail bar follows deps navigation. Chat coins describe
+        // their own identity; the Spine/Fleet fall back to the selection.
+        if let WindowKind::Coin {
+            mode: CoinMode::Deps,
+            ..
+        } = &w.kind
+            && let Some(cursor) = w.deps.as_ref()
+        {
+            return Some(cursor.root.as_str());
+        }
+        match w.issue() {
             Some(i) => Some(i),
             None if !self.root.is_empty() => Some(self.root.as_str()),
             None => None,
@@ -400,6 +419,15 @@ impl App {
             return;
         }
 
+        // 3. Latched command mode: keys are window verbs directly (no prefix), so a
+        //    run of focus/pin/zoom/… needs no repeats. Esc or the prefix exits.
+        //    After kill_confirm so a confirm still wins; before the prefix-arm so the
+        //    prefix toggles the latch off rather than arming a one-shot inside it.
+        if self.command_mode {
+            self.on_command_mode_key(key);
+            return;
+        }
+
         // 3. The prefix arms; the next key resolves it.
         if self.keymap.is_prefix(key) {
             self.prefix_armed = true;
@@ -498,6 +526,20 @@ impl App {
         self.dispatch_verb(verb);
     }
 
+    /// Resolve a key while latched in command mode: Esc or the prefix chord exits;
+    /// any bound window verb fires and keeps the latch (so a run of verbs needs no
+    /// repeats); unbound keys are harmless no-ops.
+    fn on_command_mode_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc || self.keymap.is_prefix(key) {
+            self.command_mode = false;
+            self.set_footer("command mode off".to_string());
+            return;
+        }
+        if let Some(verb) = self.keymap.verb_for(key) {
+            self.dispatch_verb(verb);
+        }
+    }
+
     /// Run a window-manager verb (always reached behind the prefix).
     fn dispatch_verb(&mut self, verb: Action) {
         match verb {
@@ -518,6 +560,10 @@ impl App {
             Action::LayoutToggle => self.toggle_layout(),
             Action::AttachOrSpawn => self.button(),
             Action::Quit => self.should_quit = true,
+            Action::CommandMode => {
+                self.command_mode = true;
+                self.set_footer("command mode — keys are verbs · Esc or the prefix exits".into());
+            }
             Action::StartSearch => {
                 self.windows.focus = 0;
                 self.start_search();
@@ -582,6 +628,27 @@ impl App {
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ToggleSummary => self.show_summary = !self.show_summary,
             _ => {}
+        }
+        // The transient preview follows the selection both ways: re-rooting its
+        // deps tree (Enter dives in, Back pops out) re-aims the Spine so the nav
+        // list tracks where you are — fixing "the nav bar stays on the previous
+        // issue". A pinned coin is an independent explorer; it never moves the
+        // Spine. The cursor (and its Back history) is left intact either way.
+        if matches!(action, Action::Enter | Action::Back) && self.windows.focused().is_preview() {
+            self.sync_spine_to_focused_deps();
+        }
+    }
+
+    /// Re-aim the Spine selection onto the focused coin's current deps-cursor root,
+    /// so navigating the preview's dependency tree drags the nav-list highlight
+    /// with it. Only the selection moves — the cursor and its history stay put, so
+    /// in-place re-root / Back still work.
+    fn sync_spine_to_focused_deps(&mut self) {
+        if let Some(root) = self.windows.focused().deps.as_ref().map(|c| c.root.clone())
+            && root != self.root
+        {
+            self.root = root;
+            self.sync_list_selection();
         }
     }
 
@@ -764,7 +831,10 @@ impl App {
         // so the press registers; `AgentSpawned` fills in the backend.
         match self.supervisor.clone() {
             Some(supervisor) => {
-                supervisor.launch(key.clone(), title);
+                // Spawn the PTY at the tile we'll render it in, so claude's first
+                // paint already fits (no full-width reflow flash beside a pin).
+                let size = self.agent_spawn_size();
+                supervisor.launch(key.clone(), title, size);
                 self.pending_launch.insert(key.clone());
                 self.pending_attach = Some(key.clone());
                 self.open_agent_window(&key);
@@ -885,7 +955,15 @@ impl App {
     /// and separate from close, so it's never a single keystroke.
     fn arm_kill(&mut self) {
         // A coin carries its agent on either face, so kill works from chat or deps.
-        let Some(issue) = self.windows.focused().issue().map(str::to_string) else {
+        // From the Spine/roster (no agent window focused) it targets the selected
+        // issue, so you can stop an agent straight from the navbar.
+        let issue = self
+            .windows
+            .focused()
+            .issue()
+            .map(str::to_string)
+            .or_else(|| (!self.root.is_empty()).then(|| self.root.clone()));
+        let Some(issue) = issue else {
             self.status_msg = Some("no agent here to kill — Ctrl-a w closes a window".into());
             return;
         };
@@ -993,6 +1071,63 @@ impl App {
             LayoutMode::Mosaic => layout::mosaic_visible(n, idx, w),
             LayoutMode::Rail => layout::rail_visible(n, focus, active, idx, w),
         }
+    }
+
+    /// The inner PTY size window `idx` occupies in the current strip layout, so a
+    /// (re)spawned agent's PTY can be created at its real tile size and claude's
+    /// first paint already fits — instead of painting at the full-terminal width
+    /// and only reflowing once it processes the SIGWINCH (the stale, wrong-sized
+    /// frame seen when a chat is opened beside a pinned coin). `None` when the
+    /// window isn't placed (off-screen, or no viewport yet). Mirrors the layout
+    /// branches in [`Self::is_index_visible`].
+    fn window_pane_size(&self, idx: usize) -> Option<(u16, u16)> {
+        let area = self.viewport;
+        if area.area() == 0 || idx >= self.windows.windows.len() {
+            return None;
+        }
+        let n = self.windows.windows.len();
+        let focus = self.windows.focus;
+        let active = self.active_index();
+        let rect = if self.windows.zoomed {
+            // Zoom fills the viewport with the single big pane; only it is placed.
+            (layout::rail_big_index(n, focus, active) == Some(idx)).then_some(area)
+        } else {
+            match self.windows.layout {
+                LayoutMode::Mosaic => layout::mosaic(area, n)
+                    .into_iter()
+                    .find(|p| p.index == idx)
+                    .map(|p| p.rect),
+                LayoutMode::Rail => {
+                    let (full, _) =
+                        layout::rail(area, n, focus, active, self.windows.preview_index());
+                    full.into_iter().find(|p| p.index == idx).map(|p| p.rect)
+                }
+            }
+        }?;
+        // Subtract the window block's 1-cell border to get the PTY's inner size.
+        Some((
+            rect.height.saturating_sub(2).max(1),
+            rect.width.saturating_sub(2).max(1),
+        ))
+    }
+
+    /// The size to spawn a freshly-opened agent's PTY at: the pane its host window
+    /// (the selection's pinned coin, else the preview) currently occupies, or —
+    /// before any such window exists — the lone tile right of the Spine. See
+    /// [`Self::window_pane_size`] for why this matters.
+    fn agent_spawn_size(&self) -> Option<(u16, u16)> {
+        if let Some(size) = self.active_index().and_then(|i| self.window_pane_size(i)) {
+            return Some(size);
+        }
+        let area = self.viewport;
+        if area.area() == 0 {
+            return None;
+        }
+        let cols = area.width.saturating_sub(layout::SPINE_WIDTH);
+        Some((
+            area.height.saturating_sub(2).max(1),
+            cols.saturating_sub(2).max(1),
+        ))
     }
 
     /// Whether `issue`'s live screen is on screen — gates the AgentOutput repaint
@@ -1223,7 +1358,13 @@ impl App {
             .get(issue)
             .map(|i| i.title.clone())
             .unwrap_or_else(|| issue.to_string());
-        supervisor.launch(issue.to_string(), title);
+        // Resume into the docked window's current tile, so the resumed screen
+        // fits on its first paint rather than reflowing from the full width.
+        let size = self
+            .windows
+            .pinned_coin_index(issue)
+            .and_then(|i| self.window_pane_size(i));
+        supervisor.launch(issue.to_string(), title, size);
         self.pending_launch.insert(issue.to_string());
         // Each resume carries its own grace deadline, so a wedged spawn self-
         // clears here (in `tick_frame`) without later resumes pushing it out —
@@ -1404,9 +1545,13 @@ impl App {
     }
 
     /// Test seam: mark `issue` as mid-resume. Production arms this through
-    /// `resume_one`, which needs a live supervisor.
+    /// `resume_one`, which needs a live supervisor. Mirrors `resume_one`
+    /// faithfully by arming BOTH the `pending_launch` guard and the `resuming`
+    /// spinner deadline — earlier this set only `resuming`, which masked the
+    /// wedged-resume bug where the guard was never released.
     #[cfg(test)]
     pub fn mark_resuming_for_test(&mut self, issue: &str) {
+        self.pending_launch.insert(issue.to_string());
         self.resuming
             .insert(issue.to_string(), self.frame + RESUME_GRACE_FRAMES);
     }
@@ -1420,7 +1565,24 @@ impl App {
         self.flash.retain(|_, &mut (_, until)| now < until);
         // Drop each wedged resume on its own grace bound, so a stuck spawn can't
         // pin the loop awake — independently of how many other resumes arrive.
+        // Also release the matching `pending_launch` guard `resume_one` armed: a
+        // wedged spawn (a hung worktree add that never emits AgentSpawned or a
+        // setup-failure Notification) would otherwise strand the docked card
+        // behind a guard that `maybe_resume_focused`/`resume_one` early-return on
+        // forever — it could never be revived once a slot frees. A normal spawn
+        // still clears both via AgentSpawned; this only fires for entries that
+        // outlived their grace. (A button launch arms no `resuming` entry, so its
+        // own `pending_launch` is untouched.)
+        let expired: Vec<String> = self
+            .resuming
+            .iter()
+            .filter(|&(_, &deadline)| now >= deadline)
+            .map(|(issue, _)| issue.clone())
+            .collect();
         self.resuming.retain(|_, &mut deadline| now < deadline);
+        for issue in expired {
+            self.pending_launch.remove(&issue);
+        }
     }
 
     // ── Agents roster (the Spine's "AGENTS" tab) ────────────────────────────────
@@ -1429,14 +1591,26 @@ impl App {
     /// needs-you first, then live work, then idle, then the terminal states that
     /// linger until reaped. Ties break on the natural issue id.
     pub fn agent_order(&self) -> Vec<String> {
-        let mut agents: Vec<(&String, AgentStatus)> =
-            self.fleet.iter().map(|(k, s)| (k, *s)).collect();
-        agents.sort_by(|(ka, sa), (kb, sb)| {
-            sa.salience_rank()
-                .cmp(&sb.salience_rank())
-                .then_with(|| natural_key_cmp(ka, kb))
-        });
-        agents.into_iter().map(|(k, _)| k.clone()).collect()
+        // Every issue with a fleet entry (live, or a terminal one lingering until
+        // reaped), plus any *pinned* coin without one — so an agent you've docked
+        // stays reachable from the roster even after it was killed/reaped (it used
+        // to vanish, leaving "no issue"). Sorted by salience (needs-you first …
+        // terminal last); pinned-only coins rank past them all.
+        let mut agents: Vec<(String, u8)> = self
+            .fleet
+            .iter()
+            .map(|(k, s)| (k.clone(), s.salience_rank()))
+            .collect();
+        for w in &self.windows.windows {
+            if w.pinned
+                && let Some(issue) = w.issue()
+                && !self.fleet.contains_key(issue)
+            {
+                agents.push((issue.to_string(), u8::MAX));
+            }
+        }
+        agents.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| natural_key_cmp(&a.0, &b.0)));
+        agents.into_iter().map(|(k, _)| k).collect()
     }
 
     /// Step the roster cursor by `delta` (wrapping) and re-aim the selection at
@@ -1460,8 +1634,16 @@ impl App {
             LeftView::Issues => LeftView::Agents,
             LeftView::Agents => LeftView::Issues,
         };
-        if self.left_view == LeftView::Agents && self.fleet.is_empty() {
-            self.status_msg = Some("no agents yet — Enter on an issue to open one".into());
+        if self.left_view == LeftView::Agents {
+            let roster = self.agent_order();
+            if roster.is_empty() {
+                self.status_msg = Some("no agents yet — Enter on an issue to open one".into());
+            } else if !roster.contains(&self.root) {
+                // Land on a real agent so the detail bar + button reflect it,
+                // instead of whatever non-agent issue the Issues view had selected
+                // (which read as "no issue" against the roster).
+                self.aim_spine(roster[0].clone());
+            }
         }
     }
 
@@ -1484,13 +1666,21 @@ impl App {
 
     /// Jump to the next issue whose agent needs you, in display order, wrapping.
     fn jump_to_needs_you(&mut self) {
-        let members: Vec<String> = self
-            .graph
-            .keys()
+        // Source targets from the fleet — the same set the header counts and the
+        // roster shows — not from graph.keys(). An agent can be in the fleet yet
+        // absent from the graph (e.g. a worktree-backed session for an issue
+        // archived/moved out of Linear between runs survives reconcile but isn't
+        // in the freshly fetched graph); graph-bounding here made the header
+        // advertise "N needs you" for an agent this jump could never reach. Stable
+        // natural-id order so the wrapping cursor is deterministic (the roster
+        // sorts the same way; raw HashMap order isn't stable).
+        let mut members: Vec<String> = self
+            .fleet
             .iter()
-            .filter(|k| self.fleet.get(*k).is_some_and(AgentStatus::needs_you))
-            .cloned()
+            .filter(|(_, s)| s.needs_you())
+            .map(|(k, _)| k.clone())
             .collect();
+        members.sort_by(|a, b| natural_key_cmp(a, b));
         if members.is_empty() {
             self.status_msg = Some("no agents need you right now".into());
             return;
@@ -1652,6 +1842,30 @@ mod tests {
         app.backends
             .insert(key.into(), fake.clone() as Arc<dyn AgentBackend>);
         fake
+    }
+
+    // ── Spawn sizing (point F: no full-width reflow flash) ───────────────────
+
+    #[test]
+    fn a_lone_agent_spawns_at_the_full_pane_width() {
+        // One non-spine window in a 200×40 viewport: its tile is the 156 cols right
+        // of the 44-col Spine, less the 1-cell window border → 154×38 inner.
+        assert_eq!(app().agent_spawn_size(), Some((38, 154)));
+    }
+
+    #[test]
+    fn an_agent_beside_a_pin_spawns_at_the_two_up_tile() {
+        // A pinned coin + the live preview tile side by side (mosaic), so a chat
+        // opened here must spawn at the 78-col half-tile (inner 76×38), not the
+        // full terminal width — otherwise claude paints wide and only reflows once
+        // it processes the SIGWINCH (the "doesn't resize beside a pin" flash).
+        let mut a = app();
+        a.windows.focus_preview();
+        a.windows.pin_preview(); // graduate the preview → a permanent coin
+        a.windows
+            .ensure_preview("ZAP-205", CoinMode::Chat, &a.graph);
+        a.aim_spine("ZAP-205".into());
+        assert_eq!(a.agent_spawn_size(), Some((38, 76)));
     }
 
     // ── The spine ──────────────────────────────────────────────────────────
@@ -2073,6 +2287,109 @@ mod tests {
     }
 
     #[test]
+    fn entering_a_dep_in_the_preview_moves_the_nav_selection() {
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('l')); // focus the deps preview (roots at ZAP-204)
+        assert_eq!(app.root, "ZAP-204");
+        let target = app.windows.focused().deps.as_ref().unwrap().up_rows[0]
+            .key
+            .clone();
+        press(&mut app, KeyCode::Enter); // dive into the first blocker
+        assert_eq!(
+            app.root, target,
+            "the nav selection follows the entered dep"
+        );
+    }
+
+    #[test]
+    fn the_detail_bar_follows_the_focused_deps_cursor() {
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('l')); // focus the deps preview
+        let target = app.windows.focused().deps.as_ref().unwrap().up_rows[0]
+            .key
+            .clone();
+        press(&mut app, KeyCode::Enter); // re-root the cursor onto the blocker
+        assert_eq!(app.detail_key(), Some(target.as_str()));
+    }
+
+    #[test]
+    fn a_pinned_deps_coin_explores_without_moving_the_nav() {
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('l')); // focus the preview deps
+        verb(&mut app, KeyCode::Char('p')); // pin it → an independent coin, still focused
+        let before = app.root.clone();
+        let target = app.windows.focused().deps.as_ref().unwrap().up_rows[0]
+            .key
+            .clone();
+        assert_ne!(target, before, "the blocker differs from the selection");
+        press(&mut app, KeyCode::Enter); // re-root the pinned coin's tree
+        assert_eq!(
+            app.windows.focused().deps.as_ref().unwrap().root,
+            target,
+            "the pinned coin re-roots in place"
+        );
+        assert_eq!(
+            app.root, before,
+            "but the Spine stays put — pinned coins are independent"
+        );
+    }
+
+    #[test]
+    fn command_mode_latches_so_verbs_need_no_prefix() {
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('.')); // Ctrl-a . → latch command mode
+        assert!(app.command_mode);
+        let before = app.windows.focus;
+        press(&mut app, KeyCode::Char('l')); // a *bare* verb key → focus right
+        assert!(
+            app.windows.focus > before,
+            "a bare verb moved focus while latched"
+        );
+        assert!(app.command_mode, "a verb keeps the latch on");
+    }
+
+    #[test]
+    fn esc_exits_command_mode() {
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('.'));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.command_mode, "esc leaves command mode");
+    }
+
+    #[test]
+    fn the_one_shot_prefix_is_unchanged_by_command_mode() {
+        // A single `Ctrl-a l` still fires one verb and does NOT latch.
+        let mut app = app();
+        let before = app.windows.focus;
+        verb(&mut app, KeyCode::Char('l'));
+        assert!(app.windows.focus > before, "the one-shot verb still fires");
+        assert!(!app.command_mode, "a one-shot verb never latches");
+    }
+
+    #[test]
+    fn the_roster_lands_on_a_live_agent_and_kill_targets_it() {
+        let mut app = app();
+        app.fleet.insert("ZAP-210".into(), AgentStatus::Running);
+        // Switching to the roster from a non-agent selection lands on the agent…
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.root, "ZAP-210", "the roster lands on the live agent");
+        // …and Ctrl-a x from the navbar arms a kill of that selected agent.
+        verb(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.kill_confirm.as_deref(), Some("ZAP-210"));
+    }
+
+    #[test]
+    fn a_pinned_coin_is_reachable_from_the_roster_without_a_live_agent() {
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('l')); // focus the preview (deps on ZAP-204)
+        verb(&mut app, KeyCode::Char('p')); // pin it → a docked coin, no agent
+        assert!(
+            app.agent_order().contains(&"ZAP-204".to_string()),
+            "a pinned coin keeps its issue reachable from the roster"
+        );
+    }
+
+    #[test]
     fn open_fleet_opens_a_single_overview_window() {
         let mut app = app();
         press(&mut app, KeyCode::Char('g')); // open the fleet map
@@ -2347,6 +2664,30 @@ mod tests {
         assert!(
             app.is_animating(),
             "the loop stays awake for the live resume"
+        );
+    }
+
+    #[test]
+    fn a_wedged_resume_releases_its_pending_launch_guard_on_grace() {
+        // A resume that never spawns (a hung worktree add: no AgentSpawned and no
+        // setup-failure Notification) self-clears its spinner on grace but used to
+        // leave `pending_launch` set forever — so `maybe_resume_focused` and
+        // `resume_one` early-returned on it and the docked card could never be
+        // revived once a slot freed. The grace expiry must release the guard in
+        // lockstep with the spinner.
+        let mut app = app();
+        app.mark_resuming_for_test("WEDGED");
+        assert!(
+            app.pending_launch.contains("WEDGED"),
+            "resume arms the double-launch guard"
+        );
+        for _ in 0..=RESUME_GRACE_FRAMES {
+            app.tick_frame();
+        }
+        assert_eq!(app.resuming_count(), 0, "the spinner cleared on its grace");
+        assert!(
+            !app.pending_launch.contains("WEDGED"),
+            "the pending_launch guard was released, so the card can resume again"
         );
     }
 

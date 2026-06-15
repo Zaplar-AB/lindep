@@ -241,3 +241,63 @@ Implemented on top of §7 after hands-on use; all green (204 tests, clippy+fmt c
 `src/layout.rs` via `git checkout` (recovered from the session transcript). Future
 reviews must sandbox reviewers — read-only `Explore` agentType and/or
 `isolation: 'worktree'` — and `git status` should be checked after any review run.
+
+---
+
+## 9. v3.3 followups (dogfooding round 2, 2026-06-16)
+
+A second hands-on round (grill → recon via read-only `Explore` agents → fix), all
+green (**219 tests**, clippy `-D warnings`, fmt). Seven landed; two deferred to
+Linear (**ENG-471** general agent, **ENG-472** prune).
+
+1. **Status marker moved to the left gutter; `▎` bar dropped (#D).** Long issue
+   titles pushed the *existing* right-edge `agent_marker` off-screen, so the user
+   never saw it. `ui::issue_line` now renders the animated marker (spinner /
+   breathing flag / ✓) in the **fixed leftmost** gutter and drops the colored
+   `▎`. `agent_glyph` (its only caller gone) deleted; its monochrome-distinctness
+   test repointed to `agent_marker`, which gains a distinct **steady ◌ for
+   Spawning** so "starting" no longer looks like "working".
+
+2. **Completed issues grey out (#C).** `issue_line` dims the key + title
+   (`Modifier::DIM` + `MUTED`) when `Status::is_resolved()`; the status glyph stays
+   bright as the scannable done-marker. Co-designed with #D (same row).
+
+3. **No fake "working" on spawn (#E).** Dropped the eager `Spawning→Running` flip in
+   `supervisor::run_agent`; a fresh agent stays `Spawning` ("starting…") until a
+   real signal — `notify::route` promotes the **first `PostToolUse` → Running**,
+   `Stop → Idle`, a real prompt → `NeedsYou`. A wedged spawn honestly stays
+   "starting…". (`spawning_moves_to_running…` test rewritten to the new contract.)
+
+4. **"Needs you" false-positives killed (#I).** Claude's `Notification` hook fires
+   for six matcher types; lindep mapped *all* to `NeedsYou`. `route` now flags only
+   a genuine prompt: `notification_implies_needs_you` returns true for
+   `permission_prompt` / `elicitation_dialog`, false for `idle_prompt` /
+   `auth_success` / `elicitation_complete|response`; absent the (undocumented)
+   `notification_type` it falls back to **state** — escalate only from an active
+   status (`is_animating`), since the idle nudge only fires post-`Stop`. A
+   suppressed notification surfaces as a quiet `AgentAction`.
+
+5. **Spawn at the real tile size (#F).** Agents were spawned at the **full terminal**
+   width then resized to their tile, so claude painted wide and only reflowed on
+   SIGWINCH (the "doesn't resize beside a pin" flash). `SupervisorHandle::launch`
+   now takes `size: Option<(u16,u16)>` (via `Command::Launch`); `App::agent_spawn_size`
+   / `window_pane_size` compute the host window's inner pane from the live layout so
+   the PTY's first paint already fits. Resume re-spawns at the docked tile too.
+
+6. **Deps-select moves the nav (#H).** Entering a dep in the **preview** coin now
+   re-aims the Spine (`dispatch_deps` → `sync_spine_to_focused_deps`, cursor + Back
+   history kept intact); a **pinned** coin stays an independent explorer.
+   `detail_key` follows a focused deps coin's *current cursor root*, not its
+   identity, so the detail bar tracks deps navigation.
+
+7. **Roster reachability + kill from the navbar (#G + #J-partial).** `agent_order`
+   includes pinned coins with no fleet entry; `toggle_roster` lands the selection on
+   a real agent (fixes "no issue"). `arm_kill` falls back to the Spine selection, so
+   `Ctrl-a x` from the roster stops the selected agent (y/n confirm). Destructive
+   **prune** (forget session + worktree) deferred → **ENG-472**.
+
+8. **Latched command mode (#A).** "Hold `Ctrl-a`" is impossible in a terminal (no
+   key-release events). Instead `Ctrl-a .` (`Action::CommandMode`) latches
+   `App.command_mode`: keys resolve as window verbs without the prefix until Esc /
+   the prefix exits; the one-shot `prefix key` rhythm is untouched. Footer shows
+   `⌘ COMMAND`.

@@ -117,24 +117,6 @@ pub fn status_glyph(status: Status) -> (&'static str, Color) {
     }
 }
 
-/// Static glyph + colour for an agent's state (no animation). The salience
-/// order is deliberate: needs-you (amber) and failed (red) pull the eye hardest,
-/// working glows orange, spawning is quiet green, idle is calm teal, a stopped
-/// agent fades to graphite. Every state has a distinct glyph *shape* so the
-/// signal survives a monochrome terminal. The animated variants of these live
-/// in [`agent_marker`].
-pub fn agent_glyph(status: AgentStatus) -> (&'static str, Color) {
-    match status {
-        AgentStatus::Spawning => ("◌", GREEN_400),
-        AgentStatus::Running => ("▸", ORANGE_400),
-        AgentStatus::NeedsYou => ("⚑", AMBER_400),
-        AgentStatus::Idle => ("◦", STATUS_400),
-        AgentStatus::Stopped => ("◼", MUTED),
-        AgentStatus::Done => ("✓", STATUS_400),
-        AgentStatus::Failed => ("✗", RED_400),
-    }
-}
-
 /// Braille spinner frames — one single-width cell, so swapping frames never
 /// shifts a column. Eight frames at ~10 fps is a smooth, calm rotation.
 pub const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -156,14 +138,20 @@ pub fn needs_you_style(frame: u64) -> Style {
     }
 }
 
-/// Animated marker — glyph + full style — for an agent's state at `frame`. This
-/// is what the issue list, the overview chips and the chat-pane titles render so
-/// a *working* agent visibly spins and a *needs-you* agent visibly pulses. The
-/// terminal (resting) states are steady. Pure in `frame`, so the renderer stays
-/// a function of state (the frame counter lives on `App`).
+/// Marker — glyph + full style — for an agent's state at `frame`. This is the
+/// single status glyph the spine gutter, the overview chips and the chat-pane
+/// titles render: a *working* agent visibly spins, a *needs-you* agent pulses,
+/// *starting* shows a steady ◌, and the resting/terminal states are steady. Every
+/// state's glyph *shape* differs (not only its colour), so the signal survives a
+/// monochrome terminal — see `every_agent_state_has_a_distinct_marker_glyph`.
+/// Pure in `frame`, so the renderer stays a function of state (the frame counter
+/// lives on `App`).
 pub fn agent_marker(status: AgentStatus, frame: u64) -> (&'static str, Style) {
     match status {
-        AgentStatus::Spawning => (agent_spinner(frame), Style::new().fg(GREEN_400)),
+        // Starting: a steady dotted ring, distinct from Running's live spin, so a
+        // freshly-spawned agent reads as "starting" — it hasn't done anything yet
+        // — rather than "working".
+        AgentStatus::Spawning => ("◌", Style::new().fg(GREEN_400)),
         AgentStatus::Running => (
             agent_spinner(frame),
             Style::new().fg(ORANGE_400).add_modifier(Modifier::BOLD),
@@ -226,14 +214,16 @@ mod tests {
     ];
 
     #[test]
-    fn every_agent_state_has_a_distinct_static_glyph() {
+    fn every_agent_state_has_a_distinct_marker_glyph() {
         // Colour alone never carries the signal — each state must read in a
-        // monochrome terminal too, so the glyph shapes must all differ.
-        let glyphs: HashSet<&str> = ALL.iter().map(|s| agent_glyph(*s).0).collect();
+        // monochrome terminal too, so the marker glyph shapes must all differ. The
+        // spinner frame is fixed here; it's a braille char distinct from every
+        // steady glyph at any frame.
+        let glyphs: HashSet<&str> = ALL.iter().map(|s| agent_marker(*s, 0).0).collect();
         assert_eq!(
             glyphs.len(),
             ALL.len(),
-            "two states share a glyph: {glyphs:?}"
+            "two states share a marker glyph: {glyphs:?}"
         );
     }
 

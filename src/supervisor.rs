@@ -74,6 +74,12 @@ enum Command {
     Launch {
         issue: String,
         title: String,
+        /// The `(rows, cols)` the cockpit will render this agent's pane at, so the
+        /// PTY is created at its real tile size and claude's first paint already
+        /// fits — `None` falls back to the supervisor's configured size. Avoids the
+        /// stale full-width frame that lingers until claude processes the SIGWINCH
+        /// (worst when a chat is opened beside an already-pinned coin).
+        size: Option<(u16, u16)>,
     },
     Cancel {
         issue: String,
@@ -94,9 +100,12 @@ pub struct SupervisorHandle {
 }
 
 impl SupervisorHandle {
-    /// Launch an agent on `issue` (no-op if already running or at capacity).
-    pub fn launch(&self, issue: String, title: String) {
-        let _ = self.cmd_tx.send(Command::Launch { issue, title });
+    /// Launch an agent on `issue` (no-op if already running or at capacity). `size`
+    /// = `(rows, cols)` is the tile the cockpit will render the agent in, so the
+    /// PTY starts at its real size and claude's first paint already fits — no
+    /// reflow flash. `None` falls back to the supervisor's configured size.
+    pub fn launch(&self, issue: String, title: String, size: Option<(u16, u16)>) {
+        let _ = self.cmd_tx.send(Command::Launch { issue, title, size });
     }
     /// Stop a single agent, leaving the others running.
     pub fn cancel(&self, issue: String) {
@@ -176,7 +185,7 @@ impl Supervisor {
     async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                Command::Launch { issue, title } => self.launch(issue, title),
+                Command::Launch { issue, title, size } => self.launch(issue, title, size),
                 Command::Cancel { issue } => self.cancel(&issue),
                 Command::Reaped { issue, generation } => self.reap(&issue, generation),
                 // Stop receiving and fall through to teardown. Reaping is
@@ -200,7 +209,7 @@ impl Supervisor {
     /// Record an agent and hand its whole lifecycle to a tracked task. This is
     /// synchronous: the blocking worktree/spawn work happens inside the task, so
     /// a slow `git` never stalls cancel/shutdown of other agents.
-    fn launch(&mut self, issue: String, title: String) {
+    fn launch(&mut self, issue: String, title: String, size: Option<(u16, u16)>) {
         if let Some(record) = self.agents.get(&issue) {
             // A cancelled record lingers until its task confirms teardown; tell
             // the user it's still stopping rather than the misleading "already
@@ -246,8 +255,9 @@ impl Supervisor {
             hook_token: self.cfg.hook_token.clone(),
             hooks_dir: self.cfg.hooks_dir.clone(),
             base: self.cfg.base.clone(),
-            rows: self.cfg.rows,
-            cols: self.cfg.cols,
+            // The cockpit's pane size when it knows it, else the configured default.
+            rows: size.map_or(self.cfg.rows, |(r, _)| r.max(1)),
+            cols: size.map_or(self.cfg.cols, |(_, c)| c.max(1)),
             guardrails: self.cfg.guardrails.clone(),
             reap_tx: self.self_tx.clone(),
         };
@@ -356,14 +366,31 @@ async fn supervise(task: &AgentTask) {
     }
 
     // Hook settings so this agent's notifications find their way back to us.
+    // Written on the blocking pool: create_dir_all + open + write + chmod are
+    // blocking fs syscalls, and `.lindep` can be NFS-backed/contended/near-full.
+    // Parking one of the 2 async workers (see event.rs) on that would stall the
+    // supervisor command loop and the hook accept loop — the same reason the
+    // worktree create and the state persist above run off the workers.
     let settings = task.hooks_dir.join(format!("{}.settings.json", task.issue));
-    if let Err(e) = crate::notify::write_settings(
-        &settings,
-        &task.exe.to_string_lossy(),
-        task.hook_port,
-        &task.hook_token,
-    ) {
-        return notify(format!("hook settings for {} failed: {e}", task.issue));
+    let write = {
+        let settings = settings.clone();
+        let exe = task.exe.to_string_lossy().to_string();
+        let port = task.hook_port;
+        let hook_token = task.hook_token.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::notify::write_settings(&settings, &exe, port, &hook_token)
+        })
+        .await
+    };
+    match write {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return notify(format!("hook settings for {} failed: {e}", task.issue)),
+        Err(e) => {
+            return notify(format!(
+                "hook settings task for {} panicked: {e}",
+                task.issue
+            ));
+        }
     }
 
     // A `--resume` whose saved conversation has vanished ("No conversation found")
@@ -373,6 +400,15 @@ async fn supervise(task: &AgentTask) {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
+        // A cancel that landed during the async setup (state persist, hook
+        // settings write) or during a prior attempt's brief life must not fork a
+        // process. The bail above only covers the git window; this re-check
+        // covers every await since — and the missing-conversation retry's loop
+        // re-entry. run_agent still sends `Reaped` on this early return, so the
+        // issue stays relaunchable, exactly like the git-window bail.
+        if task.token.is_cancelled() {
+            return;
+        }
         let mut spawn_cfg = SpawnConfig::claude(
             &task.issue,
             worktree.path.clone(),
@@ -396,18 +432,13 @@ async fn supervise(task: &AgentTask) {
             backend: Arc::clone(&backend),
         });
 
-        // The process is up, so leave Spawning immediately — otherwise a healthy but
-        // quiet agent (thinking/streaming before its first PostToolUse) would show
-        // `◌ spawning` forever, indistinguishable from a wedged spawn. The hook bus
-        // refines this to NeedsYou/Idle once it has something to report.
-        crate::session::mutate_and_persist(&task.store, &task.events, |store| {
-            store.set_status(&task.issue, AgentStatus::Running);
-        })
-        .await;
-        let _ = task.events.send(AppEvent::AgentStatusChanged {
-            issue: task.issue.clone(),
-            status: AgentStatus::Running,
-        });
+        // The process is up but hasn't *done* anything yet, so it stays `Spawning`
+        // — rendered "starting…" (a steady ◌, not the working spinner). We used to
+        // flip to `Running` here, which made every fresh agent read as "working"
+        // before it produced a thing. The hook bus now promotes it on real
+        // activity: the first PostToolUse → Running ("working"), a Stop → Idle, a
+        // permission prompt → NeedsYou. A genuinely wedged spawn simply stays
+        // "starting…", which is honest — it never did anything.
 
         // Run until the user cancels or the agent exits on its own.
         let exit = backend.exit_notify();
@@ -665,7 +696,7 @@ mod tests {
         let store = Arc::clone(&cfg.store);
         let (handle, join) = Supervisor::start(cfg, &Handle::current());
 
-        handle.launch("ENG-1".into(), "One".into());
+        handle.launch("ENG-1".into(), "One".into(), None);
         assert!(
             wait_for(|| spawn_count(&registry, "ENG-1") == 1).await,
             "agent spawned"
@@ -723,8 +754,8 @@ mod tests {
         let store = Arc::clone(&cfg.store);
         let (handle, join) = Supervisor::start(cfg, &Handle::current());
 
-        handle.launch("ENG-1".into(), "One".into());
-        handle.launch("ENG-2".into(), "Two".into());
+        handle.launch("ENG-1".into(), "One".into(), None);
+        handle.launch("ENG-2".into(), "Two".into(), None);
 
         let mut spawned = std::collections::HashSet::new();
         assert!(
@@ -796,7 +827,7 @@ mod tests {
             n
         };
 
-        handle.launch("ENG-1".into(), "One".into());
+        handle.launch("ENG-1".into(), "One".into(), None);
         let mut spawns = 0;
         assert!(
             wait_for(|| {
@@ -824,7 +855,7 @@ mod tests {
             wait_for(|| {
                 spawns += count_spawns(&mut rx);
                 if spawns < 2 {
-                    handle.launch("ENG-1".into(), "One".into());
+                    handle.launch("ENG-1".into(), "One".into(), None);
                 }
                 spawns >= 2
             })
@@ -852,7 +883,7 @@ mod tests {
         let store = Arc::clone(&cfg.store);
         let (handle, join) = Supervisor::start(cfg, &Handle::current());
 
-        handle.launch("ENG-1".into(), "One".into());
+        handle.launch("ENG-1".into(), "One".into(), None);
         let mut seen = false;
         assert!(
             wait_for(|| {
@@ -895,7 +926,7 @@ mod tests {
         let (handle, join) = Supervisor::start(cfg, &Handle::current());
 
         let mut spawns = 0usize;
-        handle.launch("ENG-1".into(), "One".into());
+        handle.launch("ENG-1".into(), "One".into(), None);
         assert!(
             wait_for(|| {
                 while let Ok(ev) = rx.try_recv() {
@@ -922,7 +953,7 @@ mod tests {
                 }
             }
             if spawns < 2 {
-                handle.launch("ENG-1".into(), "One".into());
+                handle.launch("ENG-1".into(), "One".into(), None);
             }
             spawns >= 2
         })
@@ -951,7 +982,7 @@ mod tests {
         let store = Arc::clone(&cfg.store);
         let (handle, join) = Supervisor::start(cfg, &Handle::current());
 
-        handle.launch("ENG-1".into(), "One".into());
+        handle.launch("ENG-1".into(), "One".into(), None);
         assert!(
             wait_for(|| {
                 while let Ok(ev) = rx.try_recv() {
@@ -991,9 +1022,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn spawning_moves_to_running_once_the_process_is_up() {
-        // A healthy-but-quiet agent (no PostToolUse yet) must not be stuck on
-        // Spawning: the supervisor emits Running the moment the backend is up.
+    async fn a_fresh_agent_stays_starting_and_never_fakes_running() {
+        // We no longer flip to Running at spawn (that made every fresh agent read
+        // as "working" before it did anything). The backend comes up — AgentSpawned
+        // opens the window — but the node stays Spawning ("starting…"); only a real
+        // hook (the first PostToolUse) promotes it. With no hooks, it must never
+        // fake Running on its own.
         let (dir, wt) = temp_repo();
         let (tx, mut rx) = crate::event::channel();
         let registry: Registry = Arc::new(Mutex::new(Vec::new()));
@@ -1001,36 +1035,33 @@ mod tests {
         let store = Arc::clone(&cfg.store);
         let (handle, join) = Supervisor::start(cfg, &Handle::current());
 
-        handle.launch("ENG-1".into(), "One".into());
+        handle.launch("ENG-1".into(), "One".into(), None);
 
-        // The supervisor emits AgentStatusChanged{Running} after AgentSpawned…
-        let saw_running = wait_for(|| {
+        // Collect events over a window long enough that an eager flip would show.
+        let (mut spawned, mut running) = (false, false);
+        for _ in 0..15 {
             while let Ok(ev) = rx.try_recv() {
-                if let AppEvent::AgentStatusChanged { issue, status } = ev
-                    && issue == "ENG-1"
-                    && status == AgentStatus::Running
-                {
-                    return true;
+                match ev {
+                    AppEvent::AgentSpawned { issue, .. } if issue == "ENG-1" => spawned = true,
+                    AppEvent::AgentStatusChanged { issue, status }
+                        if issue == "ENG-1" && status == AgentStatus::Running =>
+                    {
+                        running = true;
+                    }
+                    _ => {}
                 }
             }
-            false
-        })
-        .await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(spawned, "the backend came up and opened a window");
         assert!(
-            saw_running,
-            "the node left Spawning once the process was up"
+            !running,
+            "a fresh agent must not fake Running before it works"
         );
 
-        // …and persists it, so a cockpit restart doesn't show a stale Spawning.
-        let persisted_running = wait_for(|| {
-            store
-                .lock()
-                .ok()
-                .and_then(|s| s.get("ENG-1").map(|r| r.status == AgentStatus::Running))
-                .unwrap_or(false)
-        })
-        .await;
-        assert!(persisted_running, "Running was persisted to the store");
+        // The durable status is still Spawning, so the cockpit renders "starting…".
+        let status = store.lock().unwrap().get("ENG-1").map(|r| r.status);
+        assert_eq!(status, Some(AgentStatus::Spawning), "it stays 'starting…'");
 
         handle.shutdown();
         join.await.unwrap();
@@ -1047,7 +1078,7 @@ mod tests {
         let cfg = config(&dir, wt, tx, recording_spawn(Arc::clone(&registry)), 4);
         let (handle, join) = Supervisor::start(cfg, &Handle::current());
 
-        handle.launch("ENG-1".into(), "One".into());
+        handle.launch("ENG-1".into(), "One".into(), None);
         assert!(
             wait_for(|| spawn_count(&registry, "ENG-1") >= 1).await,
             "the agent spawned"
@@ -1060,7 +1091,7 @@ mod tests {
         // must yield the distinct "still stopping" message — never the misleading
         // "already has a running agent", which we assert against throughout.
         handle.cancel("ENG-1".into());
-        handle.launch("ENG-1".into(), "One".into());
+        handle.launch("ENG-1".into(), "One".into(), None);
 
         let saw_still_stopping = wait_for(|| {
             while let Ok(ev) = rx.try_recv() {
@@ -1102,7 +1133,7 @@ mod tests {
         let cfg = config(&dir, wt, tx, recording_spawn(Arc::clone(&registry)), 4);
         let (handle, join) = Supervisor::start(cfg, &Handle::current());
 
-        handle.launch("ENG-1".into(), "One".into());
+        handle.launch("ENG-1".into(), "One".into(), None);
         handle.cancel("ENG-1".into()); // races into the setup window, before spawn
 
         // No process is ever spawned for this aborted launch: no fake recorded and
@@ -1129,7 +1160,7 @@ mod tests {
         // until it takes, since the reap from the aborted launch is async.
         let relaunched = wait_for(|| {
             if spawn_count(&registry, "ENG-1") == 0 {
-                handle.launch("ENG-1".into(), "One".into());
+                handle.launch("ENG-1".into(), "One".into(), None);
             }
             spawn_count(&registry, "ENG-1") >= 1
         })

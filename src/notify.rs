@@ -215,13 +215,6 @@ async fn handle_conn(
 /// still surfaces a footer notification rather than vanishing.
 async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: &AppEventTx) {
     let event_name = payload.hook_event_name.as_deref().unwrap_or("");
-    // The durable status this hook implies (None = surface-only, e.g. PostToolUse
-    // — too frequent to persist, and Running is already set at spawn).
-    let implied = match event_name {
-        "Notification" => Some(AgentStatus::NeedsYou),
-        "Stop" => Some(AgentStatus::Idle),
-        _ => None,
-    };
 
     // Resolve the issue, capture the transcript path, and apply the hook-implied
     // status under a *single* lock acquisition, then PERSIST the durable store so
@@ -230,7 +223,7 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
     // even if no further status write happens. Snapshot under the lock; the
     // blocking write runs after the guard drops so a rename never stalls another
     // hook on the mutex. A poisoned lock drops the hook rather than panicking.
-    let (issue, snapshot) = match store.lock() {
+    let (issue, snapshot, notif_needs_you) = match store.lock() {
         Ok(mut store) => {
             let issue = resolve_issue(payload, &store);
             let mut dirty = false;
@@ -257,6 +250,34 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
                 }
             }
 
+            // The agent's status before this hook, read once (Copy, so the borrow
+            // ends immediately and can't clash with the set_status below).
+            let current = issue
+                .as_deref()
+                .and_then(|i| store.get(i).map(|s| s.status));
+
+            // A `Notification` only means "needs you" for a genuine permission /
+            // elicitation prompt; the idle nudge, `auth_success` and the
+            // elicitation-complete events Claude also delivers through this one
+            // hook must NOT raise the flag (see `notification_implies_needs_you`).
+            let notif_needs_you =
+                event_name == "Notification" && notification_implies_needs_you(payload, current);
+
+            // The durable status this hook implies (None = surface-only).
+            let implied = match event_name {
+                "Notification" if notif_needs_you => Some(AgentStatus::NeedsYou),
+                "Stop" => Some(AgentStatus::Idle),
+                // The first tool run is the real "working" signal — we no longer
+                // fake `Running` at spawn. Promote a starting/idle agent; never
+                // revive a terminal one, and don't churn a persist when it's
+                // already Running (the `changed` guard below handles that).
+                "PostToolUse"
+                    if matches!(current, Some(AgentStatus::Spawning | AgentStatus::Idle)) =>
+                {
+                    Some(AgentStatus::Running)
+                }
+                _ => None,
+            };
             if let (Some(issue), Some(status)) = (issue.as_deref(), implied) {
                 let changed = store.get(issue).is_some_and(|s| s.status != status);
                 if changed {
@@ -275,7 +296,7 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
             } else {
                 None
             };
-            (issue, snapshot)
+            (issue, snapshot, notif_needs_you)
         }
         Err(_) => return,
     };
@@ -285,14 +306,28 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
     }
 
     let event = match (issue, event_name) {
-        (Some(issue), "Notification") => {
-            // permission_prompt | idle_prompt both mean "the human is needed".
+        (Some(issue), "Notification") if notif_needs_you => {
+            // A real permission / elicitation prompt: raise the flag.
             let reason = payload
                 .notification_type
                 .as_deref()
                 .or(payload.message.as_deref())
                 .map_or_else(|| "needs attention".to_string(), clamp_display);
             AppEvent::AgentNeedsYou { issue, reason }
+        }
+        (Some(issue), "Notification") => {
+            // A non-blocking notification (idle nudge / auth-success /
+            // elicitation-complete): surface it quietly, without raising the flag
+            // or disturbing the agent's status.
+            let note = payload
+                .notification_type
+                .as_deref()
+                .or(payload.message.as_deref())
+                .map_or_else(|| "agent idle".to_string(), clamp_display);
+            AppEvent::AgentAction {
+                issue,
+                action: note,
+            }
         }
         (Some(issue), "Stop") => AppEvent::AgentStatusChanged {
             issue,
@@ -315,6 +350,29 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
         )),
     };
     let _ = events.send(event);
+}
+
+/// Whether a `Notification` hook genuinely needs the human. Claude fires
+/// `Notification` for several distinct reasons under one event name: a permission
+/// prompt and an MCP `elicitation_dialog` truly block on you; the idle nudge
+/// (`idle_prompt`, ~60 s after a turn), `auth_success`, and the
+/// `elicitation_complete` / `elicitation_response` follow-ups do not — flagging
+/// those is the "needs-you fires when it doesn't need you" bug.
+///
+/// Discriminate on `notification_type` when Claude supplies it (the docs don't
+/// guarantee the field, so treat its absence gracefully); otherwise fall back to
+/// the agent's state. A permission prompt arrives **mid-turn** (the agent is
+/// still active — Spawning/Running), whereas the idle nudge only fires once the
+/// agent has already gone `Idle` after its `Stop` hook. An unmapped/None state
+/// stays conservative (treat as needing you) so a real block is never dropped.
+fn notification_implies_needs_you(payload: &HookPayload, current: Option<AgentStatus>) -> bool {
+    match payload.notification_type.as_deref() {
+        Some("permission_prompt" | "elicitation_dialog") => true,
+        Some("idle_prompt" | "auth_success" | "elicitation_complete" | "elicitation_response") => {
+            false
+        }
+        _ => current.is_none_or(|s| s.is_animating()),
+    }
 }
 
 /// Resolve a hook to an issue: prefer the durable `session_id`, fall back to the
@@ -680,6 +738,132 @@ mod tests {
             sanitize_transcript_path("/wt/ENG-1/../ENG-2/x.ndjson", wt),
             None
         );
+    }
+
+    #[test]
+    fn permission_and_elicitation_prompts_always_need_you() {
+        // A genuine block on the human: flag it whatever the agent's state.
+        let permission = HookPayload {
+            notification_type: Some("permission_prompt".into()),
+            ..Default::default()
+        };
+        assert!(notification_implies_needs_you(
+            &permission,
+            Some(AgentStatus::Idle)
+        ));
+        let elicitation = HookPayload {
+            notification_type: Some("elicitation_dialog".into()),
+            ..Default::default()
+        };
+        assert!(notification_implies_needs_you(
+            &elicitation,
+            Some(AgentStatus::Running)
+        ));
+    }
+
+    #[test]
+    fn idle_auth_and_completion_notifications_never_need_you() {
+        // The ~60 s idle nudge, auth-success and the elicitation follow-ups all
+        // ride the Notification hook but must NOT raise the flag — this is the
+        // "needs-you fires when it doesn't need you" regression.
+        for kind in [
+            "idle_prompt",
+            "auth_success",
+            "elicitation_complete",
+            "elicitation_response",
+        ] {
+            let payload = HookPayload {
+                notification_type: Some(kind.into()),
+                ..Default::default()
+            };
+            assert!(
+                !notification_implies_needs_you(&payload, Some(AgentStatus::Running)),
+                "{kind} must not need you even mid-run"
+            );
+        }
+    }
+
+    #[test]
+    fn an_untyped_notification_falls_back_to_agent_state() {
+        // No notification_type (Claude doesn't guarantee the field): a permission
+        // prompt fires mid-turn (agent active) while the idle nudge fires only
+        // after Stop (agent already Idle). Unknown/None state stays conservative.
+        let bare = HookPayload {
+            hook_event_name: Some("Notification".into()),
+            ..Default::default()
+        };
+        assert!(notification_implies_needs_you(
+            &bare,
+            Some(AgentStatus::Running)
+        ));
+        assert!(!notification_implies_needs_you(
+            &bare,
+            Some(AgentStatus::Idle)
+        ));
+        assert!(notification_implies_needs_you(&bare, None));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_nudge_does_not_raise_the_needs_you_flag() {
+        let (tx, mut rx) = crate::event::channel();
+        let store = seeded_store();
+        let sid = SessionStore::session_id_for("ENG-1");
+        let Endpoint { port, token } = serve(tx, store).await.unwrap();
+
+        // The idle nudge Claude fires ~60 s after a turn: same hook as a real
+        // prompt, but it must surface quietly (AgentAction), never AgentNeedsYou.
+        let body = json!({
+            "session_id": sid, "cwd": "/wt/ENG-1",
+            "hook_event_name": "Notification", "notification_type": "idle_prompt"
+        })
+        .to_string();
+        post_hook(port, &token, body.as_bytes()).unwrap();
+
+        let got = drain(&mut rx).await;
+        assert!(
+            !got.iter()
+                .any(|ev| matches!(ev, AppEvent::AgentNeedsYou { .. })),
+            "an idle nudge must not raise needs-you; got {got:?}"
+        );
+        assert!(
+            got.iter().any(|ev| matches!(
+                ev,
+                AppEvent::AgentAction { issue, .. } if issue == "ENG-1"
+            )),
+            "the idle nudge still surfaces quietly as an action; got {got:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_tool_run_promotes_a_starting_agent_to_running() {
+        // Spawn no longer fakes Running, so a fresh agent sits Spawning until it
+        // does real work; the first PostToolUse is that "working" signal.
+        let (tx, mut rx) = crate::event::channel();
+        let store = seeded_store();
+        store
+            .lock()
+            .unwrap()
+            .set_status("ENG-1", AgentStatus::Spawning);
+        let sid = SessionStore::session_id_for("ENG-1");
+        let Endpoint { port, token } = serve(tx, Arc::clone(&store)).await.unwrap();
+
+        let body = json!({
+            "session_id": sid, "cwd": "/wt/ENG-1",
+            "hook_event_name": "PostToolUse", "tool_name": "Edit"
+        })
+        .to_string();
+        post_hook(port, &token, body.as_bytes()).unwrap();
+
+        let mut promoted = false;
+        for _ in 0..50 {
+            if store.lock().unwrap().get("ENG-1").map(|r| r.status) == Some(AgentStatus::Running) {
+                promoted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = drain(&mut rx).await;
+        assert!(promoted, "the first tool run moves 'starting…' → 'working'");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

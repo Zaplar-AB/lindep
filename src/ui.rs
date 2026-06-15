@@ -802,15 +802,26 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
         " type to filter · ⏎ accept · esc clear".to_string()
     } else if app.kill_confirm.is_some() {
         " y / ⏎ confirm kill · any other key cancels".to_string()
-    } else if app.prefix_armed {
+    } else if app.command_mode {
         format!(
-            " {p} armed: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} rail/mosaic · {} quit · {} help · {p} again → agent",
+            " ⌘ COMMAND: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} rail/mosaic · esc or {p} exits",
             vk(Action::ContextToggle),
             vk(Action::ZoomToggle),
             vk(Action::PinWindow),
             vk(Action::CloseWindow),
             vk(Action::KillWindow),
             vk(Action::LayoutToggle),
+        )
+    } else if app.prefix_armed {
+        format!(
+            " {p} armed: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} rail/mosaic · {} command · {} quit · {} help · {p} again → agent",
+            vk(Action::ContextToggle),
+            vk(Action::ZoomToggle),
+            vk(Action::PinWindow),
+            vk(Action::CloseWindow),
+            vk(Action::KillWindow),
+            vk(Action::LayoutToggle),
+            vk(Action::CommandMode),
             vk(Action::Quit),
             vk(Action::ToggleHelp),
         )
@@ -1097,8 +1108,9 @@ fn render_summary(app: &App, frame: &mut Frame) {
 
 // ── Line builders ─────────────────────────────────────────────────────────
 
-/// One issue row for the spine list / roster: gutter · status · priority · KEY ·
-/// title (· blocked · cycle · animated agent marker).
+/// One issue row for the spine list / roster: agent-marker · status · priority ·
+/// KEY · title (· blocked · cycle). The leftmost gutter holds the live agent
+/// marker (or a blank when the issue has no agent).
 fn issue_line<'a>(
     graph: &Graph,
     key: &str,
@@ -1111,33 +1123,45 @@ fn issue_line<'a>(
     };
     let (glyph, color) = theme::status_glyph(issue.status);
     let (pmark, pcolor) = theme::priority_marker(issue.priority);
+    // A finished/abandoned issue recedes so open work reads first.
+    let resolved = issue.status.is_resolved();
 
+    // Left gutter: the live agent marker (spinner while working, breathing flag
+    // for needs-you, ✓ done) pinned to a FIXED leftmost column so it stays
+    // visible no matter how long the title is — it used to ride the right edge
+    // and a long title pushed it off-screen. Blank when the issue has no agent.
     let gutter = match agent {
-        Some(status) => Span::styled("▎", Style::new().fg(theme::agent_glyph(status).1)),
+        Some(status) => {
+            let (mark, mstyle) = theme::agent_marker(status, frame);
+            Span::styled(mark, mstyle)
+        }
         None => Span::raw(" "),
     };
+    // A resolved issue's key + title dim; the status glyph stays bright as the
+    // scannable "done" marker.
     let key_style = match flash {
         Some(Flash::Launched) => Style::new().fg(INK).bg(GREEN_700).bold(),
         Some(Flash::Finished) => Style::new().fg(GREEN_100).bg(STATUS_600).bold(),
+        None if resolved => Style::new().fg(MUTED).add_modifier(Modifier::DIM),
         None => Style::new().fg(INK).bold(),
+    };
+    let title_style = if resolved {
+        Style::new().fg(MUTED).add_modifier(Modifier::DIM)
+    } else {
+        Style::new().fg(MUTED)
     };
     let mut spans = vec![
         gutter,
         Span::styled(format!("{glyph} "), Style::new().fg(color)),
         Span::styled(format!("{pmark} "), Style::new().fg(pcolor)),
         Span::styled(format!("{:<8} ", issue.key), key_style),
-        Span::styled(truncate(&issue.title, MAX_TITLE), Style::new().fg(MUTED)),
+        Span::styled(truncate(&issue.title, MAX_TITLE), title_style),
     ];
     if graph.is_blocked(key) {
         spans.push(Span::styled(" ⊘", Style::new().fg(AMBER_400)));
     }
     if graph.in_cycle(key) {
         spans.push(Span::styled(" ↺", Style::new().fg(AMBER_400)));
-    }
-    if let Some(status) = agent {
-        let (mark, mstyle) = theme::agent_marker(status, frame);
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(mark, mstyle));
     }
     Line::from(spans)
 }

@@ -157,8 +157,17 @@ impl WorktreeManager {
         let _guard = self.lock_git();
 
         // Short-circuit on an already-registered worktree *before* prune, so a
-        // valid relaunch never depends on an advisory cleanup step succeeding.
-        if let Some(existing) = self.find(issue)? {
+        // valid relaunch never depends on an advisory cleanup step succeeding —
+        // but only when its checkout is actually on disk. After a crash, `git
+        // worktree list` keeps reporting a worktree whose directory was deleted
+        // (it is merely `prunable`), so find() can return a record pointing at a
+        // vanished dir; returning it would spawn the agent with a non-existent
+        // cwd and wedge the issue on every relaunch. A vanished dir falls through
+        // to the remove + prune + re-add recovery below (which reuses the kept
+        // branch, so committed work is preserved).
+        if let Some(existing) = self.find(issue)?
+            && existing.path.is_dir()
+        {
             return Ok(existing);
         }
 
@@ -630,6 +639,38 @@ mod tests {
             issues,
             vec!["ENG-2"],
             "the vanished ENG-1 worktree was pruned"
+        );
+    }
+
+    #[test]
+    fn recreating_the_same_issue_after_its_worktree_dir_vanished_recovers() {
+        // A crash deletes the checkout dir, but `git worktree list` keeps
+        // reporting it (merely `prunable`) until a prune runs — so find() returns
+        // a record whose path no longer exists. Re-creating the SAME issue must
+        // not short-circuit onto that ghost: returning a non-existent path would
+        // spawn the agent with a missing cwd and wedge the issue on every
+        // relaunch. create() must fall through to prune + re-add, reusing the kept
+        // branch so committed work survives. (Distinct from the reconcile test,
+        // which recovers only as a side effect of creating a *different* issue.)
+        let repo = TempRepo::new();
+        let first = repo.mgr.create("ENG-1", "One", "HEAD").unwrap();
+        std::fs::remove_dir_all(&first.path).unwrap();
+        assert!(
+            repo.mgr
+                .find("ENG-1")
+                .unwrap()
+                .is_some_and(|w| !w.path.is_dir()),
+            "git still lists the vanished worktree before recovery — the stale short-circuit input"
+        );
+
+        let again = repo.mgr.create("ENG-1", "One", "HEAD").unwrap();
+        assert!(
+            again.path.is_dir(),
+            "the checkout was recreated, not a stale path returned"
+        );
+        assert_eq!(
+            first.branch, again.branch,
+            "the kept branch is reused, preserving committed work"
         );
     }
 

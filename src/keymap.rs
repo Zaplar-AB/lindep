@@ -91,6 +91,10 @@ pub enum Action {
     /// from any window via the prefix.
     AttachOrSpawn,
     Quit,
+    /// Latch into command mode: keys act as window verbs *without* re-pressing the
+    /// prefix, until Esc or the prefix exits. Keeps the one-shot `prefix key`
+    /// rhythm available, while a run of verbs (focus, pin, zoom…) needs no repeats.
+    CommandMode,
 }
 
 /// `(action, config name, default keys)` for the **direct** keys consulted when
@@ -136,6 +140,9 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::LayoutToggle, "layout", &["|"]),
     (Action::AttachOrSpawn, "open", &["enter", "space"]),
     (Action::Quit, "quit", &["q"]),
+    // `Ctrl-a .` latches command mode (keys = verbs until Esc / the prefix). The
+    // one-shot `Ctrl-a key` rhythm is untouched; this just removes the repeats.
+    (Action::CommandMode, "command-mode", &["."]),
     (Action::StartSearch, "search", &["/"]),
     (Action::ToggleHelp, "help", &["?"]),
     (Action::ToggleSummary, "summary", &["i"]),
@@ -453,6 +460,14 @@ impl Keymap {
 
     /// Set the prefix chord from a config string, warning (and keeping the
     /// default) on a bad or reserved value.
+    ///
+    /// Shadow detection is **not** done here — it's deferred to
+    /// [`Keymap::warn_prefix_shadows`], run after every override is applied. A
+    /// `[keys]`/`[verbs]` override can bind a chord *onto* the prefix (or move
+    /// one *off* it), and `load` sets the prefix before applying overrides, so
+    /// only the final map can tell what the prefix actually shadows. Detecting
+    /// here (against the pre-override defaults) both missed a rebind-onto-prefix
+    /// and false-warned on a default the user then moved away.
     pub fn set_prefix(&mut self, spec: &str) -> Vec<String> {
         match parse_binding(spec) {
             Ok(b) if b.code == KeyCode::Esc => {
@@ -460,27 +475,34 @@ impl Keymap {
             }
             Ok(b) => {
                 self.prefix = b;
-                // The prefix swallows this chord, so any direct key or verb bound
-                // to the same chord can no longer fire as a normal key — warn (the
-                // default `Ctrl-A` collides with nothing, so this is silent unless
-                // the user picked a prefix that shadows a binding).
-                let mut warnings = Vec::new();
-                if let Some(a) = self.singles.get(&b) {
-                    warnings.push(format!(
-                        "'prefix': {} is also the direct key for {a:?}; that binding is now shadowed",
-                        b.label()
-                    ));
-                }
-                if let Some(a) = self.verbs.get(&b) {
-                    warnings.push(format!(
-                        "'prefix': {} is also a verb ({a:?}); that binding is now shadowed",
-                        b.label()
-                    ));
-                }
-                warnings
+                Vec::new()
             }
             Err(e) => vec![format!("'prefix': {e}")],
         }
+    }
+
+    /// Warn about any direct key or verb whose chord equals the prefix. `on_key`
+    /// consults `is_prefix` before `action_for`/`verb_for`, so such a binding can
+    /// never fire — it's silently dead without this. Run last in [`load`], over
+    /// the **final** merged map (after the prefix and every override are applied),
+    /// since an override can bind a chord onto the prefix or move one off it. The
+    /// default `Ctrl-A` prefix collides with nothing, so this is silent unless a
+    /// custom prefix (or a rebind onto it) actually shadows a binding.
+    pub fn warn_prefix_shadows(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(a) = self.singles.get(&self.prefix) {
+            warnings.push(format!(
+                "'prefix': {} is also the direct key for {a:?}; that binding is now shadowed",
+                self.prefix.label()
+            ));
+        }
+        if let Some(a) = self.verbs.get(&self.prefix) {
+            warnings.push(format!(
+                "'prefix': {} is also a verb ({a:?}); that binding is now shadowed",
+                self.prefix.label()
+            ));
+        }
+        warnings
     }
 }
 
@@ -576,11 +598,21 @@ pub fn load(repo_root: Option<&Path>) -> (Keymap, Settings, Vec<String>) {
         };
         match toml::from_str::<ConfigFile>(&text) {
             Ok(cfg) => {
+                // Apply overrides in a deterministic (action-name) order.
+                // `cfg.keys`/`cfg.verbs` are HashMaps, whose iteration order
+                // varies per process (random SipHash seed). `apply_table`
+                // resolves conflicts against the live map in order and only frees
+                // a chord when it reaches the action that owns it, so two
+                // interacting rebinds (one taking another's default chord) would
+                // otherwise resolve differently — and emit different warnings —
+                // across launches. Sorting pins the outcome for a given config.
                 let collect = |table: HashMap<String, KeySpec>| -> Vec<(String, Vec<String>)> {
-                    table
+                    let mut out: Vec<(String, Vec<String>)> = table
                         .into_iter()
                         .map(|(name, spec)| (name, spec.into_vec()))
-                        .collect()
+                        .collect();
+                    out.sort_by(|a, b| a.0.cmp(&b.0));
+                    out
                 };
                 if let Some(prefix) = &cfg.prefix {
                     for w in keymap.set_prefix(prefix) {
@@ -601,6 +633,11 @@ pub fn load(repo_root: Option<&Path>) -> (Keymap, Settings, Vec<String>) {
             Err(e) => warnings.push(format!("{}: invalid TOML: {e}", path.display())),
         }
     }
+    // Scan for prefix shadows once, over the final merged map — after every
+    // file's prefix and overrides are applied — since a later override can bind a
+    // chord onto the prefix an earlier file set. (Silent under the default
+    // Ctrl-A prefix, which collides with nothing.)
+    warnings.extend(keymap.warn_prefix_shadows());
     (keymap, settings, warnings)
 }
 
@@ -760,13 +797,39 @@ mod tests {
     fn a_prefix_that_shadows_a_binding_warns() {
         let mut km = Keymap::default();
         // 'd' is the direct key for OpenDeps; choosing it as the prefix swallows
-        // that chord, so the rebind must warn the binding is now shadowed.
-        let warnings = km.set_prefix("d");
+        // that chord. Setting the prefix is itself clean; the shadow surfaces in
+        // the post-override scan, which runs over the final map.
+        assert!(
+            km.set_prefix("d").is_empty(),
+            "setting a valid prefix is clean"
+        );
+        let warnings = km.warn_prefix_shadows();
         assert!(
             warnings.iter().any(|w| w.contains("shadowed")),
             "a prefix colliding with an existing binding warns: {warnings:?}"
         );
         assert!(km.is_prefix(ev(KeyCode::Char('d'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn a_rebind_onto_a_custom_prefix_is_detected_as_shadowed() {
+        // The ordering bug: set a custom prefix, THEN bind a direct key onto that
+        // same chord. Ctrl-B is unbound in the defaults, so the rebind is accepted
+        // with no conflict — but on_key consumes the prefix first, so MoveUp on
+        // Ctrl-B can never fire. set_prefix ran before the override and so could
+        // not see it; warn_prefix_shadows, run after, must catch it.
+        let mut km = Keymap::default();
+        assert!(km.set_prefix("ctrl-b").is_empty());
+        assert!(
+            km.apply(&[("move-up".into(), vec!["ctrl-b".into()])])
+                .is_empty(),
+            "rebinding onto a free chord is accepted silently"
+        );
+        let warnings = km.warn_prefix_shadows();
+        assert!(
+            warnings.iter().any(|w| w.contains("shadowed")),
+            "a binding rebound onto the prefix is reported as shadowed: {warnings:?}"
+        );
     }
 
     #[test]
