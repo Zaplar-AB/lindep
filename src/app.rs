@@ -152,6 +152,15 @@ pub struct App {
     pub search_active: bool,
     pub show_help: bool,
     pub status_msg: Option<String>,
+    /// True while `status_msg` holds an unacknowledged "needs you" alert. Routine
+    /// high-frequency tool chatter (`AgentAction`) must not bury it; it clears the
+    /// moment the human touches a dashboard key (acknowledging) or a deliberate
+    /// event replaces the footer.
+    needs_you_alert: bool,
+    /// Issues with a launch command in flight (sent to the supervisor, not yet
+    /// acknowledged by an `AgentSpawned` or rejected by a `Notification`). Lets
+    /// the cockpit refuse a double-press before the fleet entry materializes.
+    pending_launch: HashSet<String>,
 
     /// Per-issue agent status, driven by the supervisor + notification bus.
     /// Absence of an entry means "no agent" — the fleet view's resting state.
@@ -232,6 +241,8 @@ impl App {
             search_active: false,
             show_help: false,
             status_msg: None,
+            needs_you_alert: false,
+            pending_launch: HashSet::new(),
             fleet: HashMap::new(),
             backends: HashMap::new(),
             attached: None,
@@ -596,7 +607,10 @@ impl App {
             return;
         }
 
+        // A dashboard keypress acknowledges any standing needs-you footer and
+        // clears the transient status line.
         self.status_msg = None;
+        self.needs_you_alert = false;
 
         if self.search_active {
             self.on_search_key(key.code);
@@ -694,24 +708,28 @@ impl App {
     pub fn apply_event(&mut self, ev: AppEvent) -> bool {
         match ev {
             AppEvent::Notification(text) => {
-                self.status_msg = Some(text);
+                // A rejected launch (e.g. "already has a running agent" / "at
+                // capacity") arrives as a Notification; clear any optimistic
+                // pending-launch marks so a later retry isn't wrongly refused.
+                self.pending_launch.clear();
+                self.set_footer(text);
                 true
             }
             AppEvent::AgentSpawned { issue, backend } => {
+                self.pending_launch.remove(&issue);
                 self.fleet.insert(issue.clone(), AgentStatus::Spawning);
                 self.backends.insert(issue.clone(), backend);
                 self.flash
                     .insert(issue.clone(), (Flash::Launched, self.frame + FLASH_FRAMES));
                 // If `a` was waiting on this launch, surface the attach nudge now
                 // its terminal is live, and clear the wait.
-                self.status_msg = if self.pending_attach.as_deref() == Some(issue.as_str()) {
+                let t = self.keymap.label_for(Action::Attach);
+                if self.pending_attach.as_deref() == Some(issue.as_str()) {
                     self.pending_attach = None;
-                    let t = self.keymap.label_for(Action::Attach);
-                    Some(format!("agent on {issue} ready · {t} to attach"))
+                    self.set_footer(format!("agent on {issue} ready · {t} to attach"));
                 } else {
-                    let t = self.keymap.label_for(Action::Attach);
-                    Some(format!("agent launched on {issue} · {t} to attach"))
-                };
+                    self.set_footer(format!("agent launched on {issue} · {t} to attach"));
+                }
                 true
             }
             // Repaint when the output belongs to an agent whose screen is on
@@ -725,7 +743,7 @@ impl App {
                 // self-exit as Done/Failed. Here we only surface a footer line and
                 // reclaim the render handle now the PTY is gone, unless the user
                 // is still attached and looking at its final screen.
-                self.status_msg = Some(match code {
+                self.set_footer(match code {
                     Some(0) | None => format!("agent on {issue} finished"),
                     Some(c) => format!("agent on {issue} exited ({c})"),
                 });
@@ -750,6 +768,7 @@ impl App {
                 }
                 self.fleet.insert(issue.clone(), AgentStatus::NeedsYou);
                 self.status_msg = Some(format!("⚑ {issue} needs you — {reason}"));
+                self.needs_you_alert = true; // sticky until acknowledged
                 true
             }
             AppEvent::AgentStatusChanged { issue, status } => {
@@ -759,6 +778,12 @@ impl App {
                 // revives it through AgentSpawned, not here.
                 if status.is_live() && self.is_terminal(&issue) {
                     return false;
+                }
+                // An explicit transition is authoritative — it's the one event
+                // allowed to clear a NeedsYou. Drop the sticky alert if the node
+                // it referred to is no longer waiting on the human.
+                if !status.needs_you() && self.fleet.get(&issue) == Some(&AgentStatus::NeedsYou) {
+                    self.needs_you_alert = false;
                 }
                 // A clean or crashed finish gets a brief node flash so it
                 // registers even if you weren't watching that node.
@@ -773,17 +798,47 @@ impl App {
                 if self.is_terminal(&issue) {
                     return false; // stale tool-use hook after teardown
                 }
-                self.fleet.insert(issue.clone(), AgentStatus::Running);
-                self.status_msg = Some(format!("{issue}: {action}"));
+                // Hook-bus PostToolUse chatter must not clobber a pending NeedsYou
+                // the human still has to act on (a queued PostToolUse can arrive
+                // just after a permission prompt), nor let the routine footer bury
+                // an unacknowledged needs-you alert.
+                if self.fleet.get(&issue) != Some(&AgentStatus::NeedsYou) {
+                    self.fleet.insert(issue.clone(), AgentStatus::Running);
+                }
+                if !self.needs_you_alert {
+                    self.status_msg = Some(format!("{issue}: {action}"));
+                }
+                true
+            }
+            AppEvent::AgentReaped { issue } => {
+                // The supervisor dropped this agent from its live map (teardown
+                // complete). Drop it from the fleet so the view stays bounded and
+                // mirrors the supervisor. Keep the backend handle while attached
+                // (reading its final screen) or pinned (so its EXITED card stays
+                // on the wall until you unpin it); otherwise reclaim it.
+                self.fleet.remove(&issue);
+                self.preview_size.remove(&issue);
+                let keep = self.attached.as_deref() == Some(issue.as_str())
+                    || self.pinned.contains(&issue);
+                if !keep {
+                    self.backends.remove(&issue);
+                }
                 true
             }
         }
     }
 
+    /// Set the transient footer line, superseding (and acknowledging) any
+    /// standing needs-you alert — used by deliberate, low-frequency events.
+    fn set_footer(&mut self, text: String) {
+        self.status_msg = Some(text);
+        self.needs_you_alert = false;
+    }
+
     /// Open an agent on the focused issue (the `a` key) — the first half of the
-    /// two-step open→attach flow. One agent per issue: a *live* agent is never
-    /// duplicated (we just show its chat and point at attach); a resting or
-    /// finished one is relaunched, which resumes its conversation. Always
+    /// two-step open→attach flow. One agent per issue: a *live* agent (incl. an
+    /// idle one) is never duplicated — we reveal its chat and point at attach; a
+    /// stopped/finished one is relaunched, which resumes its conversation. Always
     /// switches the right pane to the chat so you see what you opened.
     fn launch_agent(&mut self) {
         let Some(issue) = self.focused_issue() else {
@@ -798,40 +853,38 @@ impl App {
         let (key, title) = (issue.key.clone(), issue.title.clone());
         let t = self.keymap.label_for(Action::Attach);
 
-        // Already-live agent: don't spin up a second one. Show its chat instead.
-        match self.fleet.get(&key).copied() {
-            Some(AgentStatus::Spawning | AgentStatus::Running) => {
-                self.right_view = RightView::Chat;
-                self.status_msg = Some(format!("{key} already has an agent · {t} to attach"));
-                return;
-            }
-            Some(AgentStatus::NeedsYou) => {
-                self.right_view = RightView::Chat;
-                self.status_msg = Some(format!("⚑ {key} needs you · {t} to attach"));
-                return;
-            }
-            // Absent, or resting/terminal (idle/stopped/done/failed) → (re)launch.
-            _ => {}
+        // A live agent already exists (spawning/running/needs-you/idle — all
+        // alive): don't spin up a second. Reveal its chat and point at attach,
+        // rather than print an optimistic "launching…" the supervisor's own
+        // running/capacity guards would contradict a tick later.
+        if let Some(s) = self.fleet.get(&key).copied()
+            && s.is_live()
+        {
+            self.right_view = RightView::Chat;
+            self.status_msg = Some(if s.needs_you() {
+                format!("⚑ {key} needs you · {t} to attach")
+            } else {
+                format!("{key} already has an agent · {t} to attach")
+            });
+            return;
         }
-        let resuming = matches!(
-            self.fleet.get(&key),
-            Some(
-                AgentStatus::Idle | AgentStatus::Stopped | AgentStatus::Done | AgentStatus::Failed
-            )
-        );
-
+        // A launch already in flight (double-press before it spawns).
+        if self.pending_launch.contains(&key) {
+            self.right_view = RightView::Chat;
+            self.set_footer(format!("already opening an agent on {key}…"));
+            return;
+        }
+        // Absent, or terminal (stopped/done/failed) → (re)launch; the supervisor
+        // resumes the conversation transparently if a session already exists.
         // Clone the handle out so we can also touch `status_msg` without a
         // borrow conflict; the clone is cheap (an mpsc sender).
         match self.supervisor.clone() {
             Some(supervisor) => {
                 supervisor.launch(key.clone(), title);
+                self.pending_launch.insert(key.clone());
                 self.right_view = RightView::Chat;
                 self.pending_attach = Some(key.clone());
-                self.status_msg = Some(if resuming {
-                    format!("resuming agent on {key} · opening chat…")
-                } else {
-                    format!("opening agent on {key} · {t} to attach when ready")
-                });
+                self.set_footer(format!("opening agent on {key} · {t} to attach when ready"));
             }
             None => self.status_msg = Some("agent control plane unavailable".into()),
         }
@@ -842,10 +895,11 @@ impl App {
         let Some(issue) = self.focused_issue().map(|i| i.key.clone()) else {
             return;
         };
-        // Only a *live* agent can be stopped — a stopped/done/failed node still
-        // shows in the fleet (so you can see it ran) but there's nothing to kill.
+        // Only a *live* agent can be stopped: a stopped/done/failed entry lingers
+        // briefly for its glyph but the supervisor has already reaped it, so a
+        // Cancel would only earn a contradicting "no agent running" a tick later.
         if !self.fleet.get(&issue).is_some_and(AgentStatus::is_live) {
-            self.status_msg = Some(format!("no live agent on {issue}"));
+            self.status_msg = Some(format!("agent on {issue} is not running"));
             return;
         }
         match self.supervisor.clone() {
@@ -857,10 +911,11 @@ impl App {
         }
     }
 
-    /// `(live-agents, needs-you)` counts for the header summary. Counts only
-    /// agents whose process is up ([`AgentStatus::is_live`]), so the number
-    /// drops the instant you stop or finish one — a stopped/done/failed node
-    /// lingers in the fleet (to show it ran) but no longer counts as "on".
+    /// `(live-agents, needs-you)` counts for the header summary. "Agents" counts
+    /// only *live* nodes ([`AgentStatus::is_live`] — spawning/running/needs-you/
+    /// idle-but-alive), not the terminal Stopped/Done/Failed entries that linger
+    /// in `fleet` until reaped — so the number drops the instant you stop or
+    /// finish one, reflecting what's actually running.
     pub fn fleet_summary(&self) -> (usize, usize) {
         let agents = self.fleet.values().filter(|s| s.is_live()).count();
         let needs_you = self.fleet.values().filter(|s| s.needs_you()).count();
@@ -1097,15 +1152,22 @@ impl App {
     }
 
     /// Encode a key and write it to the attached agent's PTY.
-    fn forward_to_agent(&self, key: KeyEvent) {
+    fn forward_to_agent(&mut self, key: KeyEvent) {
         let bytes = backend::key_to_bytes(key);
         if bytes.is_empty() {
             return;
         }
-        if let Some(issue) = self.attached.clone()
-            && let Some(backend) = self.backends.get(&issue)
-        {
-            let _ = backend.send_input(&bytes);
+        let Some(issue) = self.attached.clone() else {
+            return;
+        };
+        let Some(backend) = self.backends.get(&issue) else {
+            return;
+        };
+        if backend.send_input(&bytes).is_err() {
+            // The PTY is gone — the agent exited out from under us. Surface it and
+            // detach so keystrokes don't silently vanish into a dead terminal.
+            self.set_footer(format!("agent on {issue} is no longer accepting input"));
+            self.attached = None;
         }
     }
 
@@ -1601,6 +1663,124 @@ mod tests {
     }
 
     #[test]
+    fn fleet_summary_excludes_terminal_agents() {
+        // Terminal nodes linger in `fleet` for their glyph but must not inflate
+        // the header's live-agent count. Done/Failed are terminal; Idle is alive.
+        let mut app = app();
+        app.fleet.insert("ZAP-201".into(), AgentStatus::Running);
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
+        app.fleet.insert("ZAP-205".into(), AgentStatus::Done);
+        app.fleet.insert("ZAP-210".into(), AgentStatus::Failed);
+        app.fleet.insert("ZAP-240".into(), AgentStatus::NeedsYou);
+        // Running + Idle + NeedsYou are live (3); Done/Failed are not. One needs you.
+        assert_eq!(app.fleet_summary(), (3, 1));
+    }
+
+    #[test]
+    fn post_tool_use_does_not_clear_a_pending_needs_you() {
+        // A queued PostToolUse (→Running) arriving just after a permission prompt
+        // (→NeedsYou) must not silently downgrade the node the human has to act
+        // on, nor bury the footer alert.
+        let mut app = app();
+        app.apply_event(AppEvent::AgentNeedsYou {
+            issue: "ZAP-204".into(),
+            reason: "permission".into(),
+        });
+        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::NeedsYou));
+        let alert = app.status_msg.clone();
+
+        app.apply_event(AppEvent::AgentAction {
+            issue: "ZAP-204".into(),
+            action: "ran Bash".into(),
+        });
+        assert_eq!(
+            app.fleet.get("ZAP-204"),
+            Some(&AgentStatus::NeedsYou),
+            "tool chatter must not downgrade a NeedsYou node"
+        );
+        assert_eq!(
+            app.status_msg, alert,
+            "tool chatter must not bury the needs-you footer"
+        );
+        // A different agent's action still lands normally.
+        app.apply_event(AppEvent::AgentAction {
+            issue: "ZAP-201".into(),
+            action: "ran Read".into(),
+        });
+        assert_eq!(app.fleet.get("ZAP-201"), Some(&AgentStatus::Running));
+    }
+
+    #[test]
+    fn an_explicit_status_change_resolves_a_needs_you() {
+        // Only a resolving AgentStatusChanged (the supervisor's authority) clears
+        // a NeedsYou — then routine chatter is free to move the node again.
+        let mut app = app();
+        app.apply_event(AppEvent::AgentNeedsYou {
+            issue: "ZAP-204".into(),
+            reason: "permission".into(),
+        });
+        app.apply_event(AppEvent::AgentStatusChanged {
+            issue: "ZAP-204".into(),
+            status: AgentStatus::Running,
+        });
+        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Running));
+        // The sticky footer alert is lifted, so chatter shows again.
+        app.apply_event(AppEvent::AgentAction {
+            issue: "ZAP-204".into(),
+            action: "ran Edit".into(),
+        });
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("ZAP-204: ran Edit"),
+            "after resolution, the activity line is restored"
+        );
+    }
+
+    #[test]
+    fn a_dashboard_keypress_acknowledges_the_needs_you_footer() {
+        let mut app = app();
+        app.apply_event(AppEvent::AgentNeedsYou {
+            issue: "ZAP-204".into(),
+            reason: "permission".into(),
+        });
+        assert!(app.needs_you_alert);
+        // Any dashboard key acknowledges (here: cycle filter); chatter is no
+        // longer suppressed afterwards.
+        press(&mut app, KeyCode::Char('f'));
+        assert!(!app.needs_you_alert);
+        app.apply_event(AppEvent::AgentAction {
+            issue: "ZAP-204".into(),
+            action: "ran Grep".into(),
+        });
+        assert_eq!(app.status_msg.as_deref(), Some("ZAP-204: ran Grep"));
+    }
+
+    #[test]
+    fn cancel_is_refused_on_a_terminal_or_absent_agent() {
+        let mut app = app();
+        app.root = "ZAP-204".into();
+        // No agent at all.
+        app.dispatch(Action::CancelAgent);
+        assert!(
+            app.status_msg.as_deref().unwrap().contains("not running"),
+            "{:?}",
+            app.status_msg
+        );
+        // A reaped Done entry lingers in fleet but is not a live cancel target.
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Done);
+        app.dispatch(Action::CancelAgent);
+        assert!(app.status_msg.as_deref().unwrap().contains("not running"));
+        // A live agent is a valid target (no supervisor here, so it reports the
+        // missing control plane rather than the "not running" guard).
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        app.dispatch(Action::CancelAgent);
+        assert!(
+            !app.status_msg.as_deref().unwrap().contains("not running"),
+            "a live agent passes the guard"
+        );
+    }
+
+    #[test]
     fn pinning_caps_at_one_below_the_wall_and_keeps_the_selection_visible() {
         let mut app = app();
         for key in ["ZAP-150", "ZAP-188", "ZAP-198", "ZAP-201"] {
@@ -1654,6 +1834,48 @@ mod tests {
             backend: fake as Arc<dyn AgentBackend>,
         });
         assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Spawning));
+    }
+
+    #[test]
+    fn launch_is_refused_while_an_agent_is_already_live() {
+        let mut app = app();
+        app.root = "ZAP-204".into();
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        app.dispatch(Action::LaunchAgent);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .unwrap()
+                .contains("already has an agent"),
+            "{:?}",
+            app.status_msg
+        );
+    }
+
+    #[test]
+    fn a_second_launch_is_refused_while_the_first_is_in_flight() {
+        // The double-press window: a pending launch (sent, not yet AgentSpawned)
+        // blocks a second optimistic "launching…". AgentSpawned then clears it.
+        let mut app = app();
+        app.root = "ZAP-204".into();
+        // Simulate the in-flight mark the supervisor path would set.
+        app.pending_launch.insert("ZAP-204".into());
+        app.dispatch(Action::LaunchAgent);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .unwrap()
+                .contains("already opening"),
+            "{:?}",
+            app.status_msg
+        );
+        // The spawn acknowledgement clears the pending mark.
+        let fake = crate::backend::fake::FakeBackend::new("ZAP-204");
+        app.apply_event(AppEvent::AgentSpawned {
+            issue: "ZAP-204".into(),
+            backend: fake as Arc<dyn AgentBackend>,
+        });
+        assert!(!app.pending_launch.contains("ZAP-204"));
     }
 
     #[test]
@@ -1841,7 +2063,7 @@ mod tests {
         app.root = "ZAP-205".into();
         app.fleet.insert("ZAP-205".into(), AgentStatus::Stopped);
         press(&mut app, KeyCode::Char('x'));
-        assert!(app.status_msg.as_deref().unwrap().contains("no live agent"));
+        assert!(app.status_msg.as_deref().unwrap().contains("not running"));
     }
 
     #[test]

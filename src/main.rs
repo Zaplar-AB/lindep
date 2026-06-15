@@ -69,6 +69,11 @@ struct Cli {
     /// `lindep` wires itself as its own hook forwarder; not for direct use.
     #[arg(long, hide = true, value_name = "PORT")]
     hook_forward: Option<u16>,
+
+    /// Internal: per-run bearer token proving a forwarded hook came from this
+    /// cockpit (paired with `--hook-forward`). Minted per run; not for direct use.
+    #[arg(long, hide = true, value_name = "TOKEN")]
+    hook_token: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -88,7 +93,8 @@ fn real_main() -> Result<(), String> {
     // Hook-forwarder fast path: no TUI, no Linear — just relay stdin to the
     // cockpit's loopback endpoint and exit. `claude` invokes this for us.
     if let Some(port) = cli.hook_forward {
-        return notify::forward(port).map_err(|e| e.to_string());
+        return notify::forward(port, cli.hook_token.as_deref().unwrap_or(""))
+            .map_err(|e| e.to_string());
     }
 
     // --list is a quick, key-only path.
@@ -149,7 +155,7 @@ fn real_main() -> Result<(), String> {
     if cli.graph {
         app.mode = app::Mode::Overview;
     }
-    run_tui(app).map_err(|e| e.to_string())
+    run_tui(app, cli.demo).map_err(|e| e.to_string())
 }
 
 /// Load `LINEAR_API_KEY` (and anything else) from `.env`: first the current
@@ -215,7 +221,7 @@ fn render_snapshot(app: &mut App, w: u16, h: u16) -> Result<String, String> {
     Ok(terminal.backend().to_string())
 }
 
-fn run_tui(mut app: App) -> io::Result<()> {
+fn run_tui(mut app: App, demo: bool) -> io::Result<()> {
     // Load the keymap from config (repo `.lindep/config.toml`, then personal
     // `~/.config/lindep/config.toml`), surfacing any problems on stderr before
     // we enter the alternate screen. Bad config never aborts — defaults stand in.
@@ -231,9 +237,21 @@ fn run_tui(mut app: App) -> io::Result<()> {
     let (tx, rx) = event::channel();
 
     // Stand up the agent control plane. It's best-effort: lindep also runs as a
-    // plain graph viewer (--demo, a non-git directory), so if this can't start
-    // the cockpit still works — just without launching agents.
-    let control_plane = start_control_plane(&runtime, tx.clone());
+    // plain graph viewer, so if this can't start the cockpit still works — just
+    // without launching agents.
+    //
+    // `--demo` runs on a synthetic graph of fictional issues, so it MUST stay a
+    // read-only viewer (the documented contract) even when launched from inside a
+    // real git repo: arming the control plane there would let `a` shell out a
+    // real `git worktree add` and spawn a real `claude` for a made-up issue, and
+    // reconcile/save would mutate this repo's on-disk session state. Leaving
+    // `app.supervisor = None` makes `launch_agent` report "control plane
+    // unavailable" instead — exactly the non-git degradation path.
+    let control_plane = if control_plane_enabled(demo) {
+        start_control_plane(&runtime, tx.clone())
+    } else {
+        None
+    };
     if let Some((handle, _)) = &control_plane {
         app.supervisor = Some(handle.clone());
     }
@@ -251,17 +269,79 @@ fn run_tui(mut app: App) -> io::Result<()> {
         });
     }
 
+    // Tear the control plane down through a Drop guard so it fires on *both* the
+    // normal return and a panic unwinding out of `event_loop`: a render/layout
+    // panic must still escalate SIGTERM→SIGKILL and wait for every agent to die,
+    // not leave that to each backend's bare-SIGTERM `Drop` (a SIGTERM-ignoring
+    // claude mid-tool-run would otherwise survive the cockpit). The panic hook
+    // restores the terminal; this restores the invariant that no PTY process
+    // group outlives us.
+    let mut guard = ControlPlaneGuard {
+        plane: control_plane,
+        runtime: &runtime,
+    };
+
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app, rx);
 
-    // Stop every agent before restoring the terminal, so no PTY process group
-    // outlives the cockpit.
-    if let Some((handle, join)) = control_plane {
-        handle.shutdown();
-        let _ = runtime.block_on(join);
-    }
+    // Normal path: stop agents before restoring the terminal. (On a panic the
+    // guard's `Drop` does the same during unwind; here we drop it explicitly so
+    // teardown is ordered before `ratatui::restore`.)
+    guard.shutdown();
+    drop(guard);
     ratatui::restore();
     result
+}
+
+/// How long quit waits for the agent fleet to tear down before abandoning a
+/// launch wedged in a blocking git op, so a hung `git` can't freeze the terminal
+/// on exit (see [`ControlPlaneGuard::shutdown`]).
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Drains the agent control plane on scope exit — normal return *or* panic
+/// unwind — so a panicking render loop can't leak a live PTY process group.
+/// `shutdown` is idempotent so the explicit non-panic call and the `Drop`
+/// fallback don't double-tear-down.
+struct ControlPlaneGuard<'a> {
+    plane: Option<(supervisor::SupervisorHandle, tokio::task::JoinHandle<()>)>,
+    runtime: &'a tokio::runtime::Runtime,
+}
+
+impl ControlPlaneGuard<'_> {
+    /// Signal shutdown and block until every agent's process has actually been
+    /// torn down. Taking the plane out makes a second call (e.g. from `Drop`
+    /// after the explicit call) a no-op.
+    fn shutdown(&mut self) {
+        if let Some((handle, join)) = self.plane.take() {
+            handle.shutdown();
+            // Bound the wait. A launch wedged in a blocking `git worktree` op (a
+            // stale `index.lock`, a credential prompt on a no-tty, a slow network
+            // FS) must not pin quit forever behind the supervisor's `tracker.wait`
+            // — that would leave the user in a frozen, raw-mode terminal, the exact
+            // corrupted-exit the panic hook exists to prevent. If the grace elapses
+            // we abandon the join; the terminal is restored by the caller either
+            // way, and the runtime reclaims the detached blocking thread on drop.
+            let _ = self
+                .runtime
+                .block_on(async { tokio::time::timeout(SHUTDOWN_GRACE, join).await });
+        }
+    }
+}
+
+impl Drop for ControlPlaneGuard<'_> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Whether the cockpit may arm a real agent control plane. `--demo` runs on a
+/// synthetic graph of fictional issues, so it must stay a read-only viewer (the
+/// documented contract) even inside a real git repo — otherwise `a` would shell
+/// out a real `git worktree add` + `claude` for a made-up issue and mutate the
+/// repo's on-disk session state. (Outside a repo `start_control_plane` already
+/// returns `None`; this gate covers the demo-inside-a-repo case it can't see.)
+fn control_plane_enabled(demo: bool) -> bool {
+    !demo
 }
 
 /// Build and start the agent control plane: worktree manager, session store
@@ -276,8 +356,27 @@ fn start_control_plane(
 
     let repo_root = std::env::current_dir().ok()?;
     let worktree = worktree::WorktreeManager::new(&repo_root).ok()?;
+    let state_path = session::SessionStore::state_path(&repo_root);
     let store = Arc::new(Mutex::new(
-        session::SessionStore::load(session::SessionStore::state_path(&repo_root)).ok()?,
+        match session::SessionStore::load(state_path.clone()) {
+            Ok(store) => store,
+            // A state file from a NEWER lindep must not be clobbered with our
+            // older format — bail to the read-only viewer and say why.
+            Err(e @ session::StateError::Version { .. }) => {
+                let _ = events.send(event::AppEvent::Notification(format!(
+                    "agents disabled: {e}"
+                )));
+                return None;
+            }
+            // Corrupt/unreadable state must not brick the cockpit: start fresh
+            // (the bad file is overwritten on the first save) and warn.
+            Err(e) => {
+                let _ = events.send(event::AppEvent::Notification(format!(
+                    "session state unreadable ({e}); starting fresh"
+                )));
+                session::SessionStore::empty(state_path)
+            }
+        },
     ));
 
     // On startup, drop session records whose worktree vanished while we were off.
@@ -294,9 +393,34 @@ fn start_control_plane(
         }
     }
 
+    // Rehydrate the fleet view from the durable store, through the single event
+    // funnel, so a restart surfaces last-known agent status instead of a blank
+    // overview ("the process is disposable; the conversation is durable"). The
+    // processes are gone — we just restarted — so a previously Spawning/Running
+    // session resolves to Idle (resumable, not falsely "live"); NeedsYou/Idle/
+    // Done/Failed carry over verbatim. These events sit in the channel and are
+    // drained on the first render tick, before the first paint.
+    if let Ok(store) = store.lock() {
+        for session in store.sessions() {
+            let status = match session.status {
+                session::AgentStatus::Spawning | session::AgentStatus::Running => {
+                    session::AgentStatus::Idle
+                }
+                other => other,
+            };
+            let _ = events.send(event::AppEvent::AgentStatusChanged {
+                issue: session.issue.clone(),
+                status,
+            });
+        }
+    }
+
     // The hook endpoint must bind before agents launch so their settings can
     // point at it. block_on is safe here — we're on the synchronous main thread.
-    let hook_port = runtime
+    let notify::Endpoint {
+        port: hook_port,
+        token: hook_token,
+    } = runtime
         .block_on(notify::serve(events.clone(), Arc::clone(&store)))
         .ok()?;
 
@@ -310,6 +434,7 @@ fn start_control_plane(
         spawn: backend::pty_spawn(),
         exe,
         hook_port,
+        hook_token,
         hooks_dir: repo_root.join(".lindep").join("hooks"),
         base: "HEAD".to_string(),
         rows,
@@ -352,11 +477,16 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
 
         // Bound input latency with a poll timeout; this also paces how often we
         // check the event channel and the animation clock. The poll itself is
-        // cheap and never repaints. We poll fast (16 ms) when a live PTY screen
-        // is on screen — attached, or a chat wall of live agents — so input and
-        // output feel live; at the animation cadence (100 ms) when something is
-        // merely animating off to the side (a spinner in the list); and idle at
-        // 250 ms when nothing moves, keeping a quiet cockpit truly quiet.
+        // cheap and never repaints, and `term_event::poll` only wakes early on
+        // terminal input — so a background AppEvent (needs-you, a spawn, a hook
+        // notification) isn't seen until the next poll returns. We poll fast
+        // (16 ms) when a live PTY screen is on screen — attached, or a chat wall
+        // of live agents — so input/output feel live; at the animation cadence
+        // (100 ms) when something is merely animating off to the side (a spinner
+        // in the list); and at a short 50 ms idle otherwise, so a needs-you
+        // prompt lights up the node promptly. Only the dirty flag triggers a
+        // redraw (an idle tick sets nothing dirty), so a quiet cockpit never
+        // busy-repaints.
         let chats_live = app.right_view == app::RightView::Chat
             && app.mode == app::Mode::Lens
             && !app.chat_panes().is_empty();
@@ -365,7 +495,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
         } else if app.is_animating() {
             ANIM_FRAME
         } else {
-            Duration::from_millis(250)
+            Duration::from_millis(50)
         };
         if term_event::poll(timeout)? {
             match term_event::read()? {
@@ -611,6 +741,23 @@ mod tests {
         assert_eq!(parse_size("100x30"), (100, 30));
         assert_eq!(parse_size("80X24"), (80, 24));
         assert_eq!(parse_size("garbage"), (120, 40));
+    }
+
+    #[test]
+    fn demo_mode_never_arms_the_control_plane() {
+        // The documented contract: `--demo` is a read-only graph viewer even when
+        // launched from inside a real git repo. Gating on demo here is what stops
+        // `run_tui` from binding the hook endpoint, reconciling/saving session
+        // state, and arming the supervisor on fictional issues. A real (non-demo)
+        // run is still free to stand the control plane up.
+        assert!(
+            !control_plane_enabled(true),
+            "--demo must degrade to the read-only viewer, never arm a live cockpit"
+        );
+        assert!(
+            control_plane_enabled(false),
+            "a real run must be allowed to arm the control plane"
+        );
     }
 
     #[test]

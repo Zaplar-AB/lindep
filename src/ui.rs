@@ -68,21 +68,28 @@ fn render_attached(app: &mut App, frame: &mut Frame) {
     // Clone the Arc out so we can both read its parser and mutate `app` (the
     // resize bookkeeping) without overlapping borrows.
     let Some(backend) = app.backends.get(&issue).cloned() else {
-        // The agent vanished from under us — drop back to the dashboard.
-        app.attached = None;
+        // The agent vanished from under us. Rendering is a pure function of
+        // state — it must not mutate `app.attached` (that's apply_event/on_key's
+        // job, the single funnel). Paint an empty pane this frame; the next tick
+        // resets attachment. This branch is currently unreachable (no apply_event
+        // removes a backend we're attached to), so it's only defensive.
         return;
     };
 
+    // Sample the volatile lifecycle once: the wait thread can flip
+    // Running→Exited at any moment, so reading status() repeatedly would let the
+    // title, border and resize guard disagree within one frame.
+    let lifecycle = backend.status();
+    let exited = matches!(lifecycle, Lifecycle::Exited(_));
+    let detach = app.detach_key_label();
     // A dead agent is shown as a frozen, amber EXITED pane rather than a live
     // racing-green one, so "this agent is gone" is unmistakable.
-    let key = app
-        .graph
-        .get(&issue)
-        .map_or(issue.clone(), |i| i.key.clone());
-    let detach = app.detach_key_label();
-    let exited = matches!(backend.status(), Lifecycle::Exited(_));
-    let (title, header_style, border) = if let Lifecycle::Exited(code) = backend.status() {
+    let (title, header_style, border) = if let Lifecycle::Exited(code) = lifecycle {
         let code = code.map_or_else(|| "signal".to_string(), |c| c.to_string());
+        let key = app
+            .graph
+            .get(&issue)
+            .map_or(issue.as_str(), |i| i.key.as_str());
         (
             format!(" ○ EXITED ({code})  {key}  · {detach} to leave "),
             Style::new().fg(INK).bg(AMBER_500).bold(),

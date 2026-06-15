@@ -98,9 +98,10 @@ supervisor ─► AppEvent::{AgentSpawned,AgentStatusChanged,Notification} ─�
 
 `apply_event` is the **single funnel** for off-thread state changes, keeping
 rendering a pure function of `App`. Status authority is split cleanly to avoid a
-race: the **supervisor** owns fleet status via `AgentStatusChanged` (Idle on a
+race: the **supervisor** owns fleet status via `AgentStatusChanged` (Stopped on a
 deliberate cancel, Done/Failed on a self-exit); `AgentExited` only updates the
-footer line and reclaims the dead PTY handle — it never sets status.
+footer line and reclaims the dead PTY handle — it never sets status. A reaped
+agent is then dropped from the fleet view via `AgentReaped`.
 
 **Commands.** The cockpit holds a cheap, cloneable `SupervisorHandle` and sends
 fire-and-forget `Command`s (`Launch`/`Cancel`/`Shutdown`). The supervisor's
@@ -291,7 +292,9 @@ permission UI. That needs a human at a real terminal: `cargo run`, `a`, then `t`
 
 - Visual fidelity of claude-in-tui-term is vt100-level; a `vt100-ctt` fallback is
   noted in the spike verdict if needed.
-- A hung `git worktree add` delays only *that* launch (it runs off the command
-  loop), not cancel/shutdown of other agents.
+- A hung `git worktree add` delays only *that* launch: it runs off the command
+  loop, the launch races its blocking git against the cancel token, and quit
+  bounds the teardown wait (`SHUTDOWN_GRACE`) and restores the terminal
+  regardless — so a wedged git can't freeze cancel/shutdown or the exit.
 - A killed mid-task agent loses its in-flight tool action; `--resume` recovers the
   conversation, not the action.

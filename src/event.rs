@@ -47,6 +47,10 @@ pub enum AppEvent {
     /// The agent on `issue` took an action (e.g. ran a tool) — a per-issue
     /// activity line (from a `PostToolUse` hook).
     AgentAction { issue: String, action: String },
+    /// The supervisor finished tearing an agent down and dropped it from its live
+    /// map. The cockpit drops it from the fleet view too, so the overview stays
+    /// bounded and mirrors the supervisor instead of accreting dead agents.
+    AgentReaped { issue: String },
 }
 
 /// Sender half — cloned into every background subsystem.
@@ -71,6 +75,15 @@ pub fn channel() -> (AppEventTx, AppEventRx) {
 /// the synchronous render loop on the main thread.
 pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
+        // The async side is light and await-heavy: one supervisor task, one
+        // accept loop, short hook handlers, and per-agent supervise tasks that
+        // mostly sit in `select!`. Concurrency is bounded by `max_concurrent`
+        // agents, and the genuinely blocking work (PTY read/wait, git) runs on
+        // dedicated/blocking threads — not these workers. So a small explicit
+        // cap serves the whole workload; the num_cpus default would spin a dozen
+        // idle workers on a workstation for no benefit. The blocking pool keeps
+        // its default for `git`/`spawn_blocking`.
+        .worker_threads(2)
         .enable_all()
         .thread_name("lindep-rt")
         .build()
