@@ -78,6 +78,16 @@ impl AgentStatus {
         )
     }
 
+    /// Whether the agent's process is gone for good — a `Stopped` (deliberate
+    /// stop), `Done` (clean finish) or `Failed` (crash). The exact complement of
+    /// [`is_live`](Self::is_live); it closes a [`crate::ledger`] episode.
+    pub const fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            AgentStatus::Stopped | AgentStatus::Done | AgentStatus::Failed
+        )
+    }
+
     /// Whether this status should drive the animation tick — the states where
     /// the agent is actively doing (or waiting to do) something, so a quiet
     /// cockpit of only resting/terminal agents still never busy-repaints.

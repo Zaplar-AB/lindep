@@ -79,12 +79,18 @@ impl Picker {
 /// project switcher, `Ctrl-a s`). Mirrors the full-screen [`draw`] but boxed and
 /// with a `Clear` behind it so it floats above the cockpit; the cockpit feeds it
 /// keys (see `App::on_switcher_key`) instead of running its own event loop.
-pub(crate) fn render_overlay(picker: &mut Picker, frame: &mut Frame, full: Rect) {
+pub(crate) fn render_overlay(
+    picker: &mut Picker,
+    frame: &mut Frame,
+    full: Rect,
+    needs_you: &std::collections::HashSet<String>,
+) {
     // Widen to u32 for the arithmetic so a pathologically large terminal can't
     // overflow u16 (`width * 6`) and panic in a debug build.
-    let width = (u32::from(full.width) * 6 / 10).clamp(u32::from(40.min(full.width)), u32::from(full.width)) as u16;
-    let height =
-        (u32::from(full.height) * 6 / 10).clamp(u32::from(8.min(full.height)), u32::from(full.height)) as u16;
+    let width = (u32::from(full.width) * 6 / 10)
+        .clamp(u32::from(40.min(full.width)), u32::from(full.width)) as u16;
+    let height = (u32::from(full.height) * 6 / 10)
+        .clamp(u32::from(8.min(full.height)), u32::from(full.height)) as u16;
     let area = Rect {
         x: full.x + (full.width.saturating_sub(width)) / 2,
         y: full.y + (full.height.saturating_sub(height)) / 2,
@@ -123,14 +129,21 @@ pub(crate) fn render_overlay(picker: &mut Picker, frame: &mut Frame, full: Rect)
     ]);
     frame.render_widget(Paragraph::new(query_line), query);
 
+    // A project with an agent that needs you carries a breathing ⚑ — so a
+    // backgrounded prompt is visible right where you'd switch to handle it.
     let items: Vec<ListItem> = picker
         .order
         .iter()
         .map(|&i| {
-            ListItem::new(Line::from(Span::styled(
-                picker.projects[i].name.clone(),
-                Style::new().fg(INK),
-            )))
+            let project = &picker.projects[i];
+            let mut spans = vec![Span::styled(project.name.clone(), Style::new().fg(INK))];
+            if needs_you.contains(&project.id) {
+                // Steady (not breathing): the switcher is a modal and a
+                // backgrounded needs-you doesn't drive the animation tick, so an
+                // animated flag here would never actually repaint.
+                spans.push(Span::styled("  ⚑", Style::new().fg(AMBER_400).bold()));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let list = List::new(items)
@@ -314,10 +327,13 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut p = Picker::new(projects());
+        let needs = std::collections::HashSet::from(["1".to_string()]); // Billing (id 1)
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
-        term.draw(|f| render_overlay(&mut p, f, f.area())).unwrap();
+        term.draw(|f| render_overlay(&mut p, f, f.area(), &needs))
+            .unwrap();
         let out = term.backend().to_string();
         assert!(out.contains("SWITCH PROJECT"));
         assert!(out.contains("Billing"));
+        assert!(out.contains('⚑'), "a project that needs you is flagged");
     }
 }

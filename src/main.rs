@@ -9,6 +9,7 @@ mod demo;
 mod event;
 mod keymap;
 mod layout;
+mod ledger;
 mod linear;
 mod model;
 mod picker;
@@ -340,6 +341,18 @@ fn run_tui(
         let _ = app.snapshot_cockpit().save(&path);
     }
 
+    // Close any still-open ledger runs (with each agent's last-known terminal
+    // status, if it has one) and persist — so a clean quit leaves no dangling
+    // "running" run for the next launch to read as interrupted. The fleet is
+    // disposable now, so move it out to feed the closer without a borrow clash.
+    if let Some(path) = app.ledger_path.clone() {
+        let now = ledger::now_unix();
+        let fleet = std::mem::take(&mut app.fleet);
+        app.ledger
+            .close_open(now, |_, issue| fleet.get(issue).copied());
+        let _ = app.ledger.save(&path);
+    }
+
     // Normal path: stop agents before restoring the terminal. (On a panic the
     // guard's `Drop` does the same during unwind; here we drop it explicitly so
     // teardown is ordered before `ratatui::restore`.)
@@ -637,6 +650,30 @@ fn start_control_plane(
         }
     }
 
+    // Load the per-issue agent ledger. Unlike the cockpit layout it spans every
+    // project, so its path stays fixed across switches (the booted repo's file).
+    // Same degrade-gracefully discipline as the cockpit/state guards: a newer file
+    // is left untouched; a corrupt one starts fresh and is overwritten on the next
+    // run.
+    let ledger_path = ledger::Ledger::path(&repo_root);
+    match ledger::Ledger::load(&ledger_path) {
+        Ok(l) => {
+            app.ledger = l;
+            app.ledger_path = Some(ledger_path);
+        }
+        Err(e @ session::StateError::Version { .. }) => {
+            let _ = events_back.send(event::AppEvent::Notification(format!(
+                "agent ledger is from a newer lindep; leaving it untouched ({e})"
+            )));
+        }
+        Err(e) => {
+            let _ = events_back.send(event::AppEvent::Notification(format!(
+                "agent ledger unreadable ({e}); starting fresh"
+            )));
+            app.ledger_path = Some(ledger_path);
+        }
+    }
+
     // Auto-resume docked agents that were live before the restart — eager for the
     // focused one + up to cap-1 others, lazy (on first focus) for the rest.
     // Default-ON: the plan gated this behind `--no-resume` ("ships dark until
@@ -752,6 +789,16 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
                 let _ = app.snapshot_cockpit().save(&path);
             }
         }
+
+        // Persist the agent ledger when a run started/ended (same cadence as the
+        // cockpit layout — a lifecycle change, never a keystroke). Best-effort: the
+        // ledger is view-only history, so a write failure must not end the session.
+        if app.ledger_dirty {
+            app.ledger_dirty = false;
+            if let Some(path) = app.ledger_path.clone() {
+                let _ = app.ledger.save(&path);
+            }
+        }
     }
     Ok(())
 }
@@ -807,6 +854,26 @@ mod tests {
         assert!(out.contains("2 agents"), "header counts agents:\n{out}");
         assert!(out.contains("needs you"), "header flags attention");
         assert!(out.contains('⚑'), "needs-you flag is visible");
+    }
+
+    #[test]
+    fn the_ledger_overlay_lists_an_issues_agent_runs() {
+        // The durable session ledger surfaced in the Ctrl-a t overlay: a completed
+        // run on the selection shows its outcome and prompt count.
+        let mut app = App::new(demo::graph());
+        let issue = app.root.clone();
+        app.ledger.begin("", &issue, "sid".into(), 1_000);
+        app.ledger.note_needs_you("", &issue);
+        app.ledger
+            .note_terminal("", &issue, AgentStatus::Done, 1_600);
+        app.show_ledger = true;
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(
+            out.contains("agent session ledger"),
+            "the ledger overlay renders:\n{out}"
+        );
+        assert!(out.contains(&issue), "it names the issue");
+        assert!(out.contains("done"), "it shows the run's outcome");
     }
 
     #[test]

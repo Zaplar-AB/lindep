@@ -254,7 +254,7 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
     // transcript path must survive even if no further status write happens.
     // Snapshot under the lock; the blocking write runs after the guard drops so a
     // rename never stalls another hook. A poisoned lock drops the hook.
-    let (issue, snapshot, notif_needs_you) = match store.lock() {
+    let (issue, snapshot, notif_needs_you, working) = match store.lock() {
         Ok(mut store) => {
             let issue = resolve_issue(payload, &store);
             let mut dirty = false;
@@ -294,19 +294,39 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
             let notif_needs_you =
                 event_name == "Notification" && notification_implies_needs_you(payload, current);
 
+            // Whether this hook is an unambiguous sign the agent is *actively
+            // working again*. `UserPromptSubmit` (the user just sent a turn) and
+            // `PostToolUse` (a tool ran) are the two; an MCP elicitation that
+            // *completes* also means a block was answered. A working signal
+            // promotes any live state — including `NeedsYou` — back to `Running`,
+            // which is what finally resolves a prompt once the user answers and
+            // the agent resumes. (Without this, only the *next* `Stop` cleared
+            // `NeedsYou`, so an answered, busy agent stayed flagged for its whole
+            // turn — the "needs-you never resolves once you answer" bug.)
+            let working = matches!(event_name, "UserPromptSubmit" | "PostToolUse")
+                || (event_name == "Notification"
+                    && matches!(
+                        payload.notification_type.as_deref(),
+                        Some("elicitation_complete" | "elicitation_response")
+                    ));
+
             // The durable status this hook implies (None = surface-only).
             let implied = match event_name {
                 "Notification" if notif_needs_you => Some(AgentStatus::NeedsYou),
                 "Stop" => Some(AgentStatus::Idle),
-                // The first tool run is the real "working" signal — we no longer
-                // fake `Running` at spawn. Promote a starting/idle agent; never
-                // revive a terminal one, and don't churn a persist when it's
-                // already Running (the `changed` guard below handles that).
-                "PostToolUse"
-                    if matches!(current, Some(AgentStatus::Spawning | AgentStatus::Idle)) =>
-                {
-                    Some(AgentStatus::Running)
-                }
+                // Any working signal promotes a live, non-terminal agent to
+                // Running — Spawning/Idle (it began a turn) AND NeedsYou (it
+                // resumed after you answered). Never revive a terminal agent; a
+                // no-op when already Running is absorbed by the `changed` guard.
+                _ if working => match current {
+                    Some(
+                        AgentStatus::Spawning
+                        | AgentStatus::Idle
+                        | AgentStatus::NeedsYou
+                        | AgentStatus::Running,
+                    ) => Some(AgentStatus::Running),
+                    _ => None,
+                },
                 _ => None,
             };
             if let (Some(issue), Some(status)) = (issue.as_deref(), implied) {
@@ -327,7 +347,7 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
             } else {
                 None
             };
-            (issue, snapshot, notif_needs_you)
+            (issue, snapshot, notif_needs_you, working)
         }
         Err(_) => return,
     };
@@ -350,10 +370,20 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
                 reason,
             }
         }
+        // The user submitted a turn: the agent is working now. A bare status
+        // change (no tool name to show) that, like any working signal, clears a
+        // standing NeedsYou — answering a question is precisely a prompt submit.
+        (Some(issue), "UserPromptSubmit") => AppEvent::AgentAction {
+            project_id,
+            issue,
+            action: "working…".to_string(),
+            working: true,
+        },
         (Some(issue), "Notification") => {
             // A non-blocking notification (idle nudge / auth-success /
-            // elicitation-complete): surface it quietly, without raising the flag
-            // or disturbing the agent's status.
+            // elicitation-complete): surface it quietly. `working` is true only
+            // for an elicitation-complete (a block was answered → resumes), so an
+            // idle nudge never disturbs a needs-you agent's status.
             let note = payload
                 .notification_type
                 .as_deref()
@@ -363,6 +393,7 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
                 project_id,
                 issue,
                 action: note,
+                working,
             }
         }
         (Some(issue), "Stop") => AppEvent::AgentStatusChanged {
@@ -379,12 +410,14 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
                 project_id,
                 issue,
                 action,
+                working: true,
             }
         }
         (Some(issue), other) => AppEvent::AgentAction {
             project_id,
             issue,
             action: format!("hook: {}", clamp_display(other)),
+            working: false,
         },
         (None, name) => AppEvent::Notification(format!(
             "hook {:?} from an unmapped session",
@@ -585,8 +618,14 @@ pub fn hook_settings_json(exe: &str, port: u16, token: &str) -> String {
     let command = format!("'{escaped}' --hook-forward {port} --hook-token '{escaped_token}'");
     let entry = json!({ "hooks": [{ "type": "command", "command": command }] });
     let matched = json!({ "matcher": "*", "hooks": [{ "type": "command", "command": command }] });
+    // `UserPromptSubmit` is the leading "the agent is now working" signal: it
+    // fires the instant the user sends a turn, *before* any tool runs — so a
+    // turn that thinks/streams text (or answers in pure prose) reads WORKING
+    // immediately instead of lingering on the trailing first-PostToolUse. It is
+    // also the clean "the user answered" signal that clears a standing NeedsYou.
     let settings = json!({
         "hooks": {
+            "UserPromptSubmit": [entry],
             "Notification": [entry],
             "Stop": [entry],
             "PostToolUse": [matched],
@@ -975,6 +1014,98 @@ mod tests {
         }
         let _ = drain(&mut rx).await;
         assert!(promoted, "the first tool run moves 'starting…' → 'working'");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tool_run_after_the_user_answers_clears_needs_you() {
+        // The core needs-you bug: a permission prompt set NeedsYou, the user
+        // answered, and the agent resumed running tools — yet the flag never
+        // cleared until the next Stop. A PostToolUse from NeedsYou must now promote
+        // to Running (durably) and emit a *working* action so the cockpit resolves
+        // the flag the instant work resumes.
+        let (tx, mut rx) = crate::event::channel();
+        let store = seeded_store();
+        store
+            .lock()
+            .unwrap()
+            .set_status("ENG-1", AgentStatus::NeedsYou);
+        let sid = SessionStore::session_id_for("", "ENG-1");
+        let Endpoint { port, token } = serve(tx, registry_of(Arc::clone(&store))).await.unwrap();
+
+        let body = json!({
+            "session_id": sid, "cwd": "/wt/ENG-1",
+            "hook_event_name": "PostToolUse", "tool_name": "Bash"
+        })
+        .to_string();
+        post_hook(port, &token, body.as_bytes()).unwrap();
+
+        let mut cleared = false;
+        for _ in 0..50 {
+            if store.lock().unwrap().get("ENG-1").map(|r| r.status) == Some(AgentStatus::Running) {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let got = drain(&mut rx).await;
+        assert!(
+            cleared,
+            "a tool run after the user answers clears NeedsYou → Running"
+        );
+        assert!(
+            got.iter().any(|ev| matches!(
+                ev,
+                AppEvent::AgentAction { issue, working, .. } if issue == "ENG-1" && *working
+            )),
+            "the resumed tool run emits a *working* action that clears the flag; got {got:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submitting_a_prompt_marks_the_agent_working_and_clears_needs_you() {
+        // UserPromptSubmit is the leading "working" signal AND the clean "the user
+        // answered" signal: from NeedsYou (or Idle) it promotes to Running before
+        // any tool runs, so a text-only / thinking turn no longer reads idle.
+        let (tx, mut rx) = crate::event::channel();
+        let store = seeded_store();
+        store
+            .lock()
+            .unwrap()
+            .set_status("ENG-1", AgentStatus::NeedsYou);
+        let sid = SessionStore::session_id_for("", "ENG-1");
+        let Endpoint { port, token } = serve(tx, registry_of(Arc::clone(&store))).await.unwrap();
+
+        let body = json!({
+            "session_id": sid, "cwd": "/wt/ENG-1", "hook_event_name": "UserPromptSubmit"
+        })
+        .to_string();
+        post_hook(port, &token, body.as_bytes()).unwrap();
+
+        let mut working = false;
+        for _ in 0..50 {
+            if store.lock().unwrap().get("ENG-1").map(|r| r.status) == Some(AgentStatus::Running) {
+                working = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let got = drain(&mut rx).await;
+        assert!(working, "submitting a prompt moves the agent to Running");
+        assert!(
+            got.iter().any(|ev| matches!(
+                ev,
+                AppEvent::AgentAction { issue, working, .. } if issue == "ENG-1" && *working
+            )),
+            "the prompt submit emits a working action; got {got:?}"
+        );
+    }
+
+    #[test]
+    fn hook_settings_register_the_user_prompt_submit_working_signal() {
+        // The leading working signal must actually be wired, or a thinking/
+        // text-only turn keeps reading idle until its first tool.
+        let json = hook_settings_json("/opt/lindep", 8765, "t");
+        assert!(json.contains("UserPromptSubmit"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

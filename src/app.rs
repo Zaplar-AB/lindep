@@ -22,6 +22,7 @@ use crate::backend::{self, AgentBackend, Lifecycle};
 use crate::event::{AppEvent, AppEventTx};
 use crate::keymap::{Action, Keymap};
 use crate::layout;
+use crate::ledger::Ledger;
 use crate::linear::{Client, ProjectRef};
 use crate::model::{Direction, Graph, Issue};
 use crate::picker::Picker;
@@ -233,6 +234,13 @@ pub struct App {
     /// their agents run) so switching back re-attaches to the real PTYs; the
     /// active project's backends live in [`Self::backends`].
     stashed_backends: HashMap<String, HashMap<String, Arc<dyn AgentBackend>>>,
+    /// Issues that need you in projects you're *not* currently inside, keyed by
+    /// `project_id`. The scoping guard drops a backgrounded project's agent events
+    /// from the on-screen fleet, but a "needs you" there must still surface — so we
+    /// tally it here (and clear it when that agent resumes/exits, or when you switch
+    /// into the project). Drives the header's "⚑N elsewhere" badge, the switcher's
+    /// per-project flag, and a one-time toast. Never holds the active project.
+    other_needs_you: HashMap<String, HashSet<String>>,
     /// Hand-off slot for a switch's freshly-loaded graph: the off-thread fetch
     /// drops `(gen, target, graph)` here and wakes the loop with
     /// [`AppEvent::ProjectActivated`] (`Graph` is neither `Clone` nor `Debug`, so
@@ -262,6 +270,23 @@ pub struct App {
     /// should be re-persisted. The render thread (the sole cockpit writer) checks
     /// it after handling input and saves, so a structural change survives a crash.
     pub cockpit_dirty: bool,
+
+    /// The per-issue agent ledger — a durable history of which sessions ran for an
+    /// issue. Recorded from lifecycle events for *every* project (the render thread
+    /// sees them before the scoping guard), so a backgrounded project's runs are
+    /// logged too. Rendered in the `Ctrl-a t` overlay and the `i` summary panel.
+    pub ledger: Ledger,
+    /// Where the ledger persists (`.lindep/ledger.json`), or `None` with the
+    /// control plane off. Unlike [`cockpit_path`](Self::cockpit_path) this is
+    /// *not* cleared on a project switch: the ledger spans every project, so it
+    /// keeps persisting to the booted repo's file across switches.
+    pub ledger_path: Option<PathBuf>,
+    /// Set when a ledger run started/ended so the render thread re-persists it
+    /// (alongside the cockpit layout). Like `cockpit_dirty`, this fires only on a
+    /// lifecycle change, never per keystroke.
+    pub ledger_dirty: bool,
+    /// Dismissable overlay listing the selected issue's agent run history (`Ctrl-a t`).
+    pub show_ledger: bool,
 
     pub should_quit: bool,
 }
@@ -326,6 +351,7 @@ impl App {
             mapped_projects: HashSet::new(),
             project_switcher: None,
             stashed_backends: HashMap::new(),
+            other_needs_you: HashMap::new(),
             switch_inbox: Arc::new(Mutex::new(None)),
             switch_seq: 0,
             pending_switch: None,
@@ -335,6 +361,10 @@ impl App {
             keymap: Keymap::default(),
             cockpit_path: None,
             cockpit_dirty: false,
+            ledger: Ledger::default(),
+            ledger_path: None,
+            ledger_dirty: false,
+            show_ledger: false,
             should_quit: false,
         };
         app.rebuild_order();
@@ -507,9 +537,10 @@ impl App {
 
         // 5. The help overlay sits above the keymap so a typo can't trap you: any
         //    key (Esc included) dismisses it.
-        if self.show_help || self.show_summary {
+        if self.show_help || self.show_summary || self.show_ledger {
             self.show_help = false;
             self.show_summary = false;
+            self.show_ledger = false;
             return;
         }
 
@@ -521,7 +552,15 @@ impl App {
             WindowKind::Coin {
                 issue,
                 mode: CoinMode::Chat,
-            } => self.forward_to_agent(&issue, key),
+            } => {
+                // Typing into the very agent that needs you is the strongest "I'm
+                // handling it" signal: drop the sticky footer alert now. The
+                // per-issue NeedsYou status clears the moment the agent resumes
+                // (the UserPromptSubmit / PostToolUse hooks), so the roster/header
+                // stay honest until then.
+                self.needs_you_alert = false;
+                self.forward_to_agent(&issue, key);
+            }
             // A coin's deps face navigates exactly like the old Deps pane.
             WindowKind::Coin {
                 mode: CoinMode::Deps,
@@ -552,6 +591,7 @@ impl App {
                     match action {
                         Action::ToggleHelp => self.show_help = !self.show_help,
                         Action::ToggleSummary => self.show_summary = !self.show_summary,
+                        Action::ToggleLedger => self.show_ledger = !self.show_ledger,
                         _ => {}
                     }
                 }
@@ -628,6 +668,7 @@ impl App {
             }
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ToggleSummary => self.show_summary = !self.show_summary,
+            Action::ToggleLedger => self.show_ledger = !self.show_ledger,
             Action::ToggleRoster => {
                 self.windows.focus = 0;
                 self.toggle_roster();
@@ -787,11 +828,17 @@ impl App {
 
         self.active_project = project.id.clone();
         self.graph = graph;
+        // Its needs-you now shows in the on-screen fleet (re-emitted below), so drop
+        // the backgrounded "elsewhere" tally for the project we're entering.
+        self.other_needs_you.remove(&project.id);
 
         // Restore the target's stashed backends, dropping any whose agent exited
         // while backgrounded (its exit/reap events were filtered out, so the only
         // way to know is to ask the backend).
-        let restored = self.stashed_backends.remove(&project.id).unwrap_or_default();
+        let restored = self
+            .stashed_backends
+            .remove(&project.id)
+            .unwrap_or_default();
         self.backends = restored
             .into_iter()
             .filter(|(_, b)| !matches!(b.status(), Lifecycle::Exited(_)))
@@ -865,6 +912,7 @@ impl App {
             Action::StartSearch => self.start_search(),
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ToggleSummary => self.show_summary = !self.show_summary,
+            Action::ToggleLedger => self.show_ledger = !self.show_ledger,
             _ => {}
         }
     }
@@ -887,6 +935,7 @@ impl App {
             Action::OpenFleet => self.open_fleet(),
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ToggleSummary => self.show_summary = !self.show_summary,
+            Action::ToggleLedger => self.show_ledger = !self.show_ledger,
             _ => {}
         }
         // The transient preview follows the selection both ways: re-rooting its
@@ -1252,10 +1301,41 @@ impl App {
         match self.workspace.clone() {
             Some(workspace) => {
                 workspace.cancel(self.active_project.clone(), issue.clone());
-                self.status_msg = Some(format!("killing agent on {issue}…"));
+                // Kill also undocks the agent's window — pinned coins included.
+                // Close is "undock, agent keeps running"; kill is "stop it and put
+                // it away", so a killed agent never lingers as a dead EXITED card
+                // you have to dismiss by hand.
+                let closed = self.undock_issue(&issue);
+                self.status_msg = Some(if closed {
+                    format!("killing agent on {issue} · window closed")
+                } else {
+                    format!("killing agent on {issue}…")
+                });
             }
             None => self.status_msg = Some("agent control plane unavailable".into()),
         }
+    }
+
+    /// Close every window for `issue` (pinned coins + the preview if aimed there)
+    /// and tidy up after them — the kill verb's window teardown. Returns whether a
+    /// *docked* (pinned) window was closed, so the caller knows the layout changed.
+    /// A fresh preview is re-aimed at the current selection so the strip is never
+    /// left previewless. The backend is reclaimed on the agent's reap (no window
+    /// references it now); a still-live one is left to the supervisor's teardown.
+    fn undock_issue(&mut self, issue: &str) -> bool {
+        let removed = self.windows.close_issue(issue);
+        if removed.is_empty() {
+            return false;
+        }
+        let closed_pinned = removed.iter().any(|w| w.pinned);
+        for w in &removed {
+            self.preview_size.remove(&w.id);
+        }
+        if closed_pinned {
+            self.cockpit_dirty = true; // a docked window left the set
+        }
+        self.reaim_preview();
+        closed_pinned
     }
 
     fn toggle_layout(&mut self) {
@@ -1638,19 +1718,29 @@ impl App {
     /// Apply a background [`AppEvent`] to view state, returning whether the
     /// screen must repaint. The render loop is the single writer of `App`.
     pub fn apply_event(&mut self, ev: AppEvent) -> bool {
+        // Record the durable per-issue ledger for EVERY project — before the
+        // scoping guard below drops a backgrounded project's events from the
+        // on-screen fleet — so an agent's run history is captured no matter which
+        // project you're inside when it runs.
+        self.record_ledger(&ev);
         // While the cockpit is inside one project, an agent event from another
         // (backgrounded) project isn't for the fleet on screen — drop it. ENG-401
         // shards the fleet by project and files these instead of dropping. An
         // empty `active_project` (demo / snapshots / unit tests, which never arm a
         // workspace) disables the guard so every event still applies.
         if !self.active_project.is_empty()
-            && ev.project_id().is_some_and(|pid| pid != self.active_project)
+            && ev
+                .project_id()
+                .is_some_and(|pid| pid != self.active_project)
         {
             // A backgrounded project's event isn't for the on-screen fleet — but a
             // backend that *spawns* while backgrounded must not be lost (its
             // AgentSpawned would otherwise be dropped and the agent orphaned on a
             // switch back, since the supervisor won't re-hand the backend). File it
-            // into that project's stash instead, and drop it again on reap.
+            // into that project's stash instead, and drop it again on reap. And a
+            // "needs you" over there must still surface, so we tally it (cleared
+            // when that agent resumes/exits) and toast it once.
+            let mut repaint = false;
             match ev {
                 AppEvent::AgentSpawned {
                     project_id,
@@ -1666,10 +1756,52 @@ impl App {
                     if let Some(m) = self.stashed_backends.get_mut(&project_id) {
                         m.remove(&issue);
                     }
+                    repaint = self.forget_elsewhere_needs_you(&project_id, &issue);
+                }
+                AppEvent::AgentNeedsYou {
+                    project_id, issue, ..
+                } => {
+                    let newly = self
+                        .other_needs_you
+                        .entry(project_id.clone())
+                        .or_default()
+                        .insert(issue.clone());
+                    if newly {
+                        // Toast once, but never bury a *local* standing alert.
+                        if !self.needs_you_alert {
+                            let name = self.project_name(&project_id);
+                            let switch = self.keymap.verb_label(Action::SwitchProject);
+                            self.status_msg = Some(format!(
+                                "⚑ {issue} in {name} needs you — {switch} to switch"
+                            ));
+                        }
+                        repaint = true; // refresh the header "elsewhere" badge
+                    }
+                }
+                // Any sign the backgrounded agent is no longer blocked clears it.
+                AppEvent::AgentStatusChanged {
+                    project_id,
+                    issue,
+                    status,
+                } if !status.needs_you() => {
+                    repaint = self.forget_elsewhere_needs_you(&project_id, &issue);
+                }
+                AppEvent::AgentAction {
+                    project_id,
+                    issue,
+                    working: true,
+                    ..
+                } => {
+                    repaint = self.forget_elsewhere_needs_you(&project_id, &issue);
+                }
+                AppEvent::AgentExited {
+                    project_id, issue, ..
+                } => {
+                    repaint = self.forget_elsewhere_needs_you(&project_id, &issue);
                 }
                 _ => {}
             }
-            return false;
+            return repaint;
         }
         match ev {
             AppEvent::Notification(text) => {
@@ -1681,7 +1813,11 @@ impl App {
             // and swap the cockpit over to it — unless a newer switch (or a cancel)
             // has since bumped the generation, in which case this result is stale.
             AppEvent::ProjectActivated => {
-                let taken = self.switch_inbox.lock().ok().and_then(|mut slot| slot.take());
+                let taken = self
+                    .switch_inbox
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take());
                 if let Some((generation, project, graph)) = taken
                     && generation == self.switch_seq
                 {
@@ -1747,24 +1883,44 @@ impl App {
                 if status.is_live() && self.is_terminal(&issue) {
                     return false;
                 }
-                if !status.needs_you() && self.fleet.get(&issue) == Some(&AgentStatus::NeedsYou) {
-                    self.needs_you_alert = false;
-                }
                 if matches!(status, AgentStatus::Done | AgentStatus::Failed) {
                     self.flash
                         .insert(issue.clone(), (Flash::Finished, self.frame + FLASH_FRAMES));
                 }
                 self.fleet.insert(issue, status);
+                // Clear the sticky alert only when *no* agent needs you anymore —
+                // resolving one of several needy agents must not silence the rest
+                // (the old per-event clear dropped the global flag on the first to
+                // resolve).
+                self.clear_needs_you_alert_if_resolved();
                 true
             }
-            AppEvent::AgentAction { issue, action, .. } => {
+            AppEvent::AgentAction {
+                issue,
+                action,
+                working,
+                ..
+            } => {
                 if self.is_terminal(&issue) || self.reaped.contains(&issue) {
                     return false;
                 }
-                if self.fleet.get(&issue) != Some(&AgentStatus::NeedsYou) {
+                let was_needs_you = self.fleet.get(&issue) == Some(&AgentStatus::NeedsYou);
+                // A working signal (a tool ran, the user answered) promotes even a
+                // needs-you agent back to Running — this is what resolves a prompt
+                // once you answer and it resumes. Ambient chatter (the idle nudge)
+                // leaves a needs-you agent alone so it can't silence a real prompt.
+                if working || !was_needs_you {
                     self.fleet.insert(issue.clone(), AgentStatus::Running);
                 }
-                if !self.needs_you_alert {
+                // The needy agent itself just resumed: drop the sticky footer alert
+                // unless *another* agent still needs you.
+                let resumed = working && was_needs_you;
+                if resumed {
+                    self.clear_needs_you_alert_if_resolved();
+                }
+                // Don't let routine chatter bury a standing alert — but the agent
+                // that just resumed may speak (its alert is the one we cleared).
+                if resumed || !self.needs_you_alert {
                     self.status_msg = Some(format!("{issue}: {action}"));
                 }
                 true
@@ -1777,6 +1933,10 @@ impl App {
                 if !self.windows.references_agent(&issue) {
                     self.backends.remove(&issue);
                 }
+                // A needy agent that's now gone leaves nothing to act on — drop the
+                // sticky alert (unless another agent still needs you). Without this
+                // a kill/exit of the flagged agent left the footer yelling forever.
+                self.clear_needs_you_alert_if_resolved();
                 true
             }
         }
@@ -1787,6 +1947,94 @@ impl App {
     fn set_footer(&mut self, text: String) {
         self.status_msg = Some(text);
         self.needs_you_alert = false;
+    }
+
+    /// Drop the sticky needs-you footer alert iff no agent in the on-screen fleet
+    /// still needs you. The alert summarises the per-issue [`AgentStatus::NeedsYou`]
+    /// set, so it must outlive resolving *one* of several needy agents and must
+    /// not survive the last one's resolution/exit. Only ever clears (never
+    /// re-arms), so an explicit acknowledge stays acknowledged.
+    fn clear_needs_you_alert_if_resolved(&mut self) {
+        if self.needs_you_alert && !self.fleet.values().any(AgentStatus::needs_you) {
+            self.needs_you_alert = false;
+        }
+    }
+
+    /// Drop `issue` from a backgrounded `project_id`'s needs-you tally (it resumed,
+    /// exited, or was reaped), pruning the project's entry once empty. Returns
+    /// whether anything was removed, so the caller can repaint the header badge.
+    fn forget_elsewhere_needs_you(&mut self, project_id: &str, issue: &str) -> bool {
+        let Some(set) = self.other_needs_you.get_mut(project_id) else {
+            return false;
+        };
+        let removed = set.remove(issue);
+        if set.is_empty() {
+            self.other_needs_you.remove(project_id);
+        }
+        removed
+    }
+
+    /// How many agents in *other* (backgrounded) projects need you — the count
+    /// behind the header's "⚑N elsewhere" badge.
+    pub fn elsewhere_needs_you(&self) -> usize {
+        self.other_needs_you.values().map(HashSet::len).sum()
+    }
+
+    /// The set of backgrounded `project_id`s with at least one agent needing you —
+    /// the switcher flags these.
+    pub fn projects_needing_you(&self) -> HashSet<String> {
+        self.other_needs_you.keys().cloned().collect()
+    }
+
+    /// Fold one lifecycle event into the durable per-issue ledger: a launch opens a
+    /// run, a `NeedsYou` bumps its prompt count, and a terminal status / reap closes
+    /// it. Called for every project (before the scoping guard), so backgrounded runs
+    /// are logged too; flips [`ledger_dirty`](Self::ledger_dirty) so the render
+    /// thread persists the change. Surface-only chatter (`AgentAction`, `Output`)
+    /// never touches the ledger.
+    fn record_ledger(&mut self, ev: &AppEvent) {
+        let now = crate::ledger::now_unix();
+        match ev {
+            AppEvent::AgentSpawned {
+                project_id, issue, ..
+            } => {
+                let sid = crate::session::SessionStore::session_id_for(project_id, issue);
+                self.ledger.begin(project_id, issue, sid, now);
+                self.ledger_dirty = true;
+            }
+            AppEvent::AgentNeedsYou {
+                project_id, issue, ..
+            } => {
+                self.ledger.note_needs_you(project_id, issue);
+                self.ledger_dirty = true;
+            }
+            AppEvent::AgentStatusChanged {
+                project_id,
+                issue,
+                status,
+            } if status.is_terminal() => {
+                self.ledger.note_terminal(project_id, issue, *status, now);
+                self.ledger_dirty = true;
+            }
+            AppEvent::AgentReaped { project_id, issue } => {
+                // A fallback close: the terminal AgentStatusChanged the supervisor
+                // emits first usually closes the run; this catches a reap with no
+                // verdict (e.g. a setup-failure teardown) without clobbering one.
+                self.ledger.note_closed(project_id, issue, now);
+                self.ledger_dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// A project's display name from the switcher list, falling back to its id when
+    /// the list is unavailable (demo / control plane off).
+    fn project_name(&self, project_id: &str) -> String {
+        self.project_list
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| project_id.to_string())
     }
 
     /// Drop the cached PTY geometry for every window referencing `issue` —
@@ -2051,7 +2299,8 @@ fn most_connected_root(graph: &Graph) -> String {
         .iter()
         .filter(|k| graph.get(k).is_some_and(|i| !i.external))
         .max_by_key(|k| {
-            graph.direct_count(k, Direction::Upstream) + graph.direct_count(k, Direction::Downstream)
+            graph.direct_count(k, Direction::Upstream)
+                + graph.direct_count(k, Direction::Downstream)
         })
         .cloned()
         .unwrap_or_default()
@@ -2186,7 +2435,10 @@ mod tests {
         // (not killed — its Arc lives on for a switch back).
         a.activate_project(project("proj-b", "Beta"), demo::graph());
         assert_eq!(a.active_project, "proj-b");
-        assert!(a.backends.is_empty(), "the new project starts with no backends");
+        assert!(
+            a.backends.is_empty(),
+            "the new project starts with no backends"
+        );
         assert!(a.fleet.is_empty(), "the new project's fleet starts empty");
         assert!(
             a.stashed_backends
@@ -2242,7 +2494,10 @@ mod tests {
         a.open_project_switcher();
         assert!(a.project_switcher.is_none(), "no overlay opens");
         assert!(
-            a.status_msg.as_deref().unwrap_or("").contains("control plane"),
+            a.status_msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("control plane"),
             "an actionable footer explains why"
         );
     }
@@ -2299,6 +2554,60 @@ mod tests {
                 .get("proj-b")
                 .is_none_or(|m| !m.contains_key("ENG-9")),
             "a reaped backgrounded agent is removed from the stash"
+        );
+    }
+
+    #[test]
+    fn a_backgrounded_projects_needs_you_surfaces_as_an_elsewhere_tally_and_clears() {
+        // A "needs you" in a project you switched away from must not vanish: it's
+        // dropped from the on-screen fleet but tallied for the header/switcher and
+        // toasted once — then cleared the moment that agent resumes work.
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        a.project_list = vec![project("proj-b", "Beta")];
+
+        let repaint = a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            reason: "permission".into(),
+        });
+        assert!(repaint, "the header 'elsewhere' badge repaints");
+        assert_eq!(a.elsewhere_needs_you(), 1);
+        assert!(a.projects_needing_you().contains("proj-b"));
+        assert!(
+            !a.fleet.contains_key("ENG-9"),
+            "a backgrounded needs-you never enters the active fleet"
+        );
+        assert!(
+            a.status_msg.as_deref().unwrap_or_default().contains("Beta"),
+            "the one-time toast names the project"
+        );
+
+        // The agent resumes (a working tool-run) → the elsewhere tally clears.
+        a.apply_event(AppEvent::AgentAction {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            action: "ran Edit".into(),
+            working: true,
+        });
+        assert_eq!(a.elsewhere_needs_you(), 0, "resumed work clears the tally");
+    }
+
+    #[test]
+    fn switching_into_a_project_clears_its_elsewhere_tally() {
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            reason: "permission".into(),
+        });
+        assert_eq!(a.elsewhere_needs_you(), 1);
+        a.activate_project(project("proj-b", "Beta"), demo::graph());
+        assert_eq!(
+            a.elsewhere_needs_you(),
+            0,
+            "entering the project moves its needs-you into the on-screen fleet"
         );
     }
 
@@ -2564,6 +2873,78 @@ mod tests {
         assert!(
             app.backends.contains_key("ZAP-204"),
             "a live agent keeps running (its backend is kept for re-find)"
+        );
+    }
+
+    #[test]
+    fn apply_event_records_a_run_in_the_ledger_for_any_project() {
+        // The ledger is fed from lifecycle events for EVERY project — even one you
+        // switched away from — recorded before the scoping guard. A spawn opens a
+        // run, a needs-you bumps its prompt count, a terminal status closes it.
+        let mut app = app();
+        app.active_project = "proj-a".into();
+        // A backgrounded project's agent: its events are dropped from the fleet…
+        let spawn = AppEvent::AgentSpawned {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            backend: FakeBackend::new("ENG-9") as Arc<dyn AgentBackend>,
+        };
+        app.apply_event(spawn);
+        app.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            reason: "permission".into(),
+        });
+        app.apply_event(AppEvent::AgentStatusChanged {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            status: AgentStatus::Done,
+        });
+
+        // …but the run is still in the ledger, fully closed.
+        let eps = app.ledger.episodes("proj-b", "ENG-9");
+        assert_eq!(
+            eps.len(),
+            1,
+            "the run was recorded for the backgrounded project"
+        );
+        assert_eq!(eps[0].outcome, Some(AgentStatus::Done));
+        assert_eq!(eps[0].needs_you, 1);
+        assert!(!eps[0].is_open(), "a terminal status closed the run");
+        assert!(
+            app.ledger_dirty,
+            "a recorded run asks the render thread to persist"
+        );
+    }
+
+    #[test]
+    fn kill_undocks_a_pinned_agent_window() {
+        // Bug: killing an agent left its pinned coin on screen as a dead card.
+        // Kill must now undock the issue's window (pinned included) — `undock_issue`
+        // is the window half of the confirmed-kill path.
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        press(&mut app, KeyCode::Enter); // active window → chat on ZAP-204
+        verb(&mut app, KeyCode::Char('p')); // pin = graduate to a permanent tab
+        assert!(
+            app.windows.pinned_coin_index("ZAP-204").is_some(),
+            "precondition: the agent has a pinned coin"
+        );
+
+        let closed_pinned = app.undock_issue("ZAP-204");
+        assert!(closed_pinned, "a docked window was closed");
+        assert!(
+            app.windows.pinned_coin_index("ZAP-204").is_none(),
+            "killing the agent undocked its pinned window"
+        );
+        assert!(
+            app.cockpit_dirty,
+            "closing a docked window re-persists the layout"
+        );
+        assert!(
+            app.windows.preview_index().is_some(),
+            "a fresh preview is re-aimed so the strip isn't left previewless"
         );
     }
 
@@ -2887,12 +3268,44 @@ mod tests {
             project_id: String::new(),
             issue: "ZAP-204".into(),
             action: "ran Grep".into(),
+            working: true,
         });
         assert_eq!(app.status_msg.as_deref(), Some("ZAP-204: ran Grep"));
     }
 
     #[test]
-    fn post_tool_use_does_not_clear_a_pending_needs_you() {
+    fn a_working_action_resolves_a_pending_needs_you() {
+        // The bug: after a permission prompt set NeedsYou and the user answered,
+        // the agent ran tools (working actions) but the flag never cleared until
+        // the next Stop. A working action must promote NeedsYou → Running and drop
+        // the sticky alert — that's "the agent resumed, you're no longer needed".
+        let mut app = app();
+        app.apply_event(AppEvent::AgentNeedsYou {
+            project_id: String::new(),
+            issue: "ZAP-204".into(),
+            reason: "permission".into(),
+        });
+        assert!(app.needs_you_alert);
+        app.apply_event(AppEvent::AgentAction {
+            project_id: String::new(),
+            issue: "ZAP-204".into(),
+            action: "ran Bash".into(),
+            working: true,
+        });
+        assert_eq!(
+            app.fleet.get("ZAP-204"),
+            Some(&AgentStatus::Running),
+            "a working tool-run after the user answered clears NeedsYou → Running"
+        );
+        assert!(!app.needs_you_alert, "the resolved agent drops its alert");
+        assert_eq!(app.status_msg.as_deref(), Some("ZAP-204: ran Bash"));
+    }
+
+    #[test]
+    fn an_ambient_action_does_not_clear_a_pending_needs_you() {
+        // The other half: a NON-working action (the ~60 s idle nudge) must NOT
+        // promote a needs-you agent or bury its alert — only genuine work resolves
+        // a prompt, so routine chatter can't silence one.
         let mut app = app();
         app.apply_event(AppEvent::AgentNeedsYou {
             project_id: String::new(),
@@ -2903,10 +3316,14 @@ mod tests {
         app.apply_event(AppEvent::AgentAction {
             project_id: String::new(),
             issue: "ZAP-204".into(),
-            action: "ran Bash".into(),
+            action: "agent idle".into(),
+            working: false,
         });
         assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::NeedsYou));
-        assert_eq!(app.status_msg, alert, "chatter must not bury the alert");
+        assert_eq!(
+            app.status_msg, alert,
+            "ambient chatter must not bury the alert"
+        );
     }
 
     #[test]
@@ -2917,6 +3334,7 @@ mod tests {
             project_id: String::new(),
             issue: "ZAP-204".into(),
             action: "ran grep".into(),
+            working: true,
         }));
         assert!(!app.apply_event(AppEvent::AgentNeedsYou {
             project_id: String::new(),
@@ -2964,6 +3382,7 @@ mod tests {
             project_id: String::new(),
             issue: "ZAP-204".into(),
             action: "ran grep".into(),
+            working: true,
         }));
         assert!(!app.apply_event(AppEvent::AgentStatusChanged {
             project_id: String::new(),

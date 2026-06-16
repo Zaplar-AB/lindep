@@ -51,11 +51,16 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     if app.show_summary {
         render_summary(app, frame);
     }
+    if app.show_ledger {
+        render_ledger(app, frame);
+    }
     // The project switcher floats above everything else while it's open.
     if app.project_switcher.is_some() {
         let area = frame.area();
+        // Snapshot the cross-project needs-you set before the mutable picker borrow.
+        let needs_you = app.projects_needing_you();
         if let Some(picker) = app.project_switcher.as_mut() {
-            crate::picker::render_overlay(picker, frame, area);
+            crate::picker::render_overlay(picker, frame, area, &needs_you);
         }
     }
 }
@@ -93,6 +98,17 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
                 theme::needs_you_style(app.frame),
             ));
         }
+    }
+    // Agents needing you in projects you've switched away from — surfaced even when
+    // the current project has no agents at all, so a backgrounded prompt is never
+    // invisible (Ctrl-a s to reach it; the switcher flags which project).
+    let elsewhere = app.elsewhere_needs_you();
+    if elsewhere > 0 {
+        spans.push(Span::styled(" · ", Style::new().fg(BORDER)));
+        spans.push(Span::styled(
+            format!("⚑{elsewhere} elsewhere"),
+            theme::needs_you_style(app.frame),
+        ));
     }
     // Auto-resume spinner: while docked agents are still coming back, the header
     // breathes a "resuming N…" so the cockpit reads as busy, not stalled.
@@ -861,14 +877,14 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
                 dk(Action::ToggleHelp),
             ),
             WindowKind::Spine => format!(
-                " ↑↓ move · ⏎ open agent · {} chat/deps · {} deps · {} map · {} roster · {} needs-you · {} find · {} summary · {p} {} quit · {} help",
-                dk(Action::ContextToggle),
+                " ↑↓ move · ⏎ open agent · {} deps · {} map · {} roster · {} needs-you · {} find · {} summary · {} ledger · {p} {} quit · {} help",
                 dk(Action::OpenDeps),
                 dk(Action::OpenFleet),
                 dk(Action::ToggleRoster),
                 dk(Action::JumpNeedsYou),
                 dk(Action::StartSearch),
                 dk(Action::ToggleSummary),
+                dk(Action::ToggleLedger),
                 vk(Action::Quit),
                 dk(Action::ToggleHelp),
             ),
@@ -918,6 +934,10 @@ fn render_help(app: &App, frame: &mut Frame) {
         (
             direct(Action::ToggleSummary),
             "summary overlay for the selected issue (any key closes)",
+        ),
+        (
+            direct(Action::ToggleLedger),
+            "agent ledger: this issue's session history (any key closes)",
         ),
         (
             format!(
@@ -1101,6 +1121,11 @@ fn render_summary(app: &App, frame: &mut Frame) {
         lines.push(Line::raw(""));
     }
 
+    // A compact agent-history line: the durable ledger, at a glance, so the
+    // summary card answers "has anyone run an agent on this, and how did it go?"
+    // (the full timeline is the Ctrl-a t overlay).
+    lines.push(ledger_summary_line(app, key));
+
     let area = centered_rect(78, lines.len() as u16 + 2, frame.area());
     frame.render_widget(Clear, area);
     let block = Block::default()
@@ -1111,6 +1136,137 @@ fn render_summary(app: &App, frame: &mut Frame) {
             Style::new().fg(GREEN_500).bold(),
         )));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The one-line agent-history summary for the `i` panel: run count, last outcome
+/// and total prompts, or a "no agent yet" note.
+fn ledger_summary_line<'a>(app: &App, issue: &str) -> Line<'a> {
+    let episodes = app.ledger.episodes(&app.active_project, issue);
+    let Some(last) = episodes.last() else {
+        return Line::from(Span::styled(
+            " ⌁ agent: never run",
+            Style::new().fg(MUTED).italic(),
+        ));
+    };
+    let now = crate::ledger::now_unix();
+    let runs = episodes.len();
+    let prompts: u32 = episodes.iter().map(|e| e.needs_you).sum();
+    let when = crate::ledger::ago(now, last.started_at);
+    let outcome = if last.is_open() {
+        "running".to_string()
+    } else {
+        crate::ledger::outcome_label(last.outcome).to_string()
+    };
+    let mut text = format!(
+        " ⌁ agent: {runs} run{} · last {outcome} {when}",
+        if runs == 1 { "" } else { "s" }
+    );
+    if prompts > 0 {
+        text.push_str(&format!(" · ⚑{prompts}"));
+    }
+    Line::from(Span::styled(text, Style::new().fg(STATUS_400)))
+}
+
+/// The agent session ledger overlay (`Ctrl-a t`): the durable, at-a-glance history
+/// of every `claude` run on the selected issue — when each started, how long it
+/// ran, how it ended, and how many times it needed you. Answers "what has run on
+/// this issue?", which the live fleet view (current status only) cannot. Any key
+/// closes it (see `App::on_key`).
+fn render_ledger(app: &App, frame: &mut Frame) {
+    let Some(key) = app.detail_key() else {
+        return;
+    };
+    let key = key.to_string();
+    let episodes = app.ledger.episodes(&app.active_project, &key);
+    let now = crate::ledger::now_unix();
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" ⌁ ", Style::new().fg(GREEN_400)),
+            Span::styled(format!("{key} "), Style::new().fg(INK).bold()),
+            Span::styled("agent session ledger", Style::new().fg(GREEN_400).bold()),
+        ]),
+        Line::raw(""),
+    ];
+
+    if episodes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   no agent has run on this issue yet — ⏎ on the spine launches one",
+            Style::new().fg(MUTED).italic(),
+        )));
+    } else {
+        let prompts: u32 = episodes.iter().map(|e| e.needs_you).sum();
+        lines.push(Line::from(Span::styled(
+            format!(
+                "   {} run{} · {prompts} prompt{} for you total",
+                episodes.len(),
+                if episodes.len() == 1 { "" } else { "s" },
+                if prompts == 1 { "" } else { "s" },
+            ),
+            Style::new().fg(MUTED),
+        )));
+        lines.push(Line::raw(""));
+        // Most recent first — the run you most likely care about leads.
+        for ep in episodes.iter().rev() {
+            let (glyph, gstyle, label) = if ep.is_open() {
+                (
+                    theme::agent_spinner(app.frame),
+                    Style::new().fg(ORANGE_400).bold(),
+                    "running…".to_string(),
+                )
+            } else {
+                let label = crate::ledger::outcome_label(ep.outcome);
+                let (g, c) = ledger_outcome_glyph(ep.outcome);
+                (g, Style::new().fg(c), label.to_string())
+            };
+            let mut spans = vec![
+                Span::styled(format!("   {glyph} "), gstyle),
+                Span::styled(format!("{label:<9} "), gstyle),
+                Span::styled(
+                    format!("started {}", crate::ledger::ago(now, ep.started_at)),
+                    Style::new().fg(INK),
+                ),
+            ];
+            if let Some(secs) = ep.duration_secs() {
+                spans.push(Span::styled(
+                    format!("  · ran {}", crate::ledger::duration_label(secs)),
+                    Style::new().fg(MUTED),
+                ));
+            }
+            if ep.needs_you > 0 {
+                spans.push(Span::styled(
+                    format!("  · ⚑{}", ep.needs_you),
+                    Style::new().fg(AMBER_400),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+    lines.push(Line::raw(""));
+
+    let area = centered_rect(78, lines.len() as u16 + 2, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(GREEN_600))
+        .title(Line::from(Span::styled(
+            " agent ledger · any key to close ",
+            Style::new().fg(GREEN_500).bold(),
+        )));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Glyph + colour for a finished run's outcome in the ledger — shapes match the
+/// fleet markers (`agent_marker`) so the vocabulary is consistent, and each
+/// differs by shape (not only colour) for monochrome terminals.
+fn ledger_outcome_glyph(outcome: Option<AgentStatus>) -> (&'static str, Color) {
+    match outcome {
+        Some(AgentStatus::Done) => ("✓", STATUS_400),
+        Some(AgentStatus::Failed) => ("✗", RED_400),
+        Some(AgentStatus::Stopped) => ("◼", MUTED),
+        // Closed without a terminal verdict (interrupted / reaped raw).
+        _ => ("·", MUTED),
+    }
 }
 
 // ── Line builders ─────────────────────────────────────────────────────────
@@ -1136,13 +1292,17 @@ fn issue_line<'a>(
     // Left gutter: the live agent marker (spinner while working, breathing flag
     // for needs-you, ✓ done) pinned to a FIXED leftmost column so it stays
     // visible no matter how long the title is — it used to ride the right edge
-    // and a long title pushed it off-screen. Blank when the issue has no agent.
+    // and a long title pushed it off-screen. Always two columns — marker (or
+    // space) plus a trailing space — so the marker never butts against the
+    // status glyph (`⚑◇` → `⚑ ◇`) and the status column stays aligned whether or
+    // not an issue has an agent. The trailing space is fg-only styled, so it
+    // shows nothing of its own — the whole-row tint (`agent_row_bg`) covers it.
     let gutter = match agent {
         Some(status) => {
             let (mark, mstyle) = theme::agent_marker(status, frame);
-            Span::styled(mark, mstyle)
+            Span::styled(format!("{mark} "), mstyle)
         }
-        None => Span::raw(" "),
+        None => Span::raw("  "),
     };
     // A resolved issue's key + title dim; the status glyph stays bright as the
     // scannable "done" marker.

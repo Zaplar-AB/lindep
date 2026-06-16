@@ -150,11 +150,7 @@ pub fn reconcile_and_rehydrate(
 /// view without falsely idling agents that are still live. A *fresh* plane gets
 /// this via [`reconcile_and_rehydrate`] in [`build_plane`] instead (which DOES
 /// downgrade, because a never-started project's records are from a dead process).
-pub fn reemit_statuses(
-    store: &Arc<Mutex<SessionStore>>,
-    events: &AppEventTx,
-    project_id: &str,
-) {
+pub fn reemit_statuses(store: &Arc<Mutex<SessionStore>>, events: &AppEventTx, project_id: &str) {
     if let Ok(store) = store.lock() {
         for session in store.sessions() {
             let _ = events.send(AppEvent::AgentStatusChanged {
@@ -475,9 +471,10 @@ mod tests {
     fn recording_spawn(count: Arc<AtomicUsize>, log: BackendLog) -> Arc<SpawnFn> {
         Arc::new(move |cfg: SpawnConfig, _events: AppEventTx| {
             let fake = FakeBackend::new(&cfg.issue);
-            log.lock()
-                .unwrap()
-                .insert((cfg.project_id.clone(), cfg.issue.clone()), Arc::clone(&fake));
+            log.lock().unwrap().insert(
+                (cfg.project_id.clone(), cfg.issue.clone()),
+                Arc::clone(&fake),
+            );
             count.fetch_add(1, Ordering::Relaxed);
             Ok(fake as Arc<dyn AgentBackend>)
         })
@@ -633,7 +630,10 @@ mod tests {
             false
         })
         .await;
-        assert!(at_capacity, "the workspace-wide cap rejects the third launch");
+        assert!(
+            at_capacity,
+            "the workspace-wide cap rejects the third launch"
+        );
         assert_eq!(
             spawns.load(Ordering::Relaxed),
             2,
@@ -674,8 +674,14 @@ mod tests {
         let (tx, mut rx) = crate::event::channel();
         let resumable = reconcile_and_rehydrate(&wt, &store, &tx, "proj-x");
 
-        assert!(resumable.contains("ENG-live"), "the was-live session is resumable");
-        assert!(!resumable.contains("ENG-done"), "a terminal session is not resumable");
+        assert!(
+            resumable.contains("ENG-live"),
+            "the was-live session is resumable"
+        );
+        assert!(
+            !resumable.contains("ENG-done"),
+            "a terminal session is not resumable"
+        );
         assert_eq!(resumable.len(), 1);
 
         let (mut live_status, mut done_status) = (None, None);

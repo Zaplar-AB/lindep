@@ -622,6 +622,33 @@ impl WindowSet {
         Some(removed)
     }
 
+    /// Close *every* window for `issue` — its pinned coin(s) on either face and the
+    /// transient preview if it's aimed there — and return them so the caller can
+    /// reclaim the backend / drop geometry / mark the layout dirty. Unlike
+    /// [`close_focused`] this acts by identity, not focus, and bypasses the
+    /// preview-close guard: it's the kill verb's teardown, where a killed agent's
+    /// window must not linger as a dead card (pinned ones included). The Spine is
+    /// never matched (it's not a coin), so it's always preserved.
+    pub fn close_issue(&mut self, issue: &str) -> Vec<Window> {
+        let mut removed = Vec::new();
+        // Re-find each time: `remove` shifts indices, so a fresh scan is simplest
+        // and the coin count per issue is tiny (a pinned coin + maybe the preview).
+        while let Some(idx) = self
+            .windows
+            .iter()
+            .position(|w| w.kind.coin().is_some_and(|(i, _)| i == issue))
+        {
+            match self.remove(idx) {
+                Some(w) => removed.push(w),
+                None => break, // never happens (a coin is never index 0), but don't spin
+            }
+        }
+        if !removed.is_empty() {
+            self.zoomed = false;
+        }
+        removed
+    }
+
     /// Append a window with the next id, focusing it. Used by persistence restore
     /// and the auto-resume placeholders, where the kind/pin state are already
     /// decided by the caller. `pinned` is honoured as given.
@@ -860,6 +887,48 @@ mod tests {
         assert_eq!(again, id, "the preview keeps its WindowId across re-aims");
         assert_eq!(ws.windows.len(), 2, "still exactly one preview coin");
         assert_eq!(ws.preview().unwrap().0, "ZAP-210");
+    }
+
+    #[test]
+    fn close_issue_removes_a_pinned_coin_and_its_preview_keeping_the_spine() {
+        // The kill-close primitive: closing by identity must drop a docked
+        // (pinned) coin AND the transient preview for the same issue, leaving the
+        // Spine — bypassing the preview-close guard `close_focused` enforces.
+        let graph = demo::graph();
+        let mut ws = WindowSet::new();
+        // Graduate a pinned chat coin for ZAP-204…
+        ws.ensure_preview("ZAP-204", CoinMode::Chat, &graph);
+        ws.focus_preview();
+        ws.pin_preview();
+        // …and re-arm a preview also aimed at it (a coin on its deps face).
+        ws.ensure_preview("ZAP-204", CoinMode::Deps, &graph);
+        assert!(ws.pinned_coin_index("ZAP-204").is_some());
+
+        let removed = ws.close_issue("ZAP-204");
+        assert!(
+            removed.iter().any(|w| w.pinned),
+            "a pinned coin was among the closed windows"
+        );
+        assert_eq!(ws.windows.len(), 1, "only the Spine remains");
+        assert!(matches!(ws.focused_kind(), WindowKind::Spine));
+        assert!(ws.pinned_coin_index("ZAP-204").is_none());
+    }
+
+    #[test]
+    fn close_issue_leaves_other_issues_windows_intact() {
+        let graph = demo::graph();
+        let mut ws = WindowSet::new();
+        ws.ensure_preview("ZAP-204", CoinMode::Chat, &graph);
+        ws.focus_preview();
+        ws.pin_preview(); // pinned coin for ZAP-204
+        ws.ensure_preview("ZAP-210", CoinMode::Chat, &graph); // preview for a different issue
+        let removed = ws.close_issue("ZAP-204");
+        assert_eq!(removed.len(), 1, "only ZAP-204's window closed");
+        assert_eq!(
+            ws.preview().unwrap().0,
+            "ZAP-210",
+            "the other issue's window stays"
+        );
     }
 
     #[test]

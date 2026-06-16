@@ -59,11 +59,18 @@ pub enum AppEvent {
         status: AgentStatus,
     },
     /// The agent on `(project_id, issue)` took an action (e.g. ran a tool) — a
-    /// per-issue activity line (from a `PostToolUse` hook).
+    /// per-issue activity line (from a `PostToolUse` hook, an idle nudge, …).
     AgentAction {
         project_id: String,
         issue: String,
         action: String,
+        /// Whether this action is an unambiguous sign the agent is *actively
+        /// working* — a tool ran, or an MCP elicitation was answered. A working
+        /// action promotes even a `NeedsYou` agent back to `Running` and clears
+        /// its attention flag (answering a prompt then resuming work is exactly
+        /// this). An ambient action (the ~60 s idle nudge) leaves a needs-you
+        /// agent untouched, so routine chatter never silences a real prompt.
+        working: bool,
     },
     /// The supervisor finished tearing an agent down and dropped it from its live
     /// map. The cockpit drops it from the fleet view too, so the overview stays

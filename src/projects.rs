@@ -604,9 +604,18 @@ mod tests {
             "#,
         );
         let (cfg, warnings) = WorkspaceConfig::load_paths(&[path]);
-        assert!(cfg.resolve("good1").is_ok(), "the entry before the bad one loads");
-        assert!(cfg.resolve("good2").is_ok(), "the entry after the bad one loads");
-        assert!(cfg.resolve("bad").is_err(), "the malformed entry is skipped");
+        assert!(
+            cfg.resolve("good1").is_ok(),
+            "the entry before the bad one loads"
+        );
+        assert!(
+            cfg.resolve("good2").is_ok(),
+            "the entry after the bad one loads"
+        );
+        assert!(
+            cfg.resolve("bad").is_err(),
+            "the malformed entry is skipped"
+        );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("invalid [[project]] entry"));
     }

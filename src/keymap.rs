@@ -70,6 +70,10 @@ pub enum Action {
     ToggleHelp,
     /// Pop a dismissable overlay summarising the selected issue (details + deps).
     ToggleSummary,
+    /// Pop a dismissable overlay listing the selected issue's agent run history —
+    /// the session ledger (which `claude` runs ran for it, when, and how each
+    /// ended). Mnemonic: agent **t**imeline.
+    ToggleLedger,
 
     // ── Prefix verbs (any focus, behind the prefix) ───────────────────────
     FocusLeft,
@@ -127,6 +131,7 @@ const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::StartSearch, "search", &["/"]),
     (Action::ToggleHelp, "help", &["?"]),
     (Action::ToggleSummary, "summary", &["i"]),
+    (Action::ToggleLedger, "ledger", &["t"]),
 ];
 
 /// `(action, config name, default keys)` for the **prefix** verbs, reached as
@@ -149,6 +154,7 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::StartSearch, "search", &["/"]),
     (Action::ToggleHelp, "help", &["?"]),
     (Action::ToggleSummary, "summary", &["i"]),
+    (Action::ToggleLedger, "ledger", &["t"]),
     (Action::ToggleRoster, "roster", &["r"]),
     (Action::JumpNeedsYou, "jump-needs-you", &["n"]),
     // `Ctrl-a s` opens the project switcher (`p` is taken by `pin`).
