@@ -5,16 +5,23 @@
 //! project's fleet (its own worktree root, state file and hook settings). The
 //! workspace lifts ownership a level: it spins up one supervisor per
 //! [`ProjectMapping`](crate::projects::ProjectMapping) and routes launch/cancel
-//! by `project_id`, so agents started in one project keep running while you
-//! navigate, switch, and launch agents in another. **Backing out of a project
-//! never cancels its agents — only [`shutdown`](WorkspaceHandle::shutdown)
-//! does**, and it fans out across every project's tracker.
+//! by `project_id` — the groundwork for running several projects' fleets at once,
+//! so agents started in one project keep running while you work in another.
+//! **Backing out of a project never cancels its agents — only
+//! [`shutdown`](WorkspaceHandle::shutdown) does**, and it fans out across every
+//! project's tracker.
+//!
+//! Switching the *active* project from the UI is not wired yet (ENG-401): today
+//! the cockpit launches into the one project it booted into, so the per-project
+//! routing here is exercised by tests and staged for the switcher rather than
+//! reachable end-to-end.
 //!
 //! Like the supervisor, the workspace lives entirely inside its own task; the
 //! cockpit holds a cheap, cloneable [`WorkspaceHandle`]. A project's plane is
 //! built lazily on first launch (the active project's is built eagerly at boot
-//! and handed in), so entering a project reconciles its store against its live
-//! worktrees and rehydrates its fleet view.
+//! and handed in), so entering a not-yet-started project reconciles its store
+//! against its live worktrees and rehydrates its fleet view (reachable once
+//! switching lands — ENG-401).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -34,8 +41,8 @@ use crate::worktree::WorktreeManager;
 
 /// Every started project's session store, keyed by `project_id`. Shared between
 /// the workspace (which inserts a store when it builds a project's plane) and the
-/// notification bus (which scans the stores to resolve a hook back to its
-/// `(project_id, issue)`) and the global fleet view (which reads them all).
+/// notification bus (which scans the stores to resolve a hook back to its owning
+/// `(project_id, issue)`, since the one loopback endpoint serves every project).
 pub type StoreRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<SessionStore>>>>>;
 
 /// The shared, per-project-invariant ingredients for building a supervisor:
@@ -138,6 +145,27 @@ pub fn reconcile_and_rehydrate(
     resumable
 }
 
+/// Re-emit every session's CURRENT status for `project_id` (no restart
+/// downgrade), so switching into an already-running project repopulates its fleet
+/// view without falsely idling agents that are still live. A *fresh* plane gets
+/// this via [`reconcile_and_rehydrate`] in [`build_plane`] instead (which DOES
+/// downgrade, because a never-started project's records are from a dead process).
+pub fn reemit_statuses(
+    store: &Arc<Mutex<SessionStore>>,
+    events: &AppEventTx,
+    project_id: &str,
+) {
+    if let Ok(store) = store.lock() {
+        for session in store.sessions() {
+            let _ = events.send(AppEvent::AgentStatusChanged {
+                project_id: project_id.to_string(),
+                issue: session.issue.clone(),
+                status: session.status,
+            });
+        }
+    }
+}
+
 /// Build a project's plane off the render thread: its worktree manager, session
 /// store (per-project file, adopting a legacy `state.json` on first v1.5 boot),
 /// reconcile + rehydrate, then start its supervisor. The blocking pieces
@@ -224,6 +252,12 @@ enum WorkspaceCommand {
         project_id: String,
         issue: String,
     },
+    /// Bring `project_id` online without launching anything: build its plane if
+    /// it isn't running, then re-emit its current fleet statuses so the cockpit's
+    /// switched-to view repopulates. The driver behind project switching.
+    Activate {
+        project_id: String,
+    },
     Shutdown,
 }
 
@@ -258,6 +292,12 @@ impl WorkspaceHandle {
         let _ = self
             .cmd_tx
             .send(WorkspaceCommand::Cancel { project_id, issue });
+    }
+
+    /// Switch the cockpit into `project_id`: builds its plane if needed and
+    /// re-emits its current fleet statuses (the project you leave keeps running).
+    pub fn activate(&self, project_id: String) {
+        let _ = self.cmd_tx.send(WorkspaceCommand::Activate { project_id });
     }
 
     /// Begin a clean shutdown of every project's fleet. Pair with awaiting the
@@ -320,6 +360,24 @@ impl Workspace {
                     // unstarted one is a no-op (nothing to stop).
                     if let Some(plane) = self.planes.get(&project_id) {
                         plane.handle.cancel(issue);
+                    }
+                }
+                WorkspaceCommand::Activate { project_id } => {
+                    let existed = self.planes.contains_key(&project_id);
+                    // Build the plane if this is the first time we enter the project
+                    // (build_plane reconciles + rehydrates it). If it was already
+                    // running — its agents may be live — re-emit current statuses
+                    // verbatim so the switched-to fleet repopulates without the
+                    // restart downgrade a fresh build applies.
+                    if self.ensure_plane(&project_id).await.is_some() && existed {
+                        let store = self
+                            .stores
+                            .lock()
+                            .ok()
+                            .and_then(|reg| reg.get(&project_id).cloned());
+                        if let Some(store) = store {
+                            reemit_statuses(&store, &self.builder.events, &project_id);
+                        }
                     }
                 }
                 WorkspaceCommand::Shutdown => break,
@@ -405,10 +463,31 @@ mod tests {
         })
     }
 
+    /// Every fake handed out, keyed by `(project_id, issue)`, so a test can assert
+    /// on a specific project's backend (e.g. that cancelling one leaves another's
+    /// alive).
+    type BackendLog = Arc<Mutex<HashMap<(String, String), Arc<FakeBackend>>>>;
+
+    /// Like [`fake_spawn`] but also stashes each fake so the test can inspect it.
+    /// Publishes the log entry BEFORE bumping the counter, so a reader that observes
+    /// `count >= n` is guaranteed the corresponding backends are already in the log
+    /// (the two spawns race on separate supervisor tasks).
+    fn recording_spawn(count: Arc<AtomicUsize>, log: BackendLog) -> Arc<SpawnFn> {
+        Arc::new(move |cfg: SpawnConfig, _events: AppEventTx| {
+            let fake = FakeBackend::new(&cfg.issue);
+            log.lock()
+                .unwrap()
+                .insert((cfg.project_id.clone(), cfg.issue.clone()), Arc::clone(&fake));
+            count.fetch_add(1, Ordering::Relaxed);
+            Ok(fake as Arc<dyn AgentBackend>)
+        })
+    }
+
     fn builder(
         events: AppEventTx,
         spawn: Arc<SpawnFn>,
         live_count: Arc<AtomicUsize>,
+        max_concurrent: usize,
     ) -> PlaneBuilder {
         PlaneBuilder {
             events,
@@ -419,10 +498,21 @@ mod tests {
             base: "HEAD".to_string(),
             rows: 24,
             cols: 80,
-            max_concurrent: 10,
+            max_concurrent,
             live_count,
             guardrails: vec![],
         }
+    }
+
+    /// Poll `cond` up to ~4s (the fake agents settle fast); returns whether it held.
+    async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        cond()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -432,7 +522,13 @@ mod tests {
         let (tx, _rx) = crate::event::channel();
         let spawns = Arc::new(AtomicUsize::new(0));
         let live = Arc::new(AtomicUsize::new(0));
-        let b = builder(tx, fake_spawn(Arc::clone(&spawns)), live);
+        let backends: BackendLog = Arc::new(Mutex::new(HashMap::new()));
+        let b = builder(
+            tx,
+            recording_spawn(Arc::clone(&spawns), Arc::clone(&backends)),
+            live,
+            10,
+        );
 
         // Two mapped projects, distinct repos.
         let mut config = WorkspaceConfig::default();
@@ -454,23 +550,198 @@ mod tests {
         ws.launch("proj-b".into(), "ENG-1".into(), "one".into(), None);
 
         // Both agents come up (two spawns for the same issue key, different repos).
-        for _ in 0..200 {
-            if spawns.load(Ordering::Relaxed) >= 2 {
-                break;
+        assert!(
+            eventually(|| spawns.load(Ordering::Relaxed) >= 2).await,
+            "the same issue key launched in two projects yields two agents"
+        );
+        assert_eq!(spawns.load(Ordering::Relaxed), 2);
+        let backend = |proj: &str| {
+            backends
+                .lock()
+                .unwrap()
+                .get(&(proj.to_string(), "ENG-1".to_string()))
+                .cloned()
+                .expect("both projects spawned a backend")
+        };
+        let (agent_a, agent_b) = (backend("proj-a"), backend("proj-b"));
+
+        // Cancelling one project's agent tears IT down…
+        ws.cancel("proj-a".into(), "ENG-1".into());
+        assert!(
+            eventually(|| agent_a.shutdown_count() > 0).await,
+            "the cancelled project's agent is torn down"
+        );
+        // …and leaves the OTHER project's agent untouched — the core isolation
+        // promise. Give any erroneous cross-project cancel time to land first.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            agent_b.shutdown_count(),
+            0,
+            "cancelling proj-a must not touch proj-b's agent"
+        );
+
+        // Shutdown reaps every project's fleet within grace — fail loudly if it hangs.
+        ws.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(5), join)
+            .await
+            .expect("workspace shut down within grace")
+            .expect("workspace task joined cleanly");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_live_agent_cap_spans_projects() {
+        // The cap's load-bearing promise: max_concurrent bounds live agents across
+        // the WHOLE workspace via the shared live_count, not per project. With a cap
+        // of 2, two agents in project A must leave no room for one in project B.
+        let repo_a = temp_repo("cap-a");
+        let repo_b = temp_repo("cap-b");
+        let (tx, mut rx) = crate::event::channel();
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(AtomicUsize::new(0));
+        let b = builder(tx, fake_spawn(Arc::clone(&spawns)), live, 2);
+
+        let mut config = WorkspaceConfig::default();
+        config.ensure_mapped("proj-a", "A", &repo_a);
+        config.ensure_mapped("proj-b", "B", &repo_b);
+        let (ws, join) = Workspace::start(
+            Handle::current(),
+            b,
+            config,
+            HashMap::new(),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+
+        // Fill the workspace cap with two agents in project A.
+        ws.launch("proj-a".into(), "ENG-1".into(), "one".into(), None);
+        ws.launch("proj-a".into(), "ENG-2".into(), "two".into(), None);
+        assert!(
+            eventually(|| spawns.load(Ordering::Relaxed) >= 2).await,
+            "project A fills the cap with two agents"
+        );
+
+        // A third launch in project B is refused — the cap is workspace-wide, so a
+        // per-project counter regression (which would let B spawn) fails here.
+        ws.launch("proj-b".into(), "ENG-1".into(), "three".into(), None);
+        let at_capacity = eventually(|| {
+            while let Ok(ev) = rx.try_recv() {
+                if let AppEvent::Notification(m) = ev
+                    && m.contains("at capacity")
+                {
+                    return true;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+            false
+        })
+        .await;
+        assert!(at_capacity, "the workspace-wide cap rejects the third launch");
         assert_eq!(
             spawns.load(Ordering::Relaxed),
             2,
-            "the same issue key launched in two projects yields two agents"
+            "no third agent spawned in another project"
         );
 
-        // Cancelling one project's agent leaves the other's running.
-        ws.cancel("proj-a".into(), "ENG-1".into());
-        // Shutdown reaps every project's fleet without hanging.
         ws.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), join)
+            .await
+            .expect("workspace shut down within grace")
+            .expect("workspace task joined cleanly");
+    }
+
+    #[test]
+    fn reconcile_and_rehydrate_downgrades_live_sessions_and_reports_them_resumable() {
+        // The per-project "process disposable, conversation durable" restart logic:
+        // a was-Spawning/Running session (its process is gone) must rehydrate as
+        // Idle (resumable, not falsely live) and be returned in the resumable set,
+        // while a terminal session keeps its status and is NOT resumable.
+        let repo = temp_repo("rehydrate");
+        let wt = WorktreeManager::new(&repo).unwrap();
+        // Real worktrees so both issues survive reconcile's prune.
+        let live_wt = wt.create("ENG-live", "live", "HEAD").unwrap();
+        let done_wt = wt.create("ENG-done", "done", "HEAD").unwrap();
+
+        let state = repo.join(".lindep").join("state.json");
+        let store = Arc::new(Mutex::new(
+            SessionStore::load(&state).unwrap().for_project("proj-x"),
+        ));
+        {
+            let mut s = store.lock().unwrap();
+            s.ensure("ENG-live", live_wt.path.clone(), live_wt.branch.clone());
+            s.ensure("ENG-done", done_wt.path.clone(), done_wt.branch.clone());
+            s.set_status("ENG-live", AgentStatus::Running);
+            s.set_status("ENG-done", AgentStatus::Done);
+        }
+
+        let (tx, mut rx) = crate::event::channel();
+        let resumable = reconcile_and_rehydrate(&wt, &store, &tx, "proj-x");
+
+        assert!(resumable.contains("ENG-live"), "the was-live session is resumable");
+        assert!(!resumable.contains("ENG-done"), "a terminal session is not resumable");
+        assert_eq!(resumable.len(), 1);
+
+        let (mut live_status, mut done_status) = (None, None);
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::AgentStatusChanged {
+                project_id,
+                issue,
+                status,
+            } = ev
+            {
+                assert_eq!(project_id, "proj-x", "events carry the owning project");
+                match issue.as_str() {
+                    "ENG-live" => live_status = Some(status),
+                    "ENG-done" => done_status = Some(status),
+                    other => panic!("unexpected issue {other}"),
+                }
+            }
+        }
+        assert_eq!(
+            live_status,
+            Some(AgentStatus::Idle),
+            "a was-Running session rehydrates as Idle"
+        );
+        assert_eq!(
+            done_status,
+            Some(AgentStatus::Done),
+            "a terminal session keeps its status verbatim"
+        );
+    }
+
+    #[test]
+    fn reemit_statuses_re_emits_current_status_verbatim_without_downgrade() {
+        // Switching INTO a project whose agents are still live must show them as
+        // running — so unlike reconcile_and_rehydrate, reemit_statuses must NOT
+        // downgrade a Running session to Idle.
+        let repo = temp_repo("reemit");
+        let state = repo.join(".lindep").join("state.json");
+        let store = Arc::new(Mutex::new(
+            SessionStore::load(&state).unwrap().for_project("proj-x"),
+        ));
+        {
+            let mut s = store.lock().unwrap();
+            s.ensure("ENG-1", "/wt/ENG-1".into(), "b".into());
+            s.set_status("ENG-1", AgentStatus::Running);
+        }
+
+        let (tx, mut rx) = crate::event::channel();
+        reemit_statuses(&store, &tx, "proj-x");
+
+        let mut got = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::AgentStatusChanged {
+                project_id,
+                issue,
+                status,
+            } = ev
+            {
+                assert_eq!((project_id.as_str(), issue.as_str()), ("proj-x", "ENG-1"));
+                got = Some(status);
+            }
+        }
+        assert_eq!(
+            got,
+            Some(AgentStatus::Running),
+            "status is re-emitted verbatim, never downgraded to Idle"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -478,7 +749,7 @@ mod tests {
         let (tx, mut rx) = crate::event::channel();
         let spawns = Arc::new(AtomicUsize::new(0));
         let live = Arc::new(AtomicUsize::new(0));
-        let b = builder(tx, fake_spawn(Arc::clone(&spawns)), live);
+        let b = builder(tx, fake_spawn(Arc::clone(&spawns)), live, 10);
         let (ws, join) = Workspace::start(
             Handle::current(),
             b,

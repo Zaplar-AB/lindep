@@ -51,6 +51,13 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     if app.show_summary {
         render_summary(app, frame);
     }
+    // The project switcher floats above everything else while it's open.
+    if app.project_switcher.is_some() {
+        let area = frame.area();
+        if let Some(picker) = app.project_switcher.as_mut() {
+            crate::picker::render_overlay(picker, frame, area);
+        }
+    }
 }
 
 // ── Header ────────────────────────────────────────────────────────────────

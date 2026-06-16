@@ -232,19 +232,19 @@ impl SessionStore {
                         supported: STATE_VERSION,
                     });
                 }
-                // Explicit per-version migration seam. v1→v2 is additive (a new
-                // `project_id` carried by `#[serde(default)]`), so both versions
-                // deserialize into the same `Session` shape and load as-is here;
-                // the owning project_id is stamped onto unstamped records by
-                // [`SessionStore::for_project`] (which preserves their stored
-                // session_id, so `--resume` survives). A structural bump would add
-                // a transforming arm. The `> STATE_VERSION` guard above means the
-                // wildcard is only reachable for already-handled versions.
-                let sessions = match persisted.version {
-                    1 | 2 => persisted.sessions,
-                    _ => persisted.sessions,
-                };
-                sessions.into_iter().map(|s| (s.issue.clone(), s)).collect()
+                // v1 and v2 share the `Session` shape: v2 only adds `project_id`,
+                // carried by `#[serde(default)]` and stamped onto unstamped records
+                // later by [`SessionStore::for_project`] (which preserves the stored
+                // `session_id`, so `--resume` survives). So every loadable version
+                // deserializes as-is here — there is no per-version transform yet.
+                // A future *structural* bump would branch on `persisted.version`
+                // before this point; the `> STATE_VERSION` guard above has already
+                // rejected anything newer than we understand.
+                persisted
+                    .sessions
+                    .into_iter()
+                    .map(|s| (s.issue.clone(), s))
+                    .collect()
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(source) => {
@@ -435,8 +435,9 @@ impl SessionStore {
     /// / [`mutate_and_persist`] so blocking fs I/O never runs under the mutex.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, StateError> {
         let mut sessions: Vec<Session> = self.sessions.values().cloned().collect();
-        // Stable (project_id, issue) order so the file diffs cleanly even if a
-        // store ever held more than one project's sessions.
+        // Stable order so the file diffs cleanly. A store owns exactly one project,
+        // so `project_id` is constant across these records; it stays in the sort key
+        // as a future-proof guard rather than a discriminator that does work today.
         sessions.sort_by(|a, b| {
             (a.project_id.as_str(), a.issue.as_str())
                 .cmp(&(b.project_id.as_str(), b.issue.as_str()))

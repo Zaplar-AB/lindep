@@ -69,15 +69,22 @@ pub enum AppEvent {
     /// map. The cockpit drops it from the fleet view too, so the overview stays
     /// bounded and mirrors the supervisor instead of accreting dead agents.
     AgentReaped { project_id: String, issue: String },
+    /// A project switch's graph finished loading off the render thread (see
+    /// `App::request_switch`). A pure wake signal: the loaded `(ProjectRef, Graph)`
+    /// rides a side mailbox because `Graph` isn't `Clone`/`Debug` and so can't live
+    /// in this enum (latest switch wins). NOT agent-scoped — it *changes* the
+    /// active project — so `project_id()` is `None` and the guard never drops it.
+    ProjectActivated,
 }
 
 impl AppEvent {
-    /// The project an agent-lifecycle event belongs to, or `None` for a bare
-    /// [`AppEvent::Notification`] (which isn't project-scoped). The render loop
-    /// uses this to file each event under the right project's fleet.
+    /// The project an agent-lifecycle event belongs to, or `None` for an event
+    /// that isn't agent-scoped ([`AppEvent::Notification`], and
+    /// [`AppEvent::ProjectActivated`] which *changes* the active project). The
+    /// render loop uses this to file each event under the right project's fleet.
     pub fn project_id(&self) -> Option<&str> {
         match self {
-            AppEvent::Notification(_) => None,
+            AppEvent::Notification(_) | AppEvent::ProjectActivated => None,
             AppEvent::AgentSpawned { project_id, .. }
             | AppEvent::AgentOutput { project_id, .. }
             | AppEvent::AgentExited { project_id, .. }

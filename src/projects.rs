@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Anything that can go wrong loading or resolving the project mapping. One
 /// thiserror enum per subsystem, shaped like [`crate::session::StateError`].
@@ -49,6 +49,15 @@ pub enum ConfigError {
         path: PathBuf,
         #[source]
         source: toml::de::Error,
+    },
+    #[error("project config {} has an invalid [[project]] entry #{index}: {source}", .path.display())]
+    ParseEntry {
+        path: PathBuf,
+        index: usize,
+        // Boxed: `toml::de::Error` is large, and an unboxed copy here would bloat
+        // `ConfigError` enough to trip `clippy::result_large_err` on `resolve`.
+        #[source]
+        source: Box<toml::de::Error>,
     },
     #[error(
         "no repo mapping for Linear project {project_id}; \
@@ -81,7 +90,10 @@ impl ProjectMapping {
     }
 
     /// `<repo_root>/.lindep/state.<project_id>.json` — this project's session
-    /// store, so two projects sharing a repo never share a state file.
+    /// store, kept per-project so a future multi-project-per-repo layout never
+    /// shares a state file. (Today [`WorkspaceConfig`] rejects two projects mapped
+    /// to one repo, since the worktree/branch/hooks layout would still collide —
+    /// see [`WorkspaceConfig::load_paths`]; full namespacing is ENG-401.)
     pub fn state_path(&self) -> PathBuf {
         self.repo_root
             .join(".lindep")
@@ -140,24 +152,88 @@ impl WorkspaceConfig {
                     continue;
                 }
             };
-            match toml::from_str::<ProjectsFile>(&text) {
-                Ok(file) => {
-                    for mapping in file.into_mappings(path) {
+            // Parse the document first, then convert each `[[project]]` table on its
+            // own: one malformed entry (e.g. a missing `repo_root`) warns and is
+            // skipped, without discarding the file's other, valid projects.
+            let doc = match text.parse::<toml::Table>() {
+                Ok(doc) => doc,
+                Err(source) => {
+                    warnings.push(
+                        ConfigError::Parse {
+                            path: path.clone(),
+                            source,
+                        }
+                        .to_string(),
+                    );
+                    continue;
+                }
+            };
+            let entries = match doc.get("project") {
+                // A file with no `[[project]]` tables contributes nothing.
+                None => continue,
+                Some(toml::Value::Array(entries)) => entries,
+                Some(_) => {
+                    warnings.push(format!(
+                        "project config {}: `project` must be an array of [[project]] tables",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            for (index, raw) in entries.iter().enumerate() {
+                match raw.clone().try_into::<ProjectEntry>() {
+                    Ok(entry) => {
+                        let mapping = entry.into_mapping(path);
                         // A later file (personal) overrides an earlier one (repo)
                         // for the same project_id.
                         cfg.projects.insert(mapping.project_id.clone(), mapping);
                     }
+                    Err(source) => warnings.push(
+                        ConfigError::ParseEntry {
+                            path: path.clone(),
+                            index,
+                            source: Box::new(source),
+                        }
+                        .to_string(),
+                    ),
                 }
-                Err(source) => warnings.push(
-                    ConfigError::Parse {
-                        path: path.clone(),
-                        source,
-                    }
-                    .to_string(),
-                ),
             }
         }
+        cfg.reject_repo_root_collisions(&mut warnings);
         (cfg, warnings)
+    }
+
+    /// Drop any project whose `repo_root` is already claimed by another. The
+    /// on-disk layout (worktrees, branches, hooks, the legacy `state.json`) is
+    /// keyed by issue, not project, so two Linear projects sharing one repo would
+    /// collide — a same-keyed issue would resolve to the same worktree dir and
+    /// branch, silently running two conversations on one tree. Until that layout is
+    /// namespaced by project (ENG-401), refuse the duplicate rather than corrupt.
+    /// The lexicographically-smallest `project_id` wins, deterministically.
+    fn reject_repo_root_collisions(&mut self, warnings: &mut Vec<String>) {
+        let mut owner: HashMap<PathBuf, String> = HashMap::new();
+        let mut ids: Vec<String> = self.projects.keys().cloned().collect();
+        ids.sort();
+        for id in ids {
+            let root = self.projects[&id].repo_root.clone();
+            // Best-effort identity: canonicalize when the path exists (collapsing
+            // `..`/symlinks), else compare it as resolved (it may not exist until
+            // first launch).
+            let key = root.canonicalize().unwrap_or_else(|_| root.clone());
+            match owner.get(&key) {
+                None => {
+                    owner.insert(key, id);
+                }
+                Some(winner) => {
+                    warnings.push(format!(
+                        "project {id}: repo_root {} is already mapped to project {winner}; \
+                         ignoring the duplicate (two projects can't share one repo yet)",
+                        root.display()
+                    ));
+                    self.projects.remove(&id);
+                }
+            }
+        }
     }
 
     /// Resolve a project to its repo mapping, or an actionable
@@ -169,6 +245,12 @@ impl WorkspaceConfig {
             .ok_or_else(|| ConfigError::UnmappedProject {
                 project_id: project_id.to_string(),
             })
+    }
+
+    /// The configured project ids — the set the in-cockpit switcher offers, since
+    /// only a mapped project (one with a repo) can run agents.
+    pub fn mapped_ids(&self) -> Vec<String> {
+        self.projects.keys().cloned().collect()
     }
 
     /// Inject a single-project mapping for `id` if none is configured, so a
@@ -198,59 +280,64 @@ impl WorkspaceConfig {
 /// further projects is discoverable. `.lindep/` is gitignored, so this never
 /// touches the tracked tree.
 pub fn seed_file_contents(mapping: &ProjectMapping) -> String {
-    // Minimal escaping is enough for the seeded values (a Linear name, a local
-    // path): only the TOML basic-string metacharacters need it.
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!(
-        "# lindep — project↔repo mapping.\n\
+    // Serialize the typed entry with the `toml` crate so every value (a free-text
+    // Linear name, a local path) is escaped correctly — a name containing a quote,
+    // backslash, newline or control char must never emit a file that then fails to
+    // parse (which would warn on every subsequent launch).
+    let file = ProjectsFile {
+        project: vec![ProjectEntry {
+            id: mapping.project_id.clone(),
+            name: mapping.name.clone(),
+            repo_root: mapping.repo_root.to_string_lossy().into_owned(),
+            branch_prefix: mapping.branch_prefix.clone(),
+        }],
+    };
+    let body = toml::to_string(&file).unwrap_or_default();
+    let header = "# lindep — project↔repo mapping.\n\
          #\n\
          # Add a [[project]] table per Linear project you want to supervise.\n\
          # `id` is the Linear project UUID; `repo_root` is its local git repo.\n\
-         # Personal/overriding entries can live in ~/.config/lindep/projects.toml.\n\
-         \n\
-         [[project]]\n\
-         id = \"{id}\"\n\
-         name = \"{name}\"\n\
-         repo_root = \"{root}\"\n\
-         # branch_prefix = \"yourname\"\n",
-        id = esc(&mapping.project_id),
-        name = esc(&mapping.name),
-        root = esc(&mapping.repo_root.to_string_lossy()),
-    )
+         # Personal/overriding entries can live in ~/.config/lindep/projects.toml.\n\n";
+    // Surface the optional per-project branch namespace when it isn't already set.
+    let hint = if mapping.branch_prefix.is_none() {
+        "# branch_prefix = \"yourname\"\n"
+    } else {
+        ""
+    };
+    format!("{header}{body}{hint}")
 }
 
-/// On-disk shape of `projects.toml`: an array of `[[project]]` tables.
-#[derive(Debug, Default, Deserialize)]
+/// On-disk shape of `projects.toml`: an array of `[[project]]` tables. Also the
+/// shape [`seed_file_contents`] serializes, so the starter template is produced
+/// by the same encoder that reads it.
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct ProjectsFile {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     project: Vec<ProjectEntry>,
 }
 
 /// One `[[project]]` table as written on disk (paths still as raw strings, so
 /// `~`/relative forms can be expanded against the config file before becoming a
 /// [`PathBuf`]).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ProjectEntry {
     id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     name: String,
     repo_root: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     branch_prefix: Option<String>,
 }
 
-impl ProjectsFile {
-    fn into_mappings(self, config_path: &Path) -> Vec<ProjectMapping> {
-        self.project
-            .into_iter()
-            .map(|e| ProjectMapping {
-                project_id: e.id,
-                name: e.name,
-                repo_root: resolve_repo_root(&e.repo_root, config_path),
-                // Treat a blank prefix as "use the default".
-                branch_prefix: e.branch_prefix.filter(|s| !s.trim().is_empty()),
-            })
-            .collect()
+impl ProjectEntry {
+    fn into_mapping(self, config_path: &Path) -> ProjectMapping {
+        ProjectMapping {
+            project_id: self.id,
+            name: self.name,
+            repo_root: resolve_repo_root(&self.repo_root, config_path),
+            // Treat a blank prefix as "use the default".
+            branch_prefix: self.branch_prefix.filter(|s| !s.trim().is_empty()),
+        }
     }
 }
 
@@ -465,6 +552,63 @@ mod tests {
         assert!(warnings[0].contains("invalid TOML"));
         // The good file still loaded despite the bad one.
         assert!(cfg.resolve("ok").is_ok());
+    }
+
+    #[test]
+    fn two_projects_mapped_to_the_same_repo_drop_the_duplicate() {
+        let root = temp_dir("dup");
+        // Both projects point at the SAME repo_root — a collision the on-disk
+        // layout (worktrees/branches/hooks/legacy state) cannot host yet.
+        let path = write_repo_config(
+            &root,
+            r#"
+            [[project]]
+            id = "p1"
+            name = "A"
+            repo_root = "/repos/shared"
+
+            [[project]]
+            id = "p2"
+            name = "B"
+            repo_root = "/repos/shared"
+            "#,
+        );
+        let (cfg, warnings) = WorkspaceConfig::load_paths(&[path]);
+        // The lexicographically-smaller id wins; the other is dropped with a warning.
+        assert!(cfg.resolve("p1").is_ok(), "the first project survives");
+        assert!(cfg.resolve("p2").is_err(), "the duplicate is rejected");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("p2"));
+        assert!(warnings[0].contains("already mapped"));
+    }
+
+    #[test]
+    fn a_single_malformed_entry_is_skipped_and_the_rest_load() {
+        let root = temp_dir("partial");
+        // The middle entry is missing the required `repo_root`.
+        let path = write_repo_config(
+            &root,
+            r#"
+            [[project]]
+            id = "good1"
+            name = "Good one"
+            repo_root = "/repos/good1"
+
+            [[project]]
+            id = "bad"
+            name = "Missing repo_root"
+
+            [[project]]
+            id = "good2"
+            repo_root = "/repos/good2"
+            "#,
+        );
+        let (cfg, warnings) = WorkspaceConfig::load_paths(&[path]);
+        assert!(cfg.resolve("good1").is_ok(), "the entry before the bad one loads");
+        assert!(cfg.resolve("good2").is_ok(), "the entry after the bad one loads");
+        assert!(cfg.resolve("bad").is_err(), "the malformed entry is skipped");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("invalid [[project]] entry"));
     }
 
     #[test]

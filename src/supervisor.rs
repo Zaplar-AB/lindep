@@ -232,9 +232,20 @@ impl Supervisor {
             }
             return;
         }
-        // Workspace-wide capacity: consult the shared counter so the cap spans
-        // every project's fleet, not this supervisor alone.
-        if self.cfg.live_count.load(Ordering::Relaxed) >= self.cfg.max_concurrent {
+        // Workspace-wide capacity: reserve a slot in the shared counter with a
+        // single atomic compare-and-increment, so the cap holds even when two
+        // projects' supervisors launch concurrently. A plain load-then-add would
+        // race across the independent supervisor tasks and overshoot the ceiling;
+        // `fetch_update` commits the increment only when the value was still under
+        // the cap, closing that window. Released in `reap` when the record drops.
+        if self
+            .cfg
+            .live_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.cfg.max_concurrent).then_some(n + 1)
+            })
+            .is_err()
+        {
             self.notify(format!(
                 "at capacity ({} agents across the workspace) — cancel one first",
                 self.cfg.max_concurrent
@@ -245,6 +256,8 @@ impl Supervisor {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
         let token = self.parent.child_token();
+        // The reserved slot is released in `reap` when this record is dropped (a
+        // cancelling record lingers until teardown, so it keeps its slot).
         self.agents.insert(
             issue.clone(),
             AgentRecord {
@@ -253,9 +266,6 @@ impl Supervisor {
                 cancelling: false,
             },
         );
-        // Claim a workspace slot; released in `reap` when this record is dropped
-        // (a cancelling record lingers until teardown, so it keeps its slot).
-        self.cfg.live_count.fetch_add(1, Ordering::Relaxed);
 
         let task = AgentTask {
             project_id: self.cfg.project_id.clone(),
@@ -649,6 +659,17 @@ mod tests {
         })
     }
 
+    /// Spawn fn that always fails, to exercise the supervisor's spawn-failure path
+    /// (and prove a reserved workspace slot is released when a launch can't spawn).
+    fn failing_spawn() -> Arc<SpawnFn> {
+        Arc::new(|_cfg: SpawnConfig, _events: AppEventTx| {
+            Err(crate::backend::AgentError::Spawn {
+                program: "claude".to_string(),
+                detail: "synthetic spawn failure".to_string(),
+            })
+        })
+    }
+
     /// How many times an issue has been spawned so far — a queried fact, not the
     /// positional ordering assumption the older tests baked into `registry[1]`.
     fn spawn_count(registry: &Registry, issue: &str) -> usize {
@@ -710,6 +731,43 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         cond()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_spawn_releases_its_reserved_workspace_slot() {
+        // launch() reserves a slot in the shared live_count BEFORE the agent task
+        // runs. If the spawn fails, run_agent must still reap so the slot is freed —
+        // otherwise every failed launch would permanently shrink the workspace cap.
+        let (dir, wt) = temp_repo();
+        let (tx, mut rx) = crate::event::channel();
+        let cfg = config(&dir, wt, tx, failing_spawn(), 4);
+        let live = Arc::clone(&cfg.live_count);
+        let (handle, join) = Supervisor::start(cfg, &Handle::current());
+
+        handle.launch("ENG-1".into(), "One".into(), None);
+
+        // The spawn failure surfaces as a footer notification…
+        let saw_failure = wait_for(|| {
+            while let Ok(ev) = rx.try_recv() {
+                if let AppEvent::Notification(m) = ev
+                    && m.contains("spawning agent for ENG-1 failed")
+                {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert!(saw_failure, "a failing spawn surfaces an error");
+
+        // …and the reserved slot is handed back, so the cap isn't leaked.
+        assert!(
+            wait_for(|| live.load(Ordering::Relaxed) == 0).await,
+            "the reserved workspace slot is released after the spawn fails"
+        );
+
+        handle.shutdown();
+        join.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

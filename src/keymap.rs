@@ -95,6 +95,9 @@ pub enum Action {
     /// prefix, until Esc or the prefix exits. Keeps the one-shot `prefix key`
     /// rhythm available, while a run of verbs (focus, pin, zoom…) needs no repeats.
     CommandMode,
+    /// Open the project switcher overlay — pick another mapped Linear project to
+    /// view; the project you leave keeps its agents running in the background.
+    SwitchProject,
 }
 
 /// `(action, config name, default keys)` for the **direct** keys consulted when
@@ -148,6 +151,8 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::ToggleSummary, "summary", &["i"]),
     (Action::ToggleRoster, "roster", &["r"]),
     (Action::JumpNeedsYou, "jump-needs-you", &["n"]),
+    // `Ctrl-a s` opens the project switcher (`p` is taken by `pin`).
+    (Action::SwitchProject, "switch-project", &["s"]),
     // `Ctrl-a Tab` flips the active window chat⇄deps from any focus — notably
     // from inside a chat, where a bare Tab would go to the agent's PTY.
     (Action::ContextToggle, "context", &["tab"]),

@@ -12,17 +12,19 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::backend::{self, AgentBackend, Lifecycle};
-use crate::event::AppEvent;
+use crate::event::{AppEvent, AppEventTx};
 use crate::keymap::{Action, Keymap};
 use crate::layout;
+use crate::linear::{Client, ProjectRef};
 use crate::model::{Direction, Graph, Issue};
+use crate::picker::Picker;
 use crate::session::{AgentStatus, CockpitState, PersistedKind, PersistedWindow};
 use crate::window::{
     CoinMode, DepsCursor, GraduateOutcome, LayoutMode, WindowId, WindowKind, WindowSet,
@@ -217,6 +219,39 @@ pub struct App {
     /// and resume act on. Set when the control plane arms; empty in `--demo` /
     /// snapshots / tests (which never launch agents).
     pub active_project: String,
+    /// Every Linear project, for the in-cockpit switcher overlay. Empty in
+    /// `--demo` / when the control plane is off (switching is then unavailable).
+    pub project_list: Vec<ProjectRef>,
+    /// The configured (mapped) project ids — the set the switcher offers, since
+    /// only a mapped project can run agents. Populated when the control plane arms.
+    pub mapped_projects: HashSet<String>,
+    /// The open project-switcher overlay (`Ctrl-a s`), if any. While `Some` it is a
+    /// full modal: it captures every key (typing filters; Esc cancels).
+    pub project_switcher: Option<Picker>,
+    /// Live agent backends for projects you've switched *away* from, keyed by
+    /// `project_id` then issue. Stashed on switch (the `Arc`s stay valid while
+    /// their agents run) so switching back re-attaches to the real PTYs; the
+    /// active project's backends live in [`Self::backends`].
+    stashed_backends: HashMap<String, HashMap<String, Arc<dyn AgentBackend>>>,
+    /// Hand-off slot for a switch's freshly-loaded graph: the off-thread fetch
+    /// drops `(gen, target, graph)` here and wakes the loop with
+    /// [`AppEvent::ProjectActivated`] (`Graph` is neither `Clone` nor `Debug`, so
+    /// it can't ride the event itself). `gen` is the switch generation, so a slow
+    /// fetch for a superseded switch is dropped rather than applied late.
+    switch_inbox: Arc<Mutex<Option<(u64, ProjectRef, Graph)>>>,
+    /// Monotonic switch generation: bumped per [`Self::request_switch`] (and per
+    /// cancel) so the most recently *selected* project wins regardless of which
+    /// fetch *completes* first.
+    switch_seq: u64,
+    /// The project a switch is currently fetching, if any — so re-selecting the
+    /// current project can cancel it and the footer can reflect "loading…".
+    pending_switch: Option<String>,
+    /// Switcher plumbing, wired by [`Self::enable_project_switching`] when the
+    /// control plane arms: the Linear client + runtime for the off-thread graph
+    /// fetch, and the event sender to wake the render loop.
+    linear: Option<Arc<Client>>,
+    runtime: Option<tokio::runtime::Handle>,
+    events: Option<AppEventTx>,
     /// Active key bindings (defaults, overridden by `config.toml`).
     pub keymap: Keymap,
 
@@ -287,6 +322,16 @@ impl App {
             auto_resume: false,
             workspace: None,
             active_project: String::new(),
+            project_list: Vec::new(),
+            mapped_projects: HashSet::new(),
+            project_switcher: None,
+            stashed_backends: HashMap::new(),
+            switch_inbox: Arc::new(Mutex::new(None)),
+            switch_seq: 0,
+            pending_switch: None,
+            linear: None,
+            runtime: None,
+            events: None,
             keymap: Keymap::default(),
             cockpit_path: None,
             cockpit_dirty: false,
@@ -414,6 +459,13 @@ impl App {
         if self.prefix_armed {
             self.prefix_armed = false;
             self.on_prefix_key(key);
+            return;
+        }
+
+        // 1b. The project switcher is a full modal: every key filters/navigates it
+        //     (Esc cancels), so it sits above the prefix and all window routing.
+        if self.project_switcher.is_some() {
+            self.on_switcher_key(key);
             return;
         }
 
@@ -581,9 +633,211 @@ impl App {
                 self.toggle_roster();
             }
             Action::JumpNeedsYou => self.jump_to_needs_you(),
+            Action::SwitchProject => self.open_project_switcher(),
             // The rest are direct (Spine/Deps) actions, never prefix verbs.
             _ => {}
         }
+    }
+
+    /// Wire the in-cockpit project switcher when the control plane arms: the
+    /// Linear client + runtime that run the off-thread graph fetch, the event
+    /// sender that wakes the render loop, and the list of projects to offer.
+    pub fn enable_project_switching(
+        &mut self,
+        linear: Arc<Client>,
+        runtime: tokio::runtime::Handle,
+        events: AppEventTx,
+        projects: Vec<ProjectRef>,
+    ) {
+        self.linear = Some(linear);
+        self.runtime = Some(runtime);
+        self.events = Some(events);
+        self.project_list = projects;
+    }
+
+    /// Open the project switcher overlay, or explain why it can't open. Offers only
+    /// *mapped* projects (those with a repo in `projects.toml`) — switching to an
+    /// unmapped project would swap the graph but never be able to run agents.
+    fn open_project_switcher(&mut self) {
+        if self.linear.is_none() || self.runtime.is_none() || self.events.is_none() {
+            self.set_footer("project switching needs the agent control plane".into());
+            return;
+        }
+        let choices: Vec<ProjectRef> = self
+            .project_list
+            .iter()
+            .filter(|p| self.mapped_projects.contains(&p.id))
+            .cloned()
+            .collect();
+        if choices.len() < 2 {
+            self.set_footer(
+                "no other mapped project — add a [[project]] to .lindep/projects.toml".into(),
+            );
+            return;
+        }
+        self.project_switcher = Some(Picker::new(choices));
+    }
+
+    /// Drive the open switcher overlay: type to filter, ↑↓ move, Enter switch,
+    /// Esc cancel.
+    fn on_switcher_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.project_switcher.as_mut() else {
+            return;
+        };
+        match key.code {
+            // Esc and Ctrl-C both cancel — matching the startup picker so the exits
+            // are consistent (without Ctrl-C the chord would leak in as filter text).
+            KeyCode::Esc => self.project_switcher = None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.project_switcher = None;
+            }
+            KeyCode::Enter => {
+                let selected = picker.selected();
+                self.project_switcher = None;
+                if let Some(target) = selected {
+                    self.request_switch(target);
+                }
+            }
+            KeyCode::Down => picker.move_by(1),
+            KeyCode::Up => picker.move_by(-1),
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.refilter();
+            }
+            // Only unmodified chars filter — a stray Ctrl-/Alt-chord never leaks in.
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                picker.query.push(c);
+                picker.refilter();
+            }
+            _ => {}
+        }
+    }
+
+    /// Begin a switch to `target`: fetch its issue graph off the render thread
+    /// (the network call must not freeze the UI), then wake the loop with
+    /// [`AppEvent::ProjectActivated`] to swap it in. A no-op for the current
+    /// project.
+    fn request_switch(&mut self, target: ProjectRef) {
+        if target.id == self.active_project {
+            // Re-selecting the project you're on cancels any in-flight switch
+            // (bumping the generation makes its result stale) and stays put.
+            if self.pending_switch.take().is_some() {
+                self.switch_seq += 1;
+                self.set_footer(format!("staying on {}", target.name));
+            } else {
+                self.set_footer(format!("already on {}", target.name));
+            }
+            return;
+        }
+        let (Some(linear), Some(runtime), Some(events)) = (
+            self.linear.clone(),
+            self.runtime.clone(),
+            self.events.clone(),
+        ) else {
+            return;
+        };
+        // Stamp this switch so the most recently *selected* project wins regardless
+        // of which fetch *completes* first (a slow fetch for a superseded switch is
+        // dropped at apply time, and never overwrites a newer one in the slot).
+        self.switch_seq += 1;
+        let generation = self.switch_seq;
+        self.pending_switch = Some(target.id.clone());
+        self.set_footer(format!("loading {}…", target.name));
+        let inbox = Arc::clone(&self.switch_inbox);
+        runtime.spawn_blocking(move || match linear.fetch_graph(&target) {
+            Ok(graph) => {
+                if let Ok(mut slot) = inbox.lock() {
+                    // Keep only the highest generation seen, so an older fetch
+                    // landing late can't clobber a newer one.
+                    if slot.as_ref().is_none_or(|(g, _, _)| generation >= *g) {
+                        *slot = Some((generation, target, graph));
+                    }
+                }
+                let _ = events.send(AppEvent::ProjectActivated);
+            }
+            Err(e) => {
+                let _ = events.send(AppEvent::Notification(format!(
+                    "switch to {} failed: {e}",
+                    target.name
+                )));
+            }
+        });
+    }
+
+    /// Swap the cockpit to `project` and its freshly-loaded `graph`. The project we
+    /// leave keeps its agents running in the supervisor; we stash its live backends
+    /// so a later switch back re-attaches to their real screens. The target's fleet
+    /// is repopulated by asking the workspace to (build and) re-emit its statuses.
+    fn activate_project(&mut self, project: ProjectRef, graph: Graph) {
+        if project.id == self.active_project {
+            return;
+        }
+        self.pending_switch = None;
+        // Stash the leaving project's live backends — the `Arc`s stay valid while
+        // their agents run, so switching back reveals their real PTYs.
+        let leaving = std::mem::take(&mut self.backends);
+        if !self.active_project.is_empty() {
+            self.stashed_backends
+                .insert(self.active_project.clone(), leaving);
+        }
+
+        self.active_project = project.id.clone();
+        self.graph = graph;
+
+        // Restore the target's stashed backends, dropping any whose agent exited
+        // while backgrounded (its exit/reap events were filtered out, so the only
+        // way to know is to ask the backend).
+        let restored = self.stashed_backends.remove(&project.id).unwrap_or_default();
+        self.backends = restored
+            .into_iter()
+            .filter(|(_, b)| !matches!(b.status(), Lifecycle::Exited(_)))
+            .collect();
+
+        // Clean view for the new project — its statuses arrive via the workspace
+        // re-emit below; everything else starts fresh.
+        self.fleet.clear();
+        self.reaped.clear();
+        self.pending_launch.clear();
+        self.pending_attach = None;
+        self.resuming.clear();
+        self.flash.clear();
+        self.preview_size.clear();
+        self.search_active = false;
+        self.search_query.clear();
+        self.needs_you_alert = false;
+
+        self.windows = WindowSet::new();
+        self.root = most_connected_root(&self.graph);
+        if !self.root.is_empty() {
+            self.windows
+                .ensure_preview(&self.root, CoinMode::Deps, &self.graph);
+            self.windows.focus = 0;
+        }
+        self.rebuild_order();
+
+        // The saved cockpit layout belongs to the project we booted into; once you
+        // switch, stop persisting so we don't overwrite it with another project's
+        // windows. (Per-project layout persistence is future work.)
+        self.cockpit_path = None;
+        self.cockpit_dirty = false;
+
+        // Bring the target online: build its plane if needed (which reconciles +
+        // rehydrates) and re-emit its current fleet statuses. Resume-on-focus
+        // reuses the restored live backends; a dead docked agent relaunches.
+        if let Some(workspace) = &self.workspace {
+            workspace.activate(project.id.clone());
+        }
+        self.auto_resume = true;
+
+        self.set_footer(format!(
+            "switched to {} · {} issues",
+            project.name,
+            self.graph.len()
+        ));
     }
 
     /// Direct keys while the Spine is focused.
@@ -1390,15 +1644,49 @@ impl App {
         // empty `active_project` (demo / snapshots / unit tests, which never arm a
         // workspace) disables the guard so every event still applies.
         if !self.active_project.is_empty()
-            && let Some(pid) = ev.project_id()
-            && pid != self.active_project
+            && ev.project_id().is_some_and(|pid| pid != self.active_project)
         {
+            // A backgrounded project's event isn't for the on-screen fleet — but a
+            // backend that *spawns* while backgrounded must not be lost (its
+            // AgentSpawned would otherwise be dropped and the agent orphaned on a
+            // switch back, since the supervisor won't re-hand the backend). File it
+            // into that project's stash instead, and drop it again on reap.
+            match ev {
+                AppEvent::AgentSpawned {
+                    project_id,
+                    issue,
+                    backend,
+                } => {
+                    self.stashed_backends
+                        .entry(project_id)
+                        .or_default()
+                        .insert(issue, backend);
+                }
+                AppEvent::AgentReaped { project_id, issue } => {
+                    if let Some(m) = self.stashed_backends.get_mut(&project_id) {
+                        m.remove(&issue);
+                    }
+                }
+                _ => {}
+            }
             return false;
         }
         match ev {
             AppEvent::Notification(text) => {
                 self.pending_launch.clear();
                 self.set_footer(text);
+                true
+            }
+            // A switch's graph finished loading off-thread: take it from the inbox
+            // and swap the cockpit over to it — unless a newer switch (or a cancel)
+            // has since bumped the generation, in which case this result is stale.
+            AppEvent::ProjectActivated => {
+                let taken = self.switch_inbox.lock().ok().and_then(|mut slot| slot.take());
+                if let Some((generation, project, graph)) = taken
+                    && generation == self.switch_seq
+                {
+                    self.activate_project(project, graph);
+                }
                 true
             }
             // `project_id` is ignored while the cockpit is single-project; ENG-401
@@ -1754,6 +2042,21 @@ impl App {
 
 /// Map a window to its persistable identity, or `None` for the Spine (never
 /// persisted — it's recreated by `WindowSet::new`).
+/// The most-connected non-external node — the cockpit's default root/selection
+/// for a freshly-loaded graph (mirrors the same pick in [`App::new`]; reused when
+/// switching projects).
+fn most_connected_root(graph: &Graph) -> String {
+    graph
+        .keys()
+        .iter()
+        .filter(|k| graph.get(k).is_some_and(|i| !i.external))
+        .max_by_key(|k| {
+            graph.direct_count(k, Direction::Upstream) + graph.direct_count(k, Direction::Downstream)
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn window_to_persisted(w: &crate::window::Window) -> Option<PersistedWindow> {
     match &w.kind {
         // The Spine is recreated by `WindowSet::new`. The preview (an unpinned
@@ -1861,6 +2164,142 @@ mod tests {
         app.backends
             .insert(key.into(), fake.clone() as Arc<dyn AgentBackend>);
         fake
+    }
+
+    // ── Project switching (Ctrl-a s) ─────────────────────────────────────────
+
+    fn project(id: &str, name: &str) -> ProjectRef {
+        ProjectRef {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn switching_projects_swaps_the_graph_and_stashes_then_restores_live_backends() {
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        let agent = register(&mut a, "ENG-1"); // a live backend in proj-a
+        a.fleet.insert("ENG-1".into(), AgentStatus::Running);
+
+        // Switch to proj-b: the active view is clean, proj-a's backend is stashed
+        // (not killed — its Arc lives on for a switch back).
+        a.activate_project(project("proj-b", "Beta"), demo::graph());
+        assert_eq!(a.active_project, "proj-b");
+        assert!(a.backends.is_empty(), "the new project starts with no backends");
+        assert!(a.fleet.is_empty(), "the new project's fleet starts empty");
+        assert!(
+            a.stashed_backends
+                .get("proj-a")
+                .is_some_and(|m| m.contains_key("ENG-1")),
+            "the left project's live backend is stashed"
+        );
+        drop(agent);
+
+        // Switch back: the still-live backend is re-attached, no relaunch.
+        a.activate_project(project("proj-a", "Alpha"), demo::graph());
+        assert_eq!(a.active_project, "proj-a");
+        assert!(
+            a.backends.contains_key("ENG-1"),
+            "switching back re-attaches the still-live backend"
+        );
+    }
+
+    #[test]
+    fn switching_back_drops_a_backend_that_exited_while_backgrounded() {
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        let agent = register(&mut a, "ENG-1");
+        a.activate_project(project("proj-b", "Beta"), demo::graph());
+        // The agent exits while proj-a is backgrounded (its reap event was filtered).
+        agent.finish(Some(0));
+        a.activate_project(project("proj-a", "Alpha"), demo::graph());
+        assert!(
+            !a.backends.contains_key("ENG-1"),
+            "a backend whose agent exited while backgrounded is not re-attached"
+        );
+    }
+
+    #[test]
+    fn the_open_switcher_captures_typing_and_esc_closes_it() {
+        let mut a = app();
+        a.project_switcher = Some(Picker::new(vec![
+            project("1", "Billing"),
+            project("2", "Infra"),
+        ]));
+        // A bare letter filters the overlay — it is NOT routed to a window verb.
+        press(&mut a, KeyCode::Char('i'));
+        assert_eq!(a.project_switcher.as_ref().unwrap().query, "i");
+        // Esc cancels without switching.
+        press(&mut a, KeyCode::Esc);
+        assert!(a.project_switcher.is_none());
+        assert_eq!(a.active_project, "");
+    }
+
+    #[test]
+    fn the_switcher_is_unavailable_without_the_control_plane() {
+        let mut a = app(); // no client/runtime/events wired
+        a.open_project_switcher();
+        assert!(a.project_switcher.is_none(), "no overlay opens");
+        assert!(
+            a.status_msg.as_deref().unwrap_or("").contains("control plane"),
+            "an actionable footer explains why"
+        );
+    }
+
+    #[test]
+    fn a_superseded_switch_result_is_ignored_so_the_last_selection_wins() {
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        a.switch_seq = 2; // the user's latest selection is generation 2
+        // A slow fetch for an EARLIER selection (gen 1) lands first → dropped.
+        *a.switch_inbox.lock().unwrap() = Some((1, project("proj-b", "B"), demo::graph()));
+        a.apply_event(AppEvent::ProjectActivated);
+        assert_eq!(
+            a.active_project, "proj-a",
+            "a superseded (older-generation) switch result is ignored"
+        );
+        // The latest selection's fetch (gen 2) lands → applied.
+        *a.switch_inbox.lock().unwrap() = Some((2, project("proj-c", "C"), demo::graph()));
+        a.apply_event(AppEvent::ProjectActivated);
+        assert_eq!(
+            a.active_project, "proj-c",
+            "the most recently selected project wins regardless of fetch order"
+        );
+    }
+
+    #[test]
+    fn a_backend_spawning_while_its_project_is_backgrounded_is_stashed_not_dropped() {
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        // An AgentSpawned for a DIFFERENT, backgrounded project must be stashed —
+        // not dropped — or the agent is orphaned (no backend) on a switch back.
+        let applied = a.apply_event(AppEvent::AgentSpawned {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            backend: FakeBackend::new("ENG-9") as Arc<dyn AgentBackend>,
+        });
+        assert!(
+            !applied,
+            "a backgrounded project's event doesn't repaint the active view"
+        );
+        assert!(
+            a.stashed_backends
+                .get("proj-b")
+                .is_some_and(|m| m.contains_key("ENG-9")),
+            "the backgrounded backend is stashed for a later switch-back"
+        );
+        // Its reap (also filtered) drops it from the stash so it can't be restored.
+        a.apply_event(AppEvent::AgentReaped {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+        });
+        assert!(
+            a.stashed_backends
+                .get("proj-b")
+                .is_none_or(|m| !m.contains_key("ENG-9")),
+            "a reaped backgrounded agent is removed from the stash"
+        );
     }
 
     // ── Spawn sizing (point F: no full-width reflow flash) ───────────────────

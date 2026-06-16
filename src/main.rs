@@ -25,7 +25,7 @@ mod workspace;
 mod worktree;
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -147,15 +147,24 @@ fn real_main() -> Result<(), String> {
     // Interactive path. Restore the terminal cleanly even on panic.
     install_panic_hook();
 
-    let (graph, project) = if cli.demo {
-        (demo::graph(), None)
+    let (graph, project, client, projects) = if cli.demo {
+        (demo::graph(), None, None, Vec::new())
     } else {
         let client = Client::new(require_key()?);
         let Some(project) = resolve_or_pick(&client, cli.project.as_deref())? else {
             return Ok(()); // user quit the picker
         };
         eprintln!("Loading {}…", project.name);
-        (client.fetch_graph(&project)?, Some(project))
+        let graph = client.fetch_graph(&project)?;
+        // The full project list powers the in-cockpit switcher (Ctrl-a s).
+        // Best-effort: if it fails we still run, just without switching.
+        let projects = client.list_projects().unwrap_or_default();
+        (
+            graph,
+            Some(project),
+            Some(std::sync::Arc::new(client)),
+            projects,
+        )
     };
 
     if graph.is_empty() {
@@ -166,7 +175,7 @@ fn real_main() -> Result<(), String> {
     if cli.graph {
         app.windows.open_fleet();
     }
-    run_tui(app, cli.demo, project, cli.no_resume).map_err(|e| e.to_string())
+    run_tui(app, cli.demo, project, client, projects, cli.no_resume).map_err(|e| e.to_string())
 }
 
 /// Load `LINEAR_API_KEY` (and anything else) from `.env`: first the current
@@ -240,6 +249,8 @@ fn run_tui(
     mut app: App,
     demo: bool,
     project: Option<ProjectRef>,
+    client: Option<std::sync::Arc<Client>>,
+    projects: Vec<ProjectRef>,
     no_resume: bool,
 ) -> io::Result<()> {
     // Load the keymap from config (repo `.lindep/config.toml`, then personal
@@ -285,6 +296,15 @@ fn run_tui(
         ),
         None => None,
     };
+
+    // Wire the in-cockpit project switcher (Ctrl-a s): it needs the Linear client +
+    // runtime to fetch a target project's graph off the render thread. Wired only
+    // when the control plane is actually up — switching re-emits a project's fleet
+    // through the workspace, so without it switching couldn't run agents anyway.
+    // start_control_plane has already set `app.active_project` (the current project).
+    if let Some(client) = client.filter(|_| control_plane.is_some()) {
+        app.enable_project_switching(client, runtime.handle().clone(), tx.clone(), projects);
+    }
 
     // Greet the user via the event path so the footer shows the cockpit is live.
     {
@@ -380,6 +400,26 @@ fn control_plane_enabled(demo: bool) -> bool {
     !demo
 }
 
+/// The git repository root for `cwd` (`git rev-parse --show-toplevel`), or `None`
+/// when `cwd` isn't inside a work tree. The control plane anchors its on-disk
+/// state at the repo root so launching from a subdirectory doesn't scatter
+/// `.lindep/` (worktrees, state, a seeded `projects.toml`) into the tracked tree —
+/// the repo's `/.lindep` gitignore is root-anchored and wouldn't cover a subdir.
+fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(out.stdout).ok()?;
+    let path = path.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
 /// Default ceiling on live agents the supervisor hosts at once. Cockpit v3 raised
 /// this from 6 and made it overridable via `[agents] max_concurrent` in
 /// `config.toml`; docking is uncapped above it, with extra docked agents shown as
@@ -420,16 +460,21 @@ fn start_control_plane(
     use std::sync::{Arc, Mutex};
 
     let cwd = std::env::current_dir().ok()?;
+    // Anchor everything at the git repo root, not the raw cwd: launched from a
+    // subdirectory, a cwd-rooted `.lindep/` (worktrees, state, the seeded
+    // projects.toml) would land outside the repo's root-anchored `/.lindep`
+    // gitignore and could be committed by accident.
+    let repo_root_default = git_toplevel(&cwd).unwrap_or_else(|| cwd.clone());
 
     // Resolve this project's repo mapping from `.lindep/projects.toml` (repo
     // file overlaid by the personal one), seeding a single-project default at
-    // the current dir when the project isn't configured — so an existing
+    // the repo root when the project isn't configured — so an existing
     // single-repo checkout boots exactly as before, with zero setup.
-    let (mut config, warnings) = projects::WorkspaceConfig::load(Some(&cwd));
+    let (mut config, warnings) = projects::WorkspaceConfig::load(Some(&repo_root_default));
     for w in warnings {
         let _ = events.send(event::AppEvent::Notification(format!("projects.toml: {w}")));
     }
-    let seeded = config.ensure_mapped(&active.id, &active.name, &cwd);
+    let seeded = config.ensure_mapped(&active.id, &active.name, &repo_root_default);
     let mapping = match config.resolve(&active.id) {
         Ok(mapping) => mapping.clone(),
         // ensure_mapped guarantees this resolves; the arm exists so an unmapped
@@ -442,15 +487,20 @@ fn start_control_plane(
         }
     };
     // First run in this repo: drop a discoverable starter projects.toml under the
-    // gitignored `.lindep/` so adding more projects is obvious. Best-effort — a
-    // write failure just means no template, never a boot failure.
-    let repo_config_path = cwd.join(".lindep").join("projects.toml");
+    // gitignored `.lindep/` so adding more projects is obvious. Anchored at the
+    // resolved repo root (not cwd) so it lands inside the gitignore. Best-effort —
+    // a write failure just means no template, never a boot failure.
+    let repo_config_path = mapping.repo_root.join(".lindep").join("projects.toml");
     if seeded && !repo_config_path.exists() {
         if let Some(dir) = repo_config_path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(&repo_config_path, projects::seed_file_contents(&mapping));
     }
+    // The project switcher offers only configured projects — a mapped repo is what
+    // lets a project run agents (switching to an unmapped one could only show its
+    // graph). Captured before `config` moves into the workspace below.
+    app.mapped_projects = config.mapped_ids().into_iter().collect();
 
     let repo_root = mapping.repo_root.clone();
     let worktree = match mapping.branch_prefix.as_deref() {
@@ -496,10 +546,10 @@ fn start_control_plane(
     // before the first paint.
     let resumable = workspace::reconcile_and_rehydrate(&worktree, &store, &events, &active.id);
 
-    // Workspace store registry: the one loopback hook endpoint and the global
-    // fleet view resolve hooks/sessions across every project through it. Seed it
-    // with the active project's store; background projects add theirs as their
-    // planes build.
+    // Workspace store registry: the one loopback hook endpoint resolves each hook
+    // to its owning project's store through it (a hook carries only a session id /
+    // cwd, never a trusted project id). Seed it with the active project's store;
+    // background projects add theirs as their planes build.
     let stores: workspace::StoreRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
     if let Ok(mut registry) = stores.lock() {
         registry.insert(active.id.clone(), Arc::clone(&store));
