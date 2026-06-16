@@ -21,6 +21,7 @@ mod notify;
 mod projects;
 mod session;
 mod supervisor;
+mod workspace;
 mod worktree;
 
 use std::io;
@@ -338,7 +339,7 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// `shutdown` is idempotent so the explicit non-panic call and the `Drop`
 /// fallback don't double-tear-down.
 struct ControlPlaneGuard<'a> {
-    plane: Option<(supervisor::SupervisorHandle, tokio::task::JoinHandle<()>)>,
+    plane: Option<(workspace::WorkspaceHandle, tokio::task::JoinHandle<()>)>,
     runtime: &'a tokio::runtime::Runtime,
 }
 
@@ -415,8 +416,7 @@ fn start_control_plane(
     active: &ProjectRef,
     no_resume: bool,
     max_concurrent: usize,
-) -> Option<(supervisor::SupervisorHandle, tokio::task::JoinHandle<()>)> {
-    use std::collections::HashSet;
+) -> Option<(workspace::WorkspaceHandle, tokio::task::JoinHandle<()>)> {
     use std::sync::{Arc, Mutex};
 
     let cwd = std::env::current_dir().ok()?;
@@ -487,56 +487,14 @@ fn start_control_plane(
         },
     ));
 
-    // On startup, drop session records whose worktree vanished while we were off.
-    {
-        let live: Vec<String> = worktree
-            .list()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|w| w.issue)
-            .collect();
-        if let Ok(mut store) = store.lock() {
-            store.reconcile(live);
-            let _ = store.save();
-        }
-    }
-
-    // Rehydrate the fleet view from the durable store, through the single event
-    // funnel, so a restart surfaces last-known agent status instead of a blank
-    // overview ("the process is disposable; the conversation is durable"). The
-    // processes are gone — we just restarted — so a previously Spawning/Running
-    // session resolves to Idle (resumable, not falsely "live"); NeedsYou/Idle/
-    // Done/Failed carry over verbatim. These events sit in the channel and are
-    // drained on the first render tick, before the first paint.
-    if let Ok(store) = store.lock() {
-        for session in store.sessions() {
-            let status = match session.status {
-                session::AgentStatus::Spawning | session::AgentStatus::Running => {
-                    session::AgentStatus::Idle
-                }
-                other => other,
-            };
-            let _ = events.send(event::AppEvent::AgentStatusChanged {
-                issue: session.issue.clone(),
-                status,
-            });
-        }
-    }
-
-    // The was-live sessions: both the auto-resume candidates AND the set the
-    // restored window layout is pruned against — a docked agent only comes back
-    // (its window *and* its resume) if it was live, never Done/Failed/Stopped
-    // (which aren't `is_live`), so a terminal agent can't restore to a permanent
-    // "resuming…" card. Captured from the durable store, not the fleet (whose
-    // rehydration events haven't been drained yet).
-    let resumable: HashSet<String> = match store.lock() {
-        Ok(store) => store
-            .sessions()
-            .filter(|s| s.status.is_live())
-            .map(|s| s.issue.clone())
-            .collect(),
-        Err(_) => HashSet::new(),
-    };
+    // Reconcile this project's store against its live worktrees and rehydrate the
+    // fleet view (a was-Spawning/Running process is gone after a restart, so it
+    // resolves to Idle). Returns the was-live set — both the auto-resume
+    // candidates AND the set the restored window layout is pruned against (a
+    // docked agent only comes back if it was live, never Done/Failed/Stopped).
+    // These rehydration events sit in the channel and drain on the first tick,
+    // before the first paint.
+    let resumable = workspace::reconcile_and_rehydrate(&worktree, &store, &events, &active.id);
 
     // The hook endpoint must bind before agents launch so their settings can
     // point at it. block_on is safe here — we're on the synchronous main thread.
@@ -550,31 +508,48 @@ fn start_control_plane(
     let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("lindep").to_path_buf());
     let (cols, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
 
-    // Kept for the post-start cockpit-restore notification (the config moves
-    // `events` into the supervisor).
+    // Kept for the post-start cockpit-restore notifications (the builder moves
+    // `events` into the workspace).
     let events_back = events.clone();
-    let config = supervisor::SupervisorConfig {
-        worktree,
-        store,
+
+    // Shared workspace ingredients: every project's supervisor is built from this
+    // one builder, so the live-agent cap and its counter are genuinely shared
+    // across projects — N agents total, not N per project.
+    let builder = workspace::PlaneBuilder {
         events,
         spawn: backend::pty_spawn(),
         exe,
         hook_port,
         hook_token,
-        hooks_dir: mapping.hooks_dir(),
         base: "HEAD".to_string(),
         rows,
         cols,
-        // Cockpit v3 uncaps docking, but live backends are still bounded by the
-        // supervisor — default 12, overridable via `[agents] max_concurrent` (the
-        // practical ceiling is machine resources + how many ≥80-col columns fit).
+        // Cockpit v3 uncaps docking, but live backends are bounded — default 12,
+        // overridable via `[agents] max_concurrent`. Enforced workspace-wide.
         max_concurrent,
-        // Interactive agents use the normal permission flow; budget/turn caps
-        // are a headless (phase-3) concern and only apply with `--print`.
+        live_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        // Interactive agents use the normal permission flow; budget/turn caps are
+        // a headless (phase-3) concern and only apply with `--print`.
         guardrails: vec!["--permission-mode".to_string(), "default".to_string()],
     };
-    let (handle, join) = supervisor::Supervisor::start(config, runtime.handle());
-    app.supervisor = Some(handle.clone());
+
+    // Build the active project's plane eagerly — we're on the main thread at boot,
+    // before the TUI — and seed the workspace with it. Other mapped projects'
+    // fleets start lazily on first launch when you switch to them.
+    let active_cfg = builder.supervisor_config(&mapping, worktree, store);
+    let (active_handle, active_join) = supervisor::Supervisor::start(active_cfg, runtime.handle());
+    let mut planes = std::collections::HashMap::new();
+    planes.insert(
+        active.id.clone(),
+        workspace::ProjectPlane {
+            handle: active_handle,
+            join: active_join,
+        },
+    );
+    let (ws_handle, ws_join) =
+        workspace::Workspace::start(runtime.handle().clone(), builder, config, planes);
+    app.active_project = active.id.clone();
+    app.workspace = Some(ws_handle.clone());
 
     // Restore the saved window layout (pruned against the resumable set), then
     // point the cockpit at the file so the render thread persists future changes.
@@ -614,7 +589,7 @@ fn start_control_plane(
         app.begin_resume(&resumable, max_concurrent);
     }
 
-    Some((handle, join))
+    Some((ws_handle, ws_join))
 }
 
 fn install_panic_hook() {

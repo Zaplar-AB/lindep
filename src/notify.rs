@@ -223,9 +223,12 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
     // even if no further status write happens. Snapshot under the lock; the
     // blocking write runs after the guard drops so a rename never stalls another
     // hook on the mutex. A poisoned lock drops the hook rather than panicking.
-    let (issue, snapshot, notif_needs_you) = match store.lock() {
+    let (issue, project_id, snapshot, notif_needs_you) = match store.lock() {
         Ok(mut store) => {
             let issue = resolve_issue(payload, &store);
+            // Tag the events this hook produces with the store's owning project so
+            // the cockpit files them under the right project's fleet.
+            let project_id = store.project_id().to_string();
             let mut dirty = false;
 
             // Transcript path: kept as a path, never inlined. Accept it only if
@@ -296,7 +299,7 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
             } else {
                 None
             };
-            (issue, snapshot, notif_needs_you)
+            (issue, project_id, snapshot, notif_needs_you)
         }
         Err(_) => return,
     };
@@ -313,7 +316,11 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
                 .as_deref()
                 .or(payload.message.as_deref())
                 .map_or_else(|| "needs attention".to_string(), clamp_display);
-            AppEvent::AgentNeedsYou { issue, reason }
+            AppEvent::AgentNeedsYou {
+                project_id,
+                issue,
+                reason,
+            }
         }
         (Some(issue), "Notification") => {
             // A non-blocking notification (idle nudge / auth-success /
@@ -325,11 +332,13 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
                 .or(payload.message.as_deref())
                 .map_or_else(|| "agent idle".to_string(), clamp_display);
             AppEvent::AgentAction {
+                project_id,
                 issue,
                 action: note,
             }
         }
         (Some(issue), "Stop") => AppEvent::AgentStatusChanged {
+            project_id,
             issue,
             status: AgentStatus::Idle,
         },
@@ -338,9 +347,14 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
                 || "ran a tool".to_string(),
                 |t| format!("ran {}", clamp_display(t)),
             );
-            AppEvent::AgentAction { issue, action }
+            AppEvent::AgentAction {
+                project_id,
+                issue,
+                action,
+            }
         }
         (Some(issue), other) => AppEvent::AgentAction {
+            project_id,
             issue,
             action: format!("hook: {}", clamp_display(other)),
         },
@@ -890,8 +904,8 @@ mod tests {
         for _ in 0..100 {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
-                    AppEvent::AgentNeedsYou { issue, reason } => needs = Some((issue, reason)),
-                    AppEvent::AgentStatusChanged { issue, status } => {
+                    AppEvent::AgentNeedsYou { issue, reason, .. } => needs = Some((issue, reason)),
+                    AppEvent::AgentStatusChanged { issue, status, .. } => {
                         assert_eq!(status, AgentStatus::Idle);
                         stopped = Some(issue);
                     }
@@ -1081,7 +1095,7 @@ mod tests {
         assert!(
             got.iter().any(|ev| matches!(
                 ev,
-                AppEvent::AgentAction { issue, action } if issue == "ENG-1" && action == "ran Edit"
+                AppEvent::AgentAction { issue, action, .. } if issue == "ENG-1" && action == "ran Edit"
             )),
             "PostToolUse with a tool_name maps to 'ran <tool>'; got {got:?}"
         );

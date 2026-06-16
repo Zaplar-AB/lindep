@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,6 +33,9 @@ use crate::worktree::WorktreeManager;
 
 /// Everything the supervisor needs to launch and host agents.
 pub struct SupervisorConfig {
+    /// The Linear project this supervisor owns the fleet for. Tags every event
+    /// it emits so the cockpit files them under the right project.
+    pub project_id: String,
     pub worktree: WorktreeManager,
     pub store: Arc<Mutex<SessionStore>>,
     pub events: AppEventTx,
@@ -51,8 +55,14 @@ pub struct SupervisorConfig {
     /// Initial PTY size; attach resizes to the real pane later.
     pub rows: u16,
     pub cols: u16,
-    /// Most agents allowed at once.
+    /// Most agents allowed at once, enforced **workspace-wide**: every project's
+    /// supervisor shares the same cap and the same `live_count`, so the ceiling
+    /// is N agents across all projects, not N per project.
     pub max_concurrent: usize,
+    /// Shared count of live agents across the whole workspace (every supervisor
+    /// increments on a launch it accepts and decrements on reap). Checked against
+    /// `max_concurrent` before each launch so the cap spans all projects.
+    pub live_count: Arc<AtomicUsize>,
     /// Extra `claude` args applied to every launch (e.g. `--permission-mode`).
     pub guardrails: Vec<String>,
 }
@@ -133,6 +143,7 @@ struct AgentRecord {
 /// Everything one agent task needs, cloned out of the config at launch so the
 /// command loop never blocks on a launch's setup.
 struct AgentTask {
+    project_id: String,
     issue: String,
     title: String,
     generation: u64,
@@ -221,9 +232,11 @@ impl Supervisor {
             }
             return;
         }
-        if self.agents.len() >= self.cfg.max_concurrent {
+        // Workspace-wide capacity: consult the shared counter so the cap spans
+        // every project's fleet, not this supervisor alone.
+        if self.cfg.live_count.load(Ordering::Relaxed) >= self.cfg.max_concurrent {
             self.notify(format!(
-                "at capacity ({} agents) — cancel one first",
+                "at capacity ({} agents across the workspace) — cancel one first",
                 self.cfg.max_concurrent
             ));
             return;
@@ -240,8 +253,12 @@ impl Supervisor {
                 cancelling: false,
             },
         );
+        // Claim a workspace slot; released in `reap` when this record is dropped
+        // (a cancelling record lingers until teardown, so it keeps its slot).
+        self.cfg.live_count.fetch_add(1, Ordering::Relaxed);
 
         let task = AgentTask {
+            project_id: self.cfg.project_id.clone(),
             issue,
             title,
             generation,
@@ -286,9 +303,12 @@ impl Supervisor {
             .is_some_and(|r| r.generation == generation)
         {
             self.agents.remove(issue);
+            // Release the workspace slot this record held.
+            self.cfg.live_count.fetch_sub(1, Ordering::Relaxed);
             // Tell the cockpit the agent is fully gone so it can drop the fleet
             // entry (bounds the overview; keeps it in step with our live map).
             let _ = self.cfg.events.send(AppEvent::AgentReaped {
+                project_id: self.cfg.project_id.clone(),
                 issue: issue.to_string(),
             });
         }
@@ -410,6 +430,7 @@ async fn supervise(task: &AgentTask) {
             return;
         }
         let mut spawn_cfg = SpawnConfig::claude(
+            &task.project_id,
             &task.issue,
             worktree.path.clone(),
             &session_id,
@@ -428,6 +449,7 @@ async fn supervise(task: &AgentTask) {
             Err(e) => return notify(format!("spawning agent for {} failed: {e}", task.issue)),
         };
         let _ = task.events.send(AppEvent::AgentSpawned {
+            project_id: task.project_id.clone(),
             issue: task.issue.clone(),
             backend: Arc::clone(&backend),
         });
@@ -517,6 +539,7 @@ async fn supervise(task: &AgentTask) {
         })
         .await;
         let _ = task.events.send(AppEvent::AgentStatusChanged {
+            project_id: task.project_id.clone(),
             issue: task.issue.clone(),
             status,
         });
@@ -659,6 +682,7 @@ mod tests {
         cap: usize,
     ) -> SupervisorConfig {
         SupervisorConfig {
+            project_id: String::new(),
             worktree: wt,
             store: Arc::new(Mutex::new(
                 SessionStore::load(dir.join(".lindep").join("state.json")).unwrap(),
@@ -673,6 +697,7 @@ mod tests {
             rows: 24,
             cols: 80,
             max_concurrent: cap,
+            live_count: Arc::new(AtomicUsize::new(0)),
             guardrails: vec![],
         }
     }
@@ -723,7 +748,7 @@ mod tests {
         assert!(
             wait_for(|| {
                 while let Ok(ev) = rx.try_recv() {
-                    if let AppEvent::AgentStatusChanged { issue, status } = ev
+                    if let AppEvent::AgentStatusChanged { issue, status, .. } = ev
                         && issue == "ENG-1"
                         && status == AgentStatus::Stopped
                     {
@@ -1046,7 +1071,7 @@ mod tests {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     AppEvent::AgentSpawned { issue, .. } if issue == "ENG-1" => spawned = true,
-                    AppEvent::AgentStatusChanged { issue, status }
+                    AppEvent::AgentStatusChanged { issue, status, .. }
                         if issue == "ENG-1" && status == AgentStatus::Running =>
                     {
                         running = true;

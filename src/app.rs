@@ -24,10 +24,10 @@ use crate::keymap::{Action, Keymap};
 use crate::layout;
 use crate::model::{Direction, Graph, Issue};
 use crate::session::{AgentStatus, CockpitState, PersistedKind, PersistedWindow};
-use crate::supervisor::SupervisorHandle;
 use crate::window::{
     CoinMode, DepsCursor, GraduateOutcome, LayoutMode, WindowId, WindowKind, WindowSet,
 };
+use crate::workspace::WorkspaceHandle;
 
 /// How many animation frames a node flash lasts (~400 ms at the 100 ms tick).
 const FLASH_FRAMES: u64 = 4;
@@ -209,9 +209,14 @@ pub struct App {
     /// Whether auto-resume is on (off under `--no-resume`, in `--demo`, tests).
     /// Gates the lazy resume-on-first-focus of docked agents.
     auto_resume: bool,
-    /// Handle to the agent supervisor, when running with one (absent in `--demo`,
-    /// snapshots and unit tests).
-    pub supervisor: Option<SupervisorHandle>,
+    /// Handle to the workspace (every project's fleet), when running with one
+    /// (absent in `--demo`, snapshots and unit tests). Launch/cancel route through
+    /// it by `(active_project, issue)`.
+    pub workspace: Option<WorkspaceHandle>,
+    /// The Linear project the cockpit is currently inside — the project `a`/`x`
+    /// and resume act on. Set when the control plane arms; empty in `--demo` /
+    /// snapshots / tests (which never launch agents).
+    pub active_project: String,
     /// Active key bindings (defaults, overridden by `config.toml`).
     pub keymap: Keymap,
 
@@ -280,7 +285,8 @@ impl App {
             resuming: HashMap::new(),
             resume_cap: 0,
             auto_resume: false,
-            supervisor: None,
+            workspace: None,
+            active_project: String::new(),
             keymap: Keymap::default(),
             cockpit_path: None,
             cockpit_dirty: false,
@@ -829,12 +835,12 @@ impl App {
         // Absent, or terminal → (re)launch; the supervisor resumes transparently
         // if a session already exists. Open the window now (a "starting…" card)
         // so the press registers; `AgentSpawned` fills in the backend.
-        match self.supervisor.clone() {
-            Some(supervisor) => {
+        match self.workspace.clone() {
+            Some(workspace) => {
                 // Spawn the PTY at the tile we'll render it in, so claude's first
                 // paint already fits (no full-width reflow flash beside a pin).
                 let size = self.agent_spawn_size();
-                supervisor.launch(key.clone(), title, size);
+                workspace.launch(self.active_project.clone(), key.clone(), title, size);
                 self.pending_launch.insert(key.clone());
                 self.pending_attach = Some(key.clone());
                 self.open_agent_window(&key);
@@ -989,9 +995,9 @@ impl App {
             self.status_msg = Some("kill cancelled".into());
             return;
         }
-        match self.supervisor.clone() {
-            Some(supervisor) => {
-                supervisor.cancel(issue.clone());
+        match self.workspace.clone() {
+            Some(workspace) => {
+                workspace.cancel(self.active_project.clone(), issue.clone());
                 self.status_msg = Some(format!("killing agent on {issue}…"));
             }
             None => self.status_msg = Some("agent control plane unavailable".into()),
@@ -1282,7 +1288,7 @@ impl App {
     pub fn begin_resume(&mut self, resumable: &HashSet<String>, cap: usize) {
         self.auto_resume = true;
         self.resume_cap = cap;
-        if self.supervisor.is_none() {
+        if self.workspace.is_none() {
             return;
         }
         // Docked agent windows that are resumable, the focused one first so it
@@ -1339,7 +1345,7 @@ impl App {
 
     /// Fire a single resume launch (no focus-steal — the window already exists).
     fn resume_one(&mut self, issue: &str) {
-        let Some(supervisor) = self.supervisor.clone() else {
+        let Some(workspace) = self.workspace.clone() else {
             return;
         };
         if self.pending_launch.contains(issue) {
@@ -1364,7 +1370,7 @@ impl App {
             .windows
             .pinned_coin_index(issue)
             .and_then(|i| self.window_pane_size(i));
-        supervisor.launch(issue.to_string(), title, size);
+        workspace.launch(self.active_project.clone(), issue.to_string(), title, size);
         self.pending_launch.insert(issue.to_string());
         // Each resume carries its own grace deadline, so a wedged spawn self-
         // clears here (in `tick_frame`) without later resumes pushing it out —
@@ -1378,13 +1384,26 @@ impl App {
     /// Apply a background [`AppEvent`] to view state, returning whether the
     /// screen must repaint. The render loop is the single writer of `App`.
     pub fn apply_event(&mut self, ev: AppEvent) -> bool {
+        // While the cockpit is inside one project, an agent event from another
+        // (backgrounded) project isn't for the fleet on screen — drop it. ENG-401
+        // shards the fleet by project and files these instead of dropping. An
+        // empty `active_project` (demo / snapshots / unit tests, which never arm a
+        // workspace) disables the guard so every event still applies.
+        if !self.active_project.is_empty()
+            && let Some(pid) = ev.project_id()
+            && pid != self.active_project
+        {
+            return false;
+        }
         match ev {
             AppEvent::Notification(text) => {
                 self.pending_launch.clear();
                 self.set_footer(text);
                 true
             }
-            AppEvent::AgentSpawned { issue, backend } => {
+            // `project_id` is ignored while the cockpit is single-project; ENG-401
+            // shards the fleet by project and binds it here.
+            AppEvent::AgentSpawned { issue, backend, .. } => {
                 // Clear the double-launch guard (set by the button AND by a resume).
                 self.pending_launch.remove(&issue);
                 // A real relaunch revives the issue — clear any reaped tombstone.
@@ -1408,8 +1427,8 @@ impl App {
                 true
             }
             // Repaint only when this agent's screen is visible right now.
-            AppEvent::AgentOutput { issue } => self.is_agent_visible(&issue),
-            AppEvent::AgentExited { issue, code } => {
+            AppEvent::AgentOutput { issue, .. } => self.is_agent_visible(&issue),
+            AppEvent::AgentExited { issue, code, .. } => {
                 self.set_footer(match code {
                     Some(0) | None => format!("agent on {issue} finished"),
                     Some(c) => format!("agent on {issue} exited ({c})"),
@@ -1424,7 +1443,7 @@ impl App {
                 }
                 true
             }
-            AppEvent::AgentNeedsYou { issue, reason } => {
+            AppEvent::AgentNeedsYou { issue, reason, .. } => {
                 if self.is_terminal(&issue) || self.reaped.contains(&issue) {
                     return false;
                 }
@@ -1433,7 +1452,7 @@ impl App {
                 self.needs_you_alert = true; // sticky until acknowledged
                 true
             }
-            AppEvent::AgentStatusChanged { issue, status } => {
+            AppEvent::AgentStatusChanged { issue, status, .. } => {
                 if self.reaped.contains(&issue) {
                     return false;
                 }
@@ -1450,7 +1469,7 @@ impl App {
                 self.fleet.insert(issue, status);
                 true
             }
-            AppEvent::AgentAction { issue, action } => {
+            AppEvent::AgentAction { issue, action, .. } => {
                 if self.is_terminal(&issue) || self.reaped.contains(&issue) {
                     return false;
                 }
@@ -1462,7 +1481,7 @@ impl App {
                 }
                 true
             }
-            AppEvent::AgentReaped { issue } => {
+            AppEvent::AgentReaped { issue, .. } => {
                 self.reaped.insert(issue.clone());
                 self.fleet.remove(&issue);
                 self.drop_preview_sizes_for(&issue);
@@ -2418,6 +2437,7 @@ mod tests {
     fn a_dashboard_keypress_acknowledges_the_needs_you_footer() {
         let mut app = app();
         app.apply_event(AppEvent::AgentNeedsYou {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             reason: "permission".into(),
         });
@@ -2425,6 +2445,7 @@ mod tests {
         press(&mut app, KeyCode::Char('f')); // a spine key acknowledges
         assert!(!app.needs_you_alert);
         app.apply_event(AppEvent::AgentAction {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             action: "ran Grep".into(),
         });
@@ -2435,11 +2456,13 @@ mod tests {
     fn post_tool_use_does_not_clear_a_pending_needs_you() {
         let mut app = app();
         app.apply_event(AppEvent::AgentNeedsYou {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             reason: "permission".into(),
         });
         let alert = app.status_msg.clone();
         app.apply_event(AppEvent::AgentAction {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             action: "ran Bash".into(),
         });
@@ -2452,14 +2475,17 @@ mod tests {
         let mut app = app();
         app.fleet.insert("ZAP-204".into(), AgentStatus::Done);
         assert!(!app.apply_event(AppEvent::AgentAction {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             action: "ran grep".into(),
         }));
         assert!(!app.apply_event(AppEvent::AgentNeedsYou {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             reason: "late prompt".into(),
         }));
         assert!(!app.apply_event(AppEvent::AgentStatusChanged {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             status: AgentStatus::Idle,
         }));
@@ -2472,14 +2498,17 @@ mod tests {
         let mut app = app();
         let fake = FakeBackend::new("ZAP-204");
         app.apply_event(AppEvent::AgentSpawned {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             backend: fake as Arc<dyn AgentBackend>,
         });
         app.apply_event(AppEvent::AgentStatusChanged {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             status: AgentStatus::Done,
         });
         app.apply_event(AppEvent::AgentReaped {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
         });
         assert!(
@@ -2488,14 +2517,17 @@ mod tests {
         );
         // All three late hooks are ignored.
         assert!(!app.apply_event(AppEvent::AgentNeedsYou {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             reason: "late".into(),
         }));
         assert!(!app.apply_event(AppEvent::AgentAction {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             action: "ran grep".into(),
         }));
         assert!(!app.apply_event(AppEvent::AgentStatusChanged {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             status: AgentStatus::Idle,
         }));
@@ -2504,10 +2536,12 @@ mod tests {
         // A genuine relaunch clears the tombstone.
         let fake2 = FakeBackend::new("ZAP-204");
         app.apply_event(AppEvent::AgentSpawned {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             backend: fake2 as Arc<dyn AgentBackend>,
         });
         assert!(app.apply_event(AppEvent::AgentNeedsYou {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             reason: "real".into(),
         }));
@@ -2524,6 +2558,7 @@ mod tests {
                 .insert("ZAP-201".into(), fake as Arc<dyn AgentBackend>);
             app.fleet.insert("ZAP-201".into(), AgentStatus::Running);
             app.apply_event(AppEvent::AgentExited {
+                project_id: String::new(),
                 issue: "ZAP-201".into(),
                 code: Some(1),
             });
@@ -2540,6 +2575,7 @@ mod tests {
         register(&mut app, "ZAP-204");
         press(&mut app, KeyCode::Enter); // open a window referencing ZAP-204
         app.apply_event(AppEvent::AgentExited {
+            project_id: String::new(),
             issue: "ZAP-204".into(),
             code: Some(0),
         });
@@ -2557,12 +2593,14 @@ mod tests {
         press(&mut app, KeyCode::Enter); // open + focus ZAP-205's window
         assert!(
             app.apply_event(AppEvent::AgentOutput {
+                project_id: String::new(),
                 issue: "ZAP-205".into()
             }),
             "a visible agent's output forces a redraw"
         );
         // An agent with no window changes nothing visible.
         assert!(!app.apply_event(AppEvent::AgentOutput {
+            project_id: String::new(),
             issue: "ZAP-999".into()
         }));
     }
@@ -2573,6 +2611,7 @@ mod tests {
         app.pending_attach = Some("ZAP-205".into());
         let fake = FakeBackend::new("ZAP-205");
         app.apply_event(AppEvent::AgentSpawned {
+            project_id: String::new(),
             issue: "ZAP-205".into(),
             backend: fake as Arc<dyn AgentBackend>,
         });
@@ -2587,6 +2626,7 @@ mod tests {
         let focus_before = app.windows.focus;
         let fake = FakeBackend::new("ZAP-205");
         app.apply_event(AppEvent::AgentSpawned {
+            project_id: String::new(),
             issue: "ZAP-205".into(),
             backend: fake as Arc<dyn AgentBackend>,
         });
@@ -2698,6 +2738,7 @@ mod tests {
         app.mark_resuming_for_test("ZAP-206");
         let fake = FakeBackend::new("ZAP-205");
         app.apply_event(AppEvent::AgentSpawned {
+            project_id: String::new(),
             issue: "ZAP-205".into(),
             backend: fake as Arc<dyn AgentBackend>,
         });

@@ -28,29 +28,65 @@ pub enum AppEvent {
     /// readiness banner is the first producer; the notification bus (ENG-397)
     /// and supervisor add more.
     Notification(String),
-    /// A new agent was launched for `issue`. Carries the backend handle so the
-    /// cockpit can render and (from ENG-400) attach to it.
+    /// A new agent was launched for `(project_id, issue)`. Carries the backend
+    /// handle so the cockpit can render and attach to it.
     AgentSpawned {
+        project_id: String,
         issue: String,
         backend: Arc<dyn AgentBackend>,
     },
     /// An agent's PTY produced output and its pane should repaint. Coalesced by
     /// the loop into a single redraw per tick.
-    AgentOutput { issue: String },
+    AgentOutput { project_id: String, issue: String },
     /// An agent process exited (cleanly or not).
-    AgentExited { issue: String, code: Option<i32> },
-    /// The agent on `issue` is waiting on the human — a permission prompt or an
-    /// idle nudge (from a `Notification` hook).
-    AgentNeedsYou { issue: String, reason: String },
-    /// The agent on `issue` changed conversational status (e.g. `Stop` → idle).
-    AgentStatusChanged { issue: String, status: AgentStatus },
-    /// The agent on `issue` took an action (e.g. ran a tool) — a per-issue
-    /// activity line (from a `PostToolUse` hook).
-    AgentAction { issue: String, action: String },
+    AgentExited {
+        project_id: String,
+        issue: String,
+        code: Option<i32>,
+    },
+    /// The agent on `(project_id, issue)` is waiting on the human — a permission
+    /// prompt or an idle nudge (from a `Notification` hook).
+    AgentNeedsYou {
+        project_id: String,
+        issue: String,
+        reason: String,
+    },
+    /// The agent on `(project_id, issue)` changed conversational status (e.g.
+    /// `Stop` → idle).
+    AgentStatusChanged {
+        project_id: String,
+        issue: String,
+        status: AgentStatus,
+    },
+    /// The agent on `(project_id, issue)` took an action (e.g. ran a tool) — a
+    /// per-issue activity line (from a `PostToolUse` hook).
+    AgentAction {
+        project_id: String,
+        issue: String,
+        action: String,
+    },
     /// The supervisor finished tearing an agent down and dropped it from its live
     /// map. The cockpit drops it from the fleet view too, so the overview stays
     /// bounded and mirrors the supervisor instead of accreting dead agents.
-    AgentReaped { issue: String },
+    AgentReaped { project_id: String, issue: String },
+}
+
+impl AppEvent {
+    /// The project an agent-lifecycle event belongs to, or `None` for a bare
+    /// [`AppEvent::Notification`] (which isn't project-scoped). The render loop
+    /// uses this to file each event under the right project's fleet.
+    pub fn project_id(&self) -> Option<&str> {
+        match self {
+            AppEvent::Notification(_) => None,
+            AppEvent::AgentSpawned { project_id, .. }
+            | AppEvent::AgentOutput { project_id, .. }
+            | AppEvent::AgentExited { project_id, .. }
+            | AppEvent::AgentNeedsYou { project_id, .. }
+            | AppEvent::AgentStatusChanged { project_id, .. }
+            | AppEvent::AgentAction { project_id, .. }
+            | AppEvent::AgentReaped { project_id, .. } => Some(project_id),
+        }
+    }
 }
 
 /// Sender half — cloned into every background subsystem.

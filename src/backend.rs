@@ -66,6 +66,10 @@ pub enum Lifecycle {
 /// agent "claude" is only the `program` + `args`, built by [`SpawnConfig::claude`].
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
+    /// The Linear project the agent's issue belongs to — tags the lifecycle
+    /// events this backend emits so the cockpit files them under the right
+    /// project's fleet/window set.
+    pub project_id: String,
     pub issue: String,
     pub cwd: PathBuf,
     pub program: String,
@@ -83,6 +87,7 @@ impl SpawnConfig {
     /// (`--permission-mode`, the `--settings` hook file, …) are layered on with
     /// [`SpawnConfig::arg`] by the supervisor.
     pub fn claude(
+        project_id: impl Into<String>,
         issue: impl Into<String>,
         cwd: PathBuf,
         session_id: &str,
@@ -96,6 +101,7 @@ impl SpawnConfig {
             vec!["--session-id".to_string(), session_id.to_string()]
         };
         SpawnConfig {
+            project_id: project_id.into(),
             issue: issue.into(),
             cwd,
             program: "claude".to_string(),
@@ -290,10 +296,11 @@ impl PtyAgent {
         {
             let parser = Arc::clone(&parser);
             let events = events.clone();
+            let project_id = cfg.project_id.clone();
             let issue = cfg.issue.clone();
             thread::Builder::new()
                 .name(format!("pty-read-{issue}"))
-                .spawn(move || read_pump(reader, &parser, &events, &issue))
+                .spawn(move || read_pump(reader, &parser, &events, &project_id, &issue))
                 // The child is already live; a thread-spawn failure here (EAGAIN
                 // under fd/thread pressure) would orphan its whole process group
                 // with no handle to signal it, so tear it down before bailing.
@@ -305,6 +312,7 @@ impl PtyAgent {
         // Wait / reap.
         {
             let events = events.clone();
+            let project_id = cfg.project_id.clone();
             let issue = cfg.issue.clone();
             let lifecycle = Arc::clone(&lifecycle);
             let exit_notify = Arc::clone(&exit_notify);
@@ -323,7 +331,11 @@ impl PtyAgent {
                     if let Ok(mut l) = lifecycle.lock() {
                         *l = Lifecycle::Exited(code);
                     }
-                    let _ = events.send(AppEvent::AgentExited { issue, code });
+                    let _ = events.send(AppEvent::AgentExited {
+                        project_id,
+                        issue,
+                        code,
+                    });
                     exit_notify.notify_one();
                 });
             if let Err(e) = spawned {
@@ -501,6 +513,7 @@ fn read_pump(
     mut reader: Box<dyn Read + Send>,
     parser: &Arc<RwLock<Parser>>,
     events: &AppEventTx,
+    project_id: &str,
     issue: &str,
 ) {
     let mut buf = [0u8; 8192];
@@ -512,6 +525,7 @@ fn read_pump(
                     parser.process(&buf[..n]);
                 }
                 let _ = events.send(AppEvent::AgentOutput {
+                    project_id: project_id.to_string(),
                     issue: issue.to_string(),
                 });
             }
@@ -783,6 +797,7 @@ mod tests {
 
     fn sh(issue: &str, script: &str) -> SpawnConfig {
         SpawnConfig {
+            project_id: "test-project".to_string(),
             issue: issue.to_string(),
             cwd: std::env::temp_dir(),
             program: "sh".to_string(),
@@ -795,11 +810,11 @@ mod tests {
 
     #[test]
     fn claude_config_picks_session_id_vs_resume() {
-        let fresh = SpawnConfig::claude("ENG-1", "/wt".into(), "sid-123", false, 24, 80);
+        let fresh = SpawnConfig::claude("proj", "ENG-1", "/wt".into(), "sid-123", false, 24, 80);
         assert_eq!(fresh.program, "claude");
         assert_eq!(fresh.args, vec!["--session-id", "sid-123"]);
 
-        let resumed = SpawnConfig::claude("ENG-1", "/wt".into(), "sid-123", true, 24, 80)
+        let resumed = SpawnConfig::claude("proj", "ENG-1", "/wt".into(), "sid-123", true, 24, 80)
             .arg("--permission-mode")
             .arg("default");
         assert_eq!(
@@ -885,6 +900,7 @@ mod tests {
         // PATH); the supervisor's "spawn failed" branch depends on this surfacing.
         let (tx, _rx) = crate::event::channel();
         let cfg = SpawnConfig {
+            project_id: "test-project".to_string(),
             issue: "ENG-1".to_string(),
             cwd: std::env::temp_dir(),
             program: "lindep-no-such-binary-zzz".to_string(),
