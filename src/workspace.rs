@@ -3,25 +3,24 @@
 //!
 //! The v1 [`Supervisor`](crate::supervisor::Supervisor) owns exactly one
 //! project's fleet (its own worktree root, state file and hook settings). The
-//! workspace lifts ownership a level: it spins up one supervisor per
-//! [`ProjectMapping`](crate::projects::ProjectMapping) and routes launch/cancel
-//! by `project_id` — the groundwork for running several projects' fleets at once,
-//! so agents started in one project keep running while you work in another.
-//! **Backing out of a project never cancels its agents — only
-//! [`shutdown`](WorkspaceHandle::shutdown) does**, and it fans out across every
-//! project's tracker.
+//! workspace lifts ownership a level: it spins up one supervisor per registered
+//! [`ProjectDescriptor`](crate::registry::ProjectDescriptor) and routes
+//! launch/cancel by `project_id` — so agents started in one project keep running
+//! while you work in another. **Backing out of a project never cancels its agents
+//! — only [`shutdown`](WorkspaceHandle::shutdown) does**, and it fans out across
+//! every project's tracker.
 //!
-//! Switching the *active* project from the UI is not wired yet (ENG-401): today
-//! the cockpit launches into the one project it booted into, so the per-project
-//! routing here is exercised by tests and staged for the switcher rather than
-//! reachable end-to-end.
+//! Under v1.6's managed workspaces, building a project's plane is also where its
+//! repos are *provisioned*: the project's primary repo is materialised through the
+//! 3-layer git model ([`crate::mirror`]) and the worktree manager is re-rooted at
+//! that reference clone. So "switch into / open a project" and "materialise its
+//! isolated workspace" are one mechanism — [`build_plane`].
 //!
 //! Like the supervisor, the workspace lives entirely inside its own task; the
 //! cockpit holds a cheap, cloneable [`WorkspaceHandle`]. A project's plane is
-//! built lazily on first launch (the active project's is built eagerly at boot
-//! and handed in), so entering a not-yet-started project reconciles its store
-//! against its live worktrees and rehydrates its fleet view (reachable once
-//! switching lands — ENG-401).
+//! built lazily on first launch or switch (the active project's is built eagerly
+//! at boot and handed in), so entering a not-yet-opened project clones its repos,
+//! reconciles its store against its live worktrees and rehydrates its fleet view.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -34,7 +33,7 @@ use tokio::task::JoinHandle;
 
 use crate::backend::SpawnFn;
 use crate::event::{AppEvent, AppEventTx};
-use crate::projects::{ProjectMapping, WorkspaceConfig};
+use crate::registry::Registry;
 use crate::session::{AgentStatus, SessionStore};
 use crate::supervisor::{Supervisor, SupervisorConfig, SupervisorHandle};
 use crate::worktree::WorktreeManager;
@@ -65,18 +64,19 @@ pub struct PlaneBuilder {
 }
 
 impl PlaneBuilder {
-    /// Assemble a [`SupervisorConfig`] for `mapping`'s project from this builder
-    /// plus the project's own worktree manager and session store. Shared by the
+    /// Assemble a [`SupervisorConfig`] from this builder plus the project's own
+    /// id, hooks directory, worktree manager and session store. Shared by the
     /// eager (active-project, at boot) and lazy (background-project) paths so the
     /// config is assembled in exactly one place.
     pub fn supervisor_config(
         &self,
-        mapping: &ProjectMapping,
+        project_id: &str,
+        hooks_dir: PathBuf,
         worktree: WorktreeManager,
         store: Arc<Mutex<SessionStore>>,
     ) -> SupervisorConfig {
         SupervisorConfig {
-            project_id: mapping.project_id.clone(),
+            project_id: project_id.to_string(),
             worktree,
             store,
             events: self.events.clone(),
@@ -84,7 +84,7 @@ impl PlaneBuilder {
             exe: self.exe.clone(),
             hook_port: self.hook_port,
             hook_token: self.hook_token.clone(),
-            hooks_dir: mapping.hooks_dir(),
+            hooks_dir,
             base: self.base.clone(),
             rows: self.rows,
             cols: self.cols,
@@ -162,77 +162,131 @@ fn reemit_statuses(store: &Arc<Mutex<SessionStore>>, events: &AppEventTx, projec
     }
 }
 
-/// Build a project's plane off the render thread: its worktree manager, session
-/// store (per-project file, adopting a legacy `state.json` on first v1.5 boot),
-/// reconcile + rehydrate, then start its supervisor. The blocking pieces
-/// (canonicalizing the worktree root, reading the state file, listing worktrees)
-/// run on the blocking pool so the workspace command loop never stalls. Returns
-/// `None` (with a footer line) if the worktree root can't be opened.
-async fn build_plane(
+/// Build a project's plane off the render thread: **materialise its primary repo**
+/// through the 3-layer git model ([`crate::mirror::ensure_clone`]), re-root the
+/// worktree manager at that reference clone, open the per-project session store
+/// (under `~/.lindep/projects/<handle>/`), reconcile + rehydrate, then start its
+/// supervisor. The blocking pieces (the git clones, canonicalising the worktree
+/// root, reading the state file, listing worktrees) run on the blocking pool so
+/// the workspace command loop never stalls. Returns the started plane **and** the
+/// was-live resumable set from rehydration (the auto-resume / cockpit-restore
+/// candidates the boot caller wants; the lazy switch path discards it), or `None`
+/// (with a footer line) if the project isn't registered or its primary repo can't
+/// be provisioned.
+pub async fn build_plane(
     rt: &Handle,
     builder: &PlaneBuilder,
-    mapping: &ProjectMapping,
+    registry: &Registry,
+    project_id: &str,
     stores: &StoreRegistry,
-) -> Option<ProjectPlane> {
-    let repo_root = mapping.repo_root.clone();
-    let branch_prefix = mapping.branch_prefix.clone();
-    let worktree = match tokio::task::spawn_blocking(move || match branch_prefix {
-        Some(prefix) => WorktreeManager::with_prefix(&repo_root, prefix),
-        None => WorktreeManager::new(&repo_root),
-    })
-    .await
-    {
-        Ok(Ok(worktree)) => worktree,
-        Ok(Err(e)) => {
-            let _ = builder.events.send(AppEvent::Notification(format!(
-                "project {}: can't open repo: {e}",
-                mapping.name
-            )));
+) -> Option<(ProjectPlane, HashSet<String>)> {
+    // Resolve the project + its primary repo against the registry.
+    let descriptor = match registry.project(project_id) {
+        Ok(d) => d.clone(),
+        Err(e) => {
+            let _ = builder.events.send(AppEvent::Notification(e.to_string()));
             return None;
         }
-        Err(_) => return None,
+    };
+    let Some(primary) = registry.repo(&descriptor.primary).cloned() else {
+        let _ = builder.events.send(AppEvent::Notification(format!(
+            "project {}: primary repo `{}` is not registered",
+            descriptor.name, descriptor.primary
+        )));
+        return None;
+    };
+    let layout = registry.layout().clone();
+    let project_handle = descriptor.handle.clone();
+
+    // Materialise the primary repo (mirror → reference clone) and re-root the
+    // worktree manager there — all on the blocking pool, since `git clone` is slow.
+    let worktree = {
+        let layout = layout.clone();
+        let handle = project_handle.clone();
+        let prefix = descriptor.branch_prefix.clone();
+        let primary = primary.clone();
+        let exe = builder.exe.to_string_lossy().into_owned();
+        let port = builder.hook_port;
+        let token = builder.hook_token.clone();
+        match tokio::task::spawn_blocking(move || -> Result<WorktreeManager, String> {
+            let clone = crate::mirror::ensure_clone(&layout, &handle, &primary)
+                .map_err(|e| e.to_string())?;
+            // Install/refresh the v1.6 auto-push post-commit hook with THIS run's
+            // port + token (the stale-port trap). Hooks are shared per L2 clone, so
+            // one install covers every worktree of this (project, repo).
+            let _ =
+                crate::notify::write_post_commit_hook(&clone, &exe, port, &token, &primary.handle);
+            let worktrees_root = layout.worktrees_dir(&handle);
+            let prefix = prefix.unwrap_or_else(crate::worktree::default_branch_prefix);
+            WorktreeManager::with_layout(&clone, prefix, &worktrees_root, &primary.handle)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        {
+            Ok(Ok(worktree)) => worktree,
+            Ok(Err(e)) => {
+                let _ = builder.events.send(AppEvent::Notification(format!(
+                    "project {}: can't provision repo: {e}",
+                    descriptor.name
+                )));
+                return None;
+            }
+            Err(_) => return None,
+        }
     };
 
-    let project_id = mapping.project_id.clone();
-    let state_path = mapping.state_path();
-    let legacy = mapping.legacy_state_path();
-    let store = match tokio::task::spawn_blocking(move || {
-        SessionStore::open_project(&project_id, state_path, Some(legacy))
+    let state_path = layout.state_path(&project_handle);
+    let pid = descriptor.project_id.clone();
+    let store = match tokio::task::spawn_blocking({
+        let state_path = state_path.clone();
+        let pid = pid.clone();
+        move || SessionStore::open_project(&pid, state_path)
     })
     .await
     {
         Ok(Ok(store)) => store,
+        // A state file from a NEWER lindep must not be clobbered with our older
+        // format — leave it untouched and skip building this plane.
+        Ok(Err(e @ crate::session::StateError::Version { .. })) => {
+            let _ = builder.events.send(AppEvent::Notification(format!(
+                "project {}: {e}",
+                descriptor.name
+            )));
+            return None;
+        }
         Ok(Err(e)) => {
             let _ = builder.events.send(AppEvent::Notification(format!(
                 "project {}: session state unreadable ({e}); starting fresh",
-                mapping.name
+                descriptor.name
             )));
-            SessionStore::empty(mapping.state_path()).for_project(&mapping.project_id)
+            SessionStore::empty(state_path).for_project(&descriptor.project_id)
         }
         Err(_) => return None,
     };
     let store = Arc::new(Mutex::new(store));
     // Register the store so the notification bus and the global view can find this
     // project's sessions even while you're inside another project.
-    if let Ok(mut registry) = stores.lock() {
-        registry.insert(mapping.project_id.clone(), Arc::clone(&store));
+    if let Ok(mut reg) = stores.lock() {
+        reg.insert(descriptor.project_id.clone(), Arc::clone(&store));
     }
 
     // Reconcile + rehydrate off the workers (worktree.list() shells out to git).
-    {
+    let resumable = {
         let worktree = worktree.clone();
         let store = Arc::clone(&store);
         let events = builder.events.clone();
-        let project_id = mapping.project_id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let project_id = descriptor.project_id.clone();
+        tokio::task::spawn_blocking(move || {
             reconcile_and_rehydrate(&worktree, &store, &events, &project_id)
         })
-        .await;
-    }
+        .await
+        .unwrap_or_default()
+    };
 
-    let cfg = builder.supervisor_config(mapping, worktree, store);
+    let hooks_dir = layout.hooks_dir(&project_handle);
+    let cfg = builder.supervisor_config(&descriptor.project_id, hooks_dir, worktree, store);
     let (handle, join) = Supervisor::start(cfg, rt);
-    Some(ProjectPlane { handle, join })
+    Some((ProjectPlane { handle, join }, resumable))
 }
 
 /// Commands the workspace processes, each addressed by `project_id` so the right
@@ -308,7 +362,7 @@ impl WorkspaceHandle {
 pub struct Workspace {
     rt: Handle,
     builder: PlaneBuilder,
-    config: WorkspaceConfig,
+    registry: Registry,
     planes: HashMap<String, ProjectPlane>,
     stores: StoreRegistry,
 }
@@ -321,7 +375,7 @@ impl Workspace {
     pub fn start(
         rt: Handle,
         builder: PlaneBuilder,
-        config: WorkspaceConfig,
+        registry: Registry,
         initial: HashMap<String, ProjectPlane>,
         stores: StoreRegistry,
     ) -> (WorkspaceHandle, JoinHandle<()>) {
@@ -330,7 +384,7 @@ impl Workspace {
         let workspace = Workspace {
             rt,
             builder,
-            config,
+            registry,
             planes: initial,
             stores,
         };
@@ -391,24 +445,22 @@ impl Workspace {
         }
     }
 
-    /// Return the supervisor handle for `project_id`, building (and reconciling +
-    /// rehydrating) its plane the first time. `None` if the project isn't mapped
-    /// in `projects.toml` or its repo can't be opened — surfaced as a footer line.
+    /// Return the supervisor handle for `project_id`, building (provisioning its
+    /// repos, reconciling + rehydrating) its plane the first time. `None` if the
+    /// project isn't in the registry or its primary repo can't be provisioned —
+    /// surfaced as a footer line by [`build_plane`].
     async fn ensure_plane(&mut self, project_id: &str) -> Option<SupervisorHandle> {
         if let Some(plane) = self.planes.get(project_id) {
             return Some(plane.handle.clone());
         }
-        let mapping = match self.config.resolve(project_id) {
-            Ok(mapping) => mapping.clone(),
-            Err(e) => {
-                let _ = self
-                    .builder
-                    .events
-                    .send(AppEvent::Notification(e.to_string()));
-                return None;
-            }
-        };
-        let plane = build_plane(&self.rt, &self.builder, &mapping, &self.stores).await?;
+        let (plane, _resumable) = build_plane(
+            &self.rt,
+            &self.builder,
+            &self.registry,
+            project_id,
+            &self.stores,
+        )
+        .await?;
         let handle = plane.handle.clone();
         self.planes.insert(project_id.to_string(), plane);
         Some(handle)
@@ -421,8 +473,39 @@ mod tests {
     use crate::backend::fake::FakeBackend;
     use crate::backend::{AgentBackend, SpawnConfig};
     use crate::event::AppEvent;
+    use crate::registry::Layout;
+    use std::path::Path;
     use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Build a [`Registry`] under a fresh temp `~/.lindep` mapping each project to
+    /// its own **local-only** repo (the temp git repo path), so a plane build
+    /// provisions a real mirror + reference clone from it. The project's handle
+    /// doubles as its single repo's handle.
+    fn registry_with(tag: &str, projects: &[(&str, &str, &Path)]) -> Registry {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("lindep-wsreg-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut body = String::new();
+        for (_, handle, local) in projects {
+            body.push_str(&format!(
+                "[[repo]]\nhandle = \"{handle}\"\nlocal = \"{}\"\n\n",
+                local.display()
+            ));
+        }
+        for (id, handle, _) in projects {
+            body.push_str(&format!(
+                "[[project]]\nid = \"{id}\"\nhandle = \"{handle}\"\nprimary = \"{handle}\"\n\n"
+            ));
+        }
+        std::fs::write(root.join("registry.toml"), body).unwrap();
+        let (reg, warnings) = Registry::load_at(Layout::new(&root));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        reg
+    }
 
     /// A process-unique git repo, mirroring the worktree/session test helpers.
     fn temp_repo(tag: &str) -> PathBuf {
@@ -527,17 +610,14 @@ mod tests {
             10,
         );
 
-        // Two mapped projects, distinct repos.
-        let mut config = WorkspaceConfig::default();
-        config.ensure_mapped("proj-a", "A", &repo_a);
-        config.ensure_mapped("proj-b", "B", &repo_b);
-        // (A real boot supplies branch_prefix via projects.toml; ensure_mapped
-        // defaults it to None, which is fine — the worktree manager picks one.)
+        // Two registered projects, each its own repo (provisioned by the clone
+        // substrate from the local repo paths).
+        let registry = registry_with("two", &[("proj-a", "a", &repo_a), ("proj-b", "b", &repo_b)]);
 
         let (ws, join) = Workspace::start(
             Handle::current(),
             b,
-            config,
+            registry,
             HashMap::new(),
             Arc::new(Mutex::new(HashMap::new())),
         );
@@ -597,13 +677,11 @@ mod tests {
         let live = Arc::new(AtomicUsize::new(0));
         let b = builder(tx, fake_spawn(Arc::clone(&spawns)), live, 2);
 
-        let mut config = WorkspaceConfig::default();
-        config.ensure_mapped("proj-a", "A", &repo_a);
-        config.ensure_mapped("proj-b", "B", &repo_b);
+        let registry = registry_with("cap", &[("proj-a", "a", &repo_a), ("proj-b", "b", &repo_b)]);
         let (ws, join) = Workspace::start(
             Handle::current(),
             b,
-            config,
+            registry,
             HashMap::new(),
             Arc::new(Mutex::new(HashMap::new())),
         );
@@ -759,7 +837,7 @@ mod tests {
         let (ws, join) = Workspace::start(
             Handle::current(),
             b,
-            WorkspaceConfig::default(),
+            registry_with("empty", &[]),
             HashMap::new(),
             Arc::new(Mutex::new(HashMap::new())),
         );

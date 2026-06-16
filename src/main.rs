@@ -18,15 +18,16 @@ mod ui;
 mod window;
 // Multi-agent spine.
 mod backend;
+mod mirror;
 mod notify;
-mod projects;
+mod registry;
 mod session;
 mod supervisor;
 mod workspace;
 mod worktree;
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -86,6 +87,18 @@ struct Cli {
     /// cockpit (paired with `--hook-forward`). Minted per run; not for direct use.
     #[arg(long, hide = true, value_name = "TOKEN")]
     hook_token: Option<String>,
+
+    /// Internal (v1.6 auto-push): a `post-commit` git hook fires this to POST an
+    /// `AgentCommitted` event to the cockpit. git gives a post-commit hook no
+    /// stdin, so this mode synthesizes the payload from the worktree. Not for
+    /// direct use.
+    #[arg(long, hide = true, value_name = "PORT")]
+    post_commit: Option<u16>,
+
+    /// Internal: which repo handle a `--post-commit` event concerns (paired with
+    /// `--post-commit`). Not for direct use.
+    #[arg(long, hide = true, value_name = "HANDLE")]
+    repo_handle: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -107,6 +120,17 @@ fn real_main() -> Result<(), String> {
     if let Some(port) = cli.hook_forward {
         return notify::forward(port, cli.hook_token.as_deref().unwrap_or(""))
             .map_err(|e| e.to_string());
+    }
+
+    // Post-commit forwarder fast path (v1.6 auto-push): a git post-commit hook
+    // synthesizes an `AgentCommitted` event and POSTs it, then exits. No TUI.
+    if let Some(port) = cli.post_commit {
+        return notify::forward_post_commit(
+            port,
+            cli.hook_token.as_deref().unwrap_or(""),
+            cli.repo_handle.as_deref().unwrap_or(""),
+        )
+        .map_err(|e| e.to_string());
     }
 
     // --list is a quick, key-only path.
@@ -413,26 +437,6 @@ fn control_plane_enabled(demo: bool) -> bool {
     !demo
 }
 
-/// The git repository root for `cwd` (`git rev-parse --show-toplevel`), or `None`
-/// when `cwd` isn't inside a work tree. The control plane anchors its on-disk
-/// state at the repo root so launching from a subdirectory doesn't scatter
-/// `.lindep/` (worktrees, state, a seeded `projects.toml`) into the tracked tree —
-/// the repo's `/.lindep` gitignore is root-anchored and wouldn't cover a subdir.
-fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let path = String::from_utf8(out.stdout).ok()?;
-    let path = path.trim();
-    (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
 /// Default ceiling on live agents the supervisor hosts at once. Cockpit v3 raised
 /// this from 6 and made it overridable via `[agents] max_concurrent` in
 /// `config.toml`; docking is uncapped above it, with extra docked agents shown as
@@ -456,12 +460,19 @@ fn resolve_max_concurrent(setting: Option<usize>) -> (usize, Option<String>) {
     }
 }
 
-/// Build and start the agent control plane: worktree manager, session store
-/// (reconciled against live worktrees), hook endpoint, and the supervisor. Also
-/// wires the supervisor handle into `app`, restores the saved window layout
-/// (pruned against the was-live resumable set), and — unless `no_resume` — brings
-/// docked agents back. Returns `None` (degrading to a read-only viewer) outside a
-/// git repo or if the loopback endpoint can't bind.
+/// Build and start the agent control plane from the global registry: provision the
+/// active project's repos (mirror → reference clone), re-root its worktree manager,
+/// open its per-project session store (reconciled against live worktrees), bind the
+/// hook endpoint, and start the workspace. Also wires the workspace handle into
+/// `app`, restores the saved window layout + ledger from the project's isolated
+/// `~/.lindep/projects/<handle>/` dir (pruned against the was-live resumable set),
+/// and — unless `no_resume` — brings docked agents back. Returns `None` (degrading
+/// to a read-only viewer) when the project isn't registered or the endpoint can't
+/// bind.
+///
+/// v1.6: lindep runs from **anywhere**. It no longer anchors at a cwd git repo
+/// (`git_toplevel` is gone); it owns the on-disk location and provisions clones
+/// itself, so launching outside any repo is fully supported.
 fn start_control_plane(
     runtime: &tokio::runtime::Runtime,
     events: event::AppEventTx,
@@ -472,104 +483,33 @@ fn start_control_plane(
 ) -> Option<(workspace::WorkspaceHandle, tokio::task::JoinHandle<()>)> {
     use std::sync::{Arc, Mutex};
 
-    let cwd = std::env::current_dir().ok()?;
-    // Anchor everything at the git repo root, not the raw cwd: launched from a
-    // subdirectory, a cwd-rooted `.lindep/` (worktrees, state, the seeded
-    // projects.toml) would land outside the repo's root-anchored `/.lindep`
-    // gitignore and could be committed by accident.
-    let repo_root_default = git_toplevel(&cwd).unwrap_or_else(|| cwd.clone());
-
-    // Resolve this project's repo mapping from `.lindep/projects.toml` (repo
-    // file overlaid by the personal one), seeding a single-project default at
-    // the repo root when the project isn't configured — so an existing
-    // single-repo checkout boots exactly as before, with zero setup.
-    let (mut config, warnings) = projects::WorkspaceConfig::load(Some(&repo_root_default));
+    let (registry, warnings) = registry::Registry::load();
     for w in warnings {
-        let _ = events.send(event::AppEvent::Notification(format!("projects.toml: {w}")));
+        let _ = events.send(event::AppEvent::Notification(format!("registry: {w}")));
     }
-    let seeded = config.ensure_mapped(&active.id, &active.name, &repo_root_default);
-    let mapping = match config.resolve(&active.id) {
-        Ok(mapping) => mapping.clone(),
-        // ensure_mapped guarantees this resolves; the arm exists so an unmapped
-        // project surfaces an actionable message rather than a silent cwd fallback.
-        Err(e) => {
+    // The active project must be registered to run agents — lindep needs to know
+    // which repos it owns. An unregistered project degrades to the read-only graph.
+    let descriptor = match registry.project(&active.id) {
+        Ok(d) => d.clone(),
+        Err(_) => {
             let _ = events.send(event::AppEvent::Notification(format!(
-                "agents disabled: {e}"
+                "agents disabled: project {} is not in ~/.lindep/registry.toml",
+                active.name
             )));
             return None;
         }
     };
-    // First run in this repo: drop a discoverable starter projects.toml under the
-    // gitignored `.lindep/` so adding more projects is obvious. Anchored at the
-    // resolved repo root (not cwd) so it lands inside the gitignore. Best-effort —
-    // a write failure just means no template, never a boot failure.
-    let repo_config_path = mapping.repo_root.join(".lindep").join("projects.toml");
-    if seeded && !repo_config_path.exists() {
-        if let Some(dir) = repo_config_path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&repo_config_path, projects::seed_file_contents(&mapping));
-    }
-    // The project switcher offers only configured projects — a mapped repo is what
-    // lets a project run agents (switching to an unmapped one could only show its
-    // graph). Captured before `config` moves into the workspace below.
-    app.mapped_projects = config.mapped_ids().into_iter().collect();
+    let layout = registry.layout().clone();
+    // The switcher offers every registered project — lindep provisions clones on
+    // demand, so there is no cwd gating (the v1.5 `mapped_projects` source).
+    app.mapped_projects = registry.project_ids().into_iter().collect();
 
-    let repo_root = mapping.repo_root.clone();
-    let worktree = match mapping.branch_prefix.as_deref() {
-        Some(prefix) => worktree::WorktreeManager::with_prefix(&repo_root, prefix).ok()?,
-        None => worktree::WorktreeManager::new(&repo_root).ok()?,
-    };
-    // Per-project state file (`state.<project_id>.json`), adopting a legacy
-    // single-project `state.json` on first v1.5 boot so existing agents keep
-    // their resumable conversations.
-    let state_path = mapping.state_path();
-    let store = Arc::new(Mutex::new(
-        match session::SessionStore::open_project(
-            &active.id,
-            state_path.clone(),
-            Some(mapping.legacy_state_path()),
-        ) {
-            Ok(store) => store,
-            // A state file from a NEWER lindep must not be clobbered with our
-            // older format — bail to the read-only viewer and say why.
-            Err(e @ session::StateError::Version { .. }) => {
-                let _ = events.send(event::AppEvent::Notification(format!(
-                    "agents disabled: {e}"
-                )));
-                return None;
-            }
-            // Corrupt/unreadable state must not brick the cockpit: start fresh
-            // (the bad file is overwritten on the first save) and warn.
-            Err(e) => {
-                let _ = events.send(event::AppEvent::Notification(format!(
-                    "session state unreadable ({e}); starting fresh"
-                )));
-                session::SessionStore::empty(state_path).for_project(&active.id)
-            }
-        },
-    ));
-
-    // Reconcile this project's store against its live worktrees and rehydrate the
-    // fleet view (a was-Spawning/Running process is gone after a restart, so it
-    // resolves to Idle). Returns the was-live set — both the auto-resume
-    // candidates AND the set the restored window layout is pruned against (a
-    // docked agent only comes back if it was live, never Done/Failed/Stopped).
-    // These rehydration events sit in the channel and drain on the first tick,
-    // before the first paint.
-    let resumable = workspace::reconcile_and_rehydrate(&worktree, &store, &events, &active.id);
-
-    // Workspace store registry: the one loopback hook endpoint resolves each hook
-    // to its owning project's store through it (a hook carries only a session id /
-    // cwd, never a trusted project id). Seed it with the active project's store;
-    // background projects add theirs as their planes build.
+    // Workspace store registry: the one loopback hook endpoint resolves each hook to
+    // its owning project's store through it (a hook carries only a session id / cwd,
+    // never a trusted project id). `build_plane` inserts each project's store as its
+    // plane builds. Bind the endpoint before any agent launches so their settings
+    // can point at it — block_on is safe here on the synchronous main thread.
     let stores: workspace::StoreRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    if let Ok(mut registry) = stores.lock() {
-        registry.insert(active.id.clone(), Arc::clone(&store));
-    }
-
-    // The hook endpoint must bind before agents launch so their settings can
-    // point at it. block_on is safe here — we're on the synchronous main thread.
     let notify::Endpoint {
         port: hook_port,
         token: hook_token,
@@ -580,15 +520,11 @@ fn start_control_plane(
     let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("lindep").to_path_buf());
     let (cols, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
 
-    // Kept for the post-start cockpit-restore notifications (the builder moves
-    // `events` into the workspace).
-    let events_back = events.clone();
-
     // Shared workspace ingredients: every project's supervisor is built from this
     // one builder, so the live-agent cap and its counter are genuinely shared
     // across projects — N agents total, not N per project.
     let builder = workspace::PlaneBuilder {
-        events,
+        events: events.clone(),
         spawn: backend::pty_spawn(),
         exe,
         hook_port,
@@ -605,82 +541,69 @@ fn start_control_plane(
         guardrails: vec!["--permission-mode".to_string(), "default".to_string()],
     };
 
-    // Build the active project's plane eagerly — we're on the main thread at boot,
-    // before the TUI — and seed the workspace with it. Other mapped projects'
-    // fleets start lazily on first launch when you switch to them.
-    let active_cfg = builder.supervisor_config(&mapping, worktree, store);
-    let (active_handle, active_join) = supervisor::Supervisor::start(active_cfg, runtime.handle());
+    // Build the active project's plane eagerly — provisioning its primary repo,
+    // re-rooting its worktree manager, reconciling + rehydrating its store. We're on
+    // the main thread at boot, before the TUI, so block on it. Other registered
+    // projects' fleets start lazily on first launch/switch. The returned resumable
+    // set seeds both auto-resume and the cockpit-layout restore (a docked agent only
+    // comes back if it was live, never Done/Failed/Stopped).
+    let (plane, resumable) = runtime.block_on(workspace::build_plane(
+        runtime.handle(),
+        &builder,
+        &registry,
+        &active.id,
+        &stores,
+    ))?;
     let mut planes = std::collections::HashMap::new();
-    planes.insert(
-        active.id.clone(),
-        workspace::ProjectPlane {
-            handle: active_handle,
-            join: active_join,
-        },
-    );
+    planes.insert(active.id.clone(), plane);
+
     let (ws_handle, ws_join) =
-        workspace::Workspace::start(runtime.handle().clone(), builder, config, planes, stores);
+        workspace::Workspace::start(runtime.handle().clone(), builder, registry, planes, stores);
     app.active_project = active.id.clone();
     app.workspace = Some(ws_handle.clone());
 
-    // Restore the saved window layout (pruned against the resumable set), then
-    // point the cockpit at the file so the render thread persists future changes.
-    let cockpit_path = session::CockpitState::path(&repo_root);
+    // Restore the saved window layout + ledger from this project's isolated
+    // `~/.lindep/projects/<handle>/` dir, then point the cockpit at the files so the
+    // render thread persists future changes. Same degrade-gracefully discipline: a
+    // newer file is left untouched; a corrupt one starts fresh and is overwritten.
+    let cockpit_path = layout.cockpit_path(&descriptor.handle);
     match session::CockpitState::load(&cockpit_path) {
         Ok(state) => {
             app.apply_cockpit(&state, &resumable);
             app.cockpit_path = Some(cockpit_path);
         }
-        // Symmetric with the state.json guard above: a cockpit layout written by a
-        // NEWER lindep must not be clobbered with our older format. Leave
-        // cockpit_path None so the render thread's save sites stay inert and the
-        // file is left untouched (honouring CockpitState::load's documented promise).
         Err(e @ session::StateError::Version { .. }) => {
-            let _ = events_back.send(event::AppEvent::Notification(format!(
+            let _ = events.send(event::AppEvent::Notification(format!(
                 "cockpit layout is from a newer lindep; leaving it untouched ({e})"
             )));
         }
-        // Corrupt/unreadable (not a version bump): start fresh and let the next
-        // structural change overwrite the bad file.
         Err(e) => {
-            let _ = events_back.send(event::AppEvent::Notification(format!(
+            let _ = events.send(event::AppEvent::Notification(format!(
                 "cockpit layout unreadable ({e}); starting fresh"
             )));
             app.cockpit_path = Some(cockpit_path);
         }
     }
 
-    // Load the per-issue agent ledger. Unlike the cockpit layout it spans every
-    // project, so its path stays fixed across switches (the booted repo's file).
-    // Same degrade-gracefully discipline as the cockpit/state guards: a newer file
-    // is left untouched; a corrupt one starts fresh and is overwritten on the next
-    // run.
-    let ledger_path = ledger::Ledger::path(&repo_root);
+    let ledger_path = layout.ledger_path(&descriptor.handle);
     match ledger::Ledger::load(&ledger_path) {
         Ok(l) => {
             app.ledger = l;
             app.ledger_path = Some(ledger_path);
         }
         Err(e @ session::StateError::Version { .. }) => {
-            let _ = events_back.send(event::AppEvent::Notification(format!(
+            let _ = events.send(event::AppEvent::Notification(format!(
                 "agent ledger is from a newer lindep; leaving it untouched ({e})"
             )));
         }
         Err(e) => {
-            let _ = events_back.send(event::AppEvent::Notification(format!(
+            let _ = events.send(event::AppEvent::Notification(format!(
                 "agent ledger unreadable ({e}); starting fresh"
             )));
             app.ledger_path = Some(ledger_path);
         }
     }
 
-    // Auto-resume docked agents that were live before the restart — eager for the
-    // focused one + up to cap-1 others, lazy (on first focus) for the rest.
-    // Default-ON: the plan gated this behind `--no-resume` ("ships dark until
-    // verified"), but the verification preconditions are now in place — the lazy
-    // >cap stagger (resume_one's capacity guard), the None-backend "resuming…"
-    // cards, and the per-resume grace bound — so it's promoted to the default and
-    // `--no-resume` is the opt-out.
     if !no_resume {
         app.begin_resume(&resumable, max_concurrent);
     }

@@ -18,7 +18,7 @@
 //! [`SessionStore::write_snapshot`] discipline and version guard as `cockpit.json`.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -94,11 +94,6 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// `.lindep/ledger.json` under a repo root.
-    pub fn path(repo_root: impl AsRef<Path>) -> PathBuf {
-        repo_root.as_ref().join(".lindep").join("ledger.json")
-    }
-
     /// Load the ledger, or the empty default if the file is absent. A file from a
     /// newer format is refused (so an older build can't clobber it); a corrupt file
     /// surfaces as `Parse` so the caller can degrade to the default. Any run left
@@ -311,6 +306,7 @@ pub fn outcome_label(outcome: Option<AgentStatus>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_path() -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};

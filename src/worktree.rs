@@ -6,9 +6,18 @@
 //! `git worktree list --porcelain`, so a crash that leaves a half-made worktree
 //! behind is detectable and recoverable on the next run.
 //!
-//! Layout is deterministic:
+//! Layout is deterministic. A **standalone** manager (legacy / tests) keeps a
+//! worktree per issue beside the repo:
 //! * worktree path — `<repo>/.lindep/worktrees/<ISSUE>` (`.lindep/` is gitignored)
 //! * branch — `<prefix>/<issue>-<slug>`, e.g. `felix/eng-392-spike-embed-a-pty`
+//!
+//! Under v1.6's managed workspaces the manager is re-rooted at an L2 reference
+//! clone ([`crate::mirror`]) and given an explicit `worktrees_root` plus a repo
+//! `handle`, so per-issue worktrees hang off the *project* directory with a
+//! per-repo leaf — letting one issue carry several repos side by side:
+//! * worktree path — `<project>/worktrees/<ISSUE>/<handle>`
+//! * the per-issue **workspace** (the agent's cwd for a multi-repo issue) is the
+//!   shared parent `<project>/worktrees/<ISSUE>`, with each repo a sibling subdir.
 //!
 //! These functions are **synchronous and blocking**. They are quick, but a
 //! caller running on the tokio runtime (the supervisor) should invoke them via
@@ -74,8 +83,18 @@ pub struct Worktree {
 #[derive(Debug, Clone)]
 pub struct WorktreeManager {
     /// Canonical path to the main working tree (so `git worktree list` paths,
-    /// which git canonicalises, can be matched against ours).
+    /// which git canonicalises, can be matched against ours). Under v1.6 this is
+    /// the L2 reference clone for one (project, repo).
     repo_root: PathBuf,
+    /// Canonical root every per-issue worktree hangs off. Standalone managers use
+    /// `<repo>/.lindep/worktrees`; a v1.6 managed manager uses the shared
+    /// `<project>/worktrees`, so every repo of a project nests under one per-issue
+    /// directory.
+    worktrees_root: PathBuf,
+    /// The repo's handle, appended as a leaf under `<ISSUE>/` so several repos of
+    /// one issue coexist (`worktrees/<ISSUE>/<handle>`). `None` for a standalone
+    /// manager, whose worktree is `worktrees/<ISSUE>` directly (no leaf).
+    repo_handle: Option<String>,
     /// Branch namespace, e.g. `felix`. Defaults to `$USER`, then `lindep`.
     branch_prefix: String,
     /// Serializes repo-mutating `git worktree add`/`prune`/`remove` across all
@@ -92,12 +111,27 @@ pub struct WorktreeManager {
 impl WorktreeManager {
     /// Open a manager rooted at `repo_root`, deriving the branch prefix from
     /// `$USER`. The path is canonicalised, so it must already exist.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "standalone constructor; v1.6 production uses with_layout, tests use this"
+        )
+    )]
     pub fn new(repo_root: impl AsRef<Path>) -> Result<Self, WorktreeError> {
         Self::with_prefix(repo_root, default_branch_prefix())
     }
 
-    /// Open a manager with an explicit branch prefix (used by tests and by
-    /// teammates who don't want `$USER` as their namespace).
+    /// Open a **standalone** manager with an explicit branch prefix (used by tests
+    /// and by teammates who don't want `$USER` as their namespace). Worktrees live
+    /// at `<repo>/.lindep/worktrees/<ISSUE>` with no per-repo leaf.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "standalone constructor; v1.6 production uses with_layout, tests use this"
+        )
+    )]
     pub fn with_prefix(
         repo_root: impl AsRef<Path>,
         branch_prefix: impl Into<String>,
@@ -107,21 +141,100 @@ impl WorktreeManager {
             path: repo_root.to_path_buf(),
             source: e,
         })?;
+        let worktrees_root = canonical.join(".lindep").join("worktrees");
         Ok(WorktreeManager {
             repo_root: canonical,
+            worktrees_root,
+            repo_handle: None,
             branch_prefix: branch_prefix.into(),
             git_lock: Arc::new(Mutex::new(())),
         })
     }
 
-    /// `<repo>/.lindep/worktrees`.
-    fn worktrees_root(&self) -> PathBuf {
-        self.repo_root.join(".lindep").join("worktrees")
+    /// Open a **managed** manager for one (project, repo) under v1.6's layout:
+    /// `repo_root` is the L2 reference clone, `worktrees_root` the project's shared
+    /// worktrees directory, and `handle` the per-repo leaf. The worktrees root is
+    /// created and canonicalised here so `git worktree list`'s canonical paths
+    /// strip cleanly against it.
+    pub fn with_layout(
+        repo_root: impl AsRef<Path>,
+        branch_prefix: impl Into<String>,
+        worktrees_root: impl AsRef<Path>,
+        handle: impl Into<String>,
+    ) -> Result<Self, WorktreeError> {
+        let repo_root = repo_root.as_ref();
+        let canonical = repo_root.canonicalize().map_err(|e| WorktreeError::Io {
+            path: repo_root.to_path_buf(),
+            source: e,
+        })?;
+        let worktrees_root = worktrees_root.as_ref();
+        std::fs::create_dir_all(worktrees_root).map_err(|e| WorktreeError::Io {
+            path: worktrees_root.to_path_buf(),
+            source: e,
+        })?;
+        let worktrees_root = worktrees_root
+            .canonicalize()
+            .map_err(|e| WorktreeError::Io {
+                path: worktrees_root.to_path_buf(),
+                source: e,
+            })?;
+        Ok(WorktreeManager {
+            repo_root: canonical,
+            worktrees_root,
+            repo_handle: Some(handle.into()),
+            branch_prefix: branch_prefix.into(),
+            git_lock: Arc::new(Mutex::new(())),
+        })
     }
 
-    /// The deterministic worktree path for an issue.
+    /// The canonical root every per-issue worktree hangs off.
+    fn worktrees_root(&self) -> PathBuf {
+        self.worktrees_root.clone()
+    }
+
+    /// The per-issue **workspace** directory — the shared parent of every repo's
+    /// worktree for an issue (`worktrees/<ISSUE>`). For a standalone manager (no
+    /// repo leaf) this *is* the worktree; for a managed one it's the agent's cwd
+    /// when several repos sit side by side.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the multi-repo agent cwd (ENG-536 up-front repo select); used by tests"
+        )
+    )]
+    pub fn issue_workspace_dir(&self, issue: &str) -> PathBuf {
+        self.worktrees_root.join(issue)
+    }
+
+    /// The deterministic worktree path for an issue — `worktrees/<ISSUE>` for a
+    /// standalone manager, or `worktrees/<ISSUE>/<handle>` for a managed one.
     pub fn worktree_path(&self, issue: &str) -> PathBuf {
-        self.worktrees_root().join(issue)
+        let base = self.worktrees_root.join(issue);
+        match &self.repo_handle {
+            Some(handle) => base.join(handle),
+            None => base,
+        }
+    }
+
+    /// Extract the issue from a worktree path made relative to [`worktrees_root`].
+    /// A standalone manager wants a single component (`<ISSUE>`); a managed one
+    /// wants exactly `<ISSUE>/<handle>` matching *this* repo's handle, so a sibling
+    /// repo's worktree under the shared per-issue parent is correctly excluded.
+    ///
+    /// [`worktrees_root`]: Self::worktrees_root
+    fn issue_of_rel(&self, rel: &Path) -> Option<String> {
+        let mut comps = rel
+            .components()
+            .map(|c| c.as_os_str().to_str().map(str::to_string));
+        let issue = comps.next()??;
+        match &self.repo_handle {
+            None => comps.next().is_none().then_some(issue),
+            Some(handle) => {
+                let leaf = comps.next()??;
+                (leaf == *handle && comps.next().is_none()).then_some(issue)
+            }
+        }
     }
 
     /// The deterministic branch name for an issue + title.
@@ -251,14 +364,16 @@ impl WorktreeManager {
             // Strip exactly one `refs/heads/` (not `trim_start_matches`, which
             // would peel a repeated prefix), leaving any other ref form intact.
             let branch = raw.strip_prefix("refs/heads/").unwrap_or(raw).to_string();
-            // Keep only an immediate `<root>/<ISSUE>` child — not the root
-            // itself, nor anything nested deeper.
+            // Map the worktree path back to its issue. Standalone managers expect
+            // an immediate `<root>/<ISSUE>` child; a managed manager expects
+            // `<root>/<ISSUE>/<handle>` and keeps only its own repo's leaf — so
+            // sibling repos sharing the per-issue parent don't bleed into this
+            // repo's list. Neither the root itself nor anything nested deeper.
             if let Ok(rel) = path.strip_prefix(&root)
-                && rel.components().count() == 1
-                && let Some(issue) = rel.components().next().and_then(|c| c.as_os_str().to_str())
+                && let Some(issue) = self.issue_of_rel(rel)
             {
                 result.push(Worktree {
-                    issue: issue.to_string(),
+                    issue,
                     path: path.clone(),
                     branch,
                 });
@@ -415,7 +530,7 @@ pub fn validate_issue_id(issue: &str) -> Result<(), WorktreeError> {
 
 /// Default branch namespace: `$USER`, then `lindep`. Keeps Felix's `felix/…`
 /// namespace off teammates' branches while matching the design's example for him.
-fn default_branch_prefix() -> String {
+pub(crate) fn default_branch_prefix() -> String {
     std::env::var("USER")
         .ok()
         .filter(|u| !u.trim().is_empty())
@@ -762,6 +877,90 @@ mod tests {
                 .all(|w| !w.branch.is_empty()),
             "no managed worktree is ever reported with an empty branch"
         );
+    }
+
+    /// Build a managed manager (v1.6 layout) over a throwaway repo, sharing an
+    /// explicit `worktrees_root` with any sibling repos of the same project.
+    fn managed(worktrees_root: &Path, handle: &str) -> (PathBuf, WorktreeManager) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("lindep-mwt-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "root"]);
+        let mgr = WorktreeManager::with_layout(&dir, "felix", worktrees_root, handle).unwrap();
+        (dir, mgr)
+    }
+
+    #[test]
+    fn a_managed_manager_nests_the_worktree_under_issue_then_handle() {
+        let wt_root = std::env::temp_dir().join(format!("lindep-mwtr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wt_root);
+        let (_repo, mgr) = managed(&wt_root, "api");
+        let wt = mgr.create("ENG-1", "First", "HEAD").unwrap();
+        // The worktree nests as worktrees/<ISSUE>/<handle>…
+        assert_eq!(wt.path, mgr.worktrees_root().join("ENG-1").join("api"));
+        assert!(wt.path.is_dir());
+        // …and the per-issue workspace (the agent's cwd) is the shared parent.
+        assert_eq!(
+            mgr.issue_workspace_dir("ENG-1"),
+            mgr.worktrees_root().join("ENG-1")
+        );
+        // Branch naming is unchanged by the re-rooting.
+        assert_eq!(wt.branch, "felix/eng-1-first");
+        let _ = std::fs::remove_dir_all(&wt_root);
+    }
+
+    #[test]
+    fn two_repos_of_one_issue_share_the_parent_but_list_only_their_own_leaf() {
+        // Two repos of the same project share one worktrees_root; each issue's
+        // repos nest as sibling subdirs under worktrees/<ISSUE>/. Each manager
+        // must list only ITS handle's worktree, mapping the path back to the issue
+        // by stripping the handle leaf.
+        let wt_root = std::env::temp_dir().join(format!("lindep-mwtr2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wt_root);
+        let (_a, api) = managed(&wt_root, "api");
+        let (_b, web) = managed(&wt_root, "web");
+        let a = api.create("ENG-1", "Feature", "HEAD").unwrap();
+        let b = web.create("ENG-1", "Feature", "HEAD").unwrap();
+
+        assert_eq!(
+            a.path.parent(),
+            b.path.parent(),
+            "siblings share the parent"
+        );
+        assert_eq!(a.path.file_name().unwrap(), "api");
+        assert_eq!(b.path.file_name().unwrap(), "web");
+
+        let api_issues: Vec<_> = api.list().unwrap().into_iter().map(|w| w.issue).collect();
+        let web_issues: Vec<_> = web.list().unwrap().into_iter().map(|w| w.issue).collect();
+        assert_eq!(
+            api_issues,
+            vec!["ENG-1"],
+            "api lists its issue, mapped past the leaf"
+        );
+        assert_eq!(
+            web_issues,
+            vec!["ENG-1"],
+            "web lists its issue independently"
+        );
+        let _ = std::fs::remove_dir_all(&wt_root);
     }
 
     #[test]

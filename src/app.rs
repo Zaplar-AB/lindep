@@ -675,8 +675,41 @@ impl App {
             }
             Action::JumpNeedsYou => self.jump_to_needs_you(),
             Action::SwitchProject => self.open_project_switcher(),
+            Action::OpenInEditor => self.open_in_editor(),
             // The rest are direct (Spine/Deps) actions, never prefix verbs.
             _ => {}
+        }
+    }
+
+    /// Open the focused agent's workspace directory in an external editor (v1.6,
+    /// `Ctrl-a e`). Detached and env-inheriting (the user's own handoff tool), so
+    /// it survives cockpit teardown. A no-op with a footer when the focused issue
+    /// has no agent on disk yet — there's nothing to open until an agent has run.
+    fn open_in_editor(&mut self) {
+        let issue = self
+            .windows
+            .focused()
+            .issue()
+            .map(str::to_string)
+            .or_else(|| (!self.root.is_empty()).then(|| self.root.clone()));
+        let Some(issue) = issue else {
+            self.set_footer("no agent selected to open".into());
+            return;
+        };
+        let Some(backend) = self.backends.get(&issue) else {
+            self.set_footer(format!(
+                "{issue}: open an agent first — no workspace on disk yet"
+            ));
+            return;
+        };
+        let dir = backend.cwd().to_path_buf();
+        if dir.as_os_str().is_empty() || !dir.exists() {
+            self.set_footer(format!("{issue}: workspace not on disk yet"));
+            return;
+        }
+        match crate::backend::open_in_editor(&dir) {
+            Ok(editor) => self.set_footer(format!("opened {issue} in {editor}")),
+            Err(e) => self.set_footer(format!("couldn't open editor: {e}")),
         }
     }
 
@@ -1937,6 +1970,30 @@ impl App {
                 // sticky alert (unless another agent still needs you). Without this
                 // a kill/exit of the flagged agent left the footer yelling forever.
                 self.clear_needs_you_alert_if_resolved();
+                true
+            }
+            // v1.6 auto-push: an agent committed and its branch was pushed (or the
+            // push is pending). A passive footer only — a commit is never "needs
+            // you", and it never buries a standing alert. The repo handle scopes
+            // the line for a multi-repo issue (where several repos can push).
+            AppEvent::AgentCommitted {
+                issue,
+                repo_handle,
+                branch,
+                ..
+            } => {
+                if !self.needs_you_alert {
+                    let where_ = if repo_handle.is_empty() {
+                        issue
+                    } else {
+                        format!("{issue}/{repo_handle}")
+                    };
+                    self.status_msg = Some(if branch.is_empty() {
+                        format!("{where_}: pushed")
+                    } else {
+                        format!("{where_}: pushed {branch}")
+                    });
+                }
                 true
             }
         }

@@ -102,6 +102,9 @@ pub enum Action {
     /// Open the project switcher overlay — pick another mapped Linear project to
     /// view; the project you leave keeps its agents running in the background.
     SwitchProject,
+    /// Open the focused agent's workspace in an external editor (VS Code / Cursor /
+    /// …), detached, for review or a real-editor handoff (v1.6, `Ctrl-a e`).
+    OpenInEditor,
 }
 
 /// `(action, config name, default keys)` for the **direct** keys consulted when
@@ -159,6 +162,8 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::JumpNeedsYou, "jump-needs-you", &["n"]),
     // `Ctrl-a s` opens the project switcher (`p` is taken by `pin`).
     (Action::SwitchProject, "switch-project", &["s"]),
+    // `Ctrl-a e` opens the focused agent's workspace in an external editor.
+    (Action::OpenInEditor, "open-in-editor", &["e"]),
     // `Ctrl-a Tab` flips the active window chat⇄deps from any focus — notably
     // from inside a chat, where a bare Tab would go to the agent's PTY.
     (Action::ContextToggle, "context", &["tab"]),
@@ -582,16 +587,18 @@ impl KeySpec {
     }
 }
 
-/// Load the keymap: defaults, then `<repo>/.lindep/config.toml`, then
-/// `~/.config/lindep/config.toml` (personal wins). Returns the map plus any
+/// Load the keymap: defaults, then `<local_root>/.lindep/config.toml`, then
+/// `~/.config/lindep/config.toml` (personal wins). `local_root` is the directory
+/// lindep was launched from (v1.6 runs from anywhere, so this is the cwd, not a
+/// git repo root); the personal file is the durable one. Returns the map plus any
 /// warnings to surface (bad config never aborts startup — defaults stand in).
-pub fn load(repo_root: Option<&Path>) -> (Keymap, Settings, Vec<String>) {
+pub fn load(local_root: Option<&Path>) -> (Keymap, Settings, Vec<String>) {
     let mut keymap = Keymap::default();
     let mut settings = Settings::default();
     let mut warnings = Vec::new();
 
     let mut paths: Vec<PathBuf> = Vec::new();
-    if let Some(root) = repo_root {
+    if let Some(root) = local_root {
         paths.push(root.join(".lindep").join("config.toml"));
     }
     if let Some(home) = std::env::var_os("HOME") {

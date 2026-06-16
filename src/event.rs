@@ -76,6 +76,16 @@ pub enum AppEvent {
     /// map. The cockpit drops it from the fleet view too, so the overview stays
     /// bounded and mirrors the supervisor instead of accreting dead agents.
     AgentReaped { project_id: String, issue: String },
+    /// An agent committed in `repo_handle`'s worktree (from a `post-commit` hook).
+    /// Drives v1.6 auto-push: the work is pushed to the repo's true remote off the
+    /// status machinery (a commit is never "needs you"), and surfaces a passive
+    /// per-issue push indicator. `branch` is the committed branch.
+    AgentCommitted {
+        project_id: String,
+        issue: String,
+        repo_handle: String,
+        branch: String,
+    },
     /// A project switch's graph finished loading off the render thread (see
     /// `App::request_switch`). A pure wake signal: the loaded `(ProjectRef, Graph)`
     /// rides a side mailbox because `Graph` isn't `Clone`/`Debug` and so can't live
@@ -98,7 +108,8 @@ impl AppEvent {
             | AppEvent::AgentNeedsYou { project_id, .. }
             | AppEvent::AgentStatusChanged { project_id, .. }
             | AppEvent::AgentAction { project_id, .. }
-            | AppEvent::AgentReaped { project_id, .. } => Some(project_id),
+            | AppEvent::AgentReaped { project_id, .. }
+            | AppEvent::AgentCommitted { project_id, .. } => Some(project_id),
         }
     }
 }
