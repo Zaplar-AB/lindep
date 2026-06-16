@@ -18,6 +18,7 @@ mod window;
 // Multi-agent spine.
 mod backend;
 mod notify;
+mod projects;
 mod session;
 mod supervisor;
 mod worktree;
@@ -145,15 +146,15 @@ fn real_main() -> Result<(), String> {
     // Interactive path. Restore the terminal cleanly even on panic.
     install_panic_hook();
 
-    let graph = if cli.demo {
-        demo::graph()
+    let (graph, project) = if cli.demo {
+        (demo::graph(), None)
     } else {
         let client = Client::new(require_key()?);
         let Some(project) = resolve_or_pick(&client, cli.project.as_deref())? else {
             return Ok(()); // user quit the picker
         };
         eprintln!("Loading {}…", project.name);
-        client.fetch_graph(&project)?
+        (client.fetch_graph(&project)?, Some(project))
     };
 
     if graph.is_empty() {
@@ -164,7 +165,7 @@ fn real_main() -> Result<(), String> {
     if cli.graph {
         app.windows.open_fleet();
     }
-    run_tui(app, cli.demo, cli.no_resume).map_err(|e| e.to_string())
+    run_tui(app, cli.demo, project, cli.no_resume).map_err(|e| e.to_string())
 }
 
 /// Load `LINEAR_API_KEY` (and anything else) from `.env`: first the current
@@ -234,7 +235,12 @@ fn render_snapshot(app: &mut App, w: u16, h: u16) -> Result<String, String> {
     Ok(terminal.backend().to_string())
 }
 
-fn run_tui(mut app: App, demo: bool, no_resume: bool) -> io::Result<()> {
+fn run_tui(
+    mut app: App,
+    demo: bool,
+    project: Option<ProjectRef>,
+    no_resume: bool,
+) -> io::Result<()> {
     // Load the keymap from config (repo `.lindep/config.toml`, then personal
     // `~/.config/lindep/config.toml`), surfacing any problems on stderr before
     // we enter the alternate screen. Bad config never aborts — defaults stand in.
@@ -267,10 +273,16 @@ fn run_tui(mut app: App, demo: bool, no_resume: bool) -> io::Result<()> {
     // `app.supervisor = None` makes the button report "control plane unavailable"
     // instead — exactly the non-git degradation path. When armed it also restores
     // the saved window layout and (unless `--no-resume`) brings docked agents back.
-    let control_plane = if control_plane_enabled(demo) {
-        start_control_plane(&runtime, tx.clone(), &mut app, no_resume, max_concurrent)
-    } else {
-        None
+    let control_plane = match project.as_ref().filter(|_| control_plane_enabled(demo)) {
+        Some(project) => start_control_plane(
+            &runtime,
+            tx.clone(),
+            &mut app,
+            project,
+            no_resume,
+            max_concurrent,
+        ),
+        None => None,
     };
 
     // Greet the user via the event path so the footer shows the cockpit is live.
@@ -400,14 +412,51 @@ fn start_control_plane(
     runtime: &tokio::runtime::Runtime,
     events: event::AppEventTx,
     app: &mut App,
+    active: &ProjectRef,
     no_resume: bool,
     max_concurrent: usize,
 ) -> Option<(supervisor::SupervisorHandle, tokio::task::JoinHandle<()>)> {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
-    let repo_root = std::env::current_dir().ok()?;
-    let worktree = worktree::WorktreeManager::new(&repo_root).ok()?;
+    let cwd = std::env::current_dir().ok()?;
+
+    // Resolve this project's repo mapping from `.lindep/projects.toml` (repo
+    // file overlaid by the personal one), seeding a single-project default at
+    // the current dir when the project isn't configured — so an existing
+    // single-repo checkout boots exactly as before, with zero setup.
+    let (mut config, warnings) = projects::WorkspaceConfig::load(Some(&cwd));
+    for w in warnings {
+        let _ = events.send(event::AppEvent::Notification(format!("projects.toml: {w}")));
+    }
+    let seeded = config.ensure_mapped(&active.id, &active.name, &cwd);
+    let mapping = match config.resolve(&active.id) {
+        Ok(mapping) => mapping.clone(),
+        // ensure_mapped guarantees this resolves; the arm exists so an unmapped
+        // project surfaces an actionable message rather than a silent cwd fallback.
+        Err(e) => {
+            let _ = events.send(event::AppEvent::Notification(format!(
+                "agents disabled: {e}"
+            )));
+            return None;
+        }
+    };
+    // First run in this repo: drop a discoverable starter projects.toml under the
+    // gitignored `.lindep/` so adding more projects is obvious. Best-effort — a
+    // write failure just means no template, never a boot failure.
+    let repo_config_path = cwd.join(".lindep").join("projects.toml");
+    if seeded && !repo_config_path.exists() {
+        if let Some(dir) = repo_config_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&repo_config_path, projects::seed_file_contents(&mapping));
+    }
+
+    let repo_root = mapping.repo_root.clone();
+    let worktree = match mapping.branch_prefix.as_deref() {
+        Some(prefix) => worktree::WorktreeManager::with_prefix(&repo_root, prefix).ok()?,
+        None => worktree::WorktreeManager::new(&repo_root).ok()?,
+    };
     let state_path = session::SessionStore::state_path(&repo_root);
     let store = Arc::new(Mutex::new(
         match session::SessionStore::load(state_path.clone()) {
@@ -505,7 +554,7 @@ fn start_control_plane(
         exe,
         hook_port,
         hook_token,
-        hooks_dir: repo_root.join(".lindep").join("hooks"),
+        hooks_dir: mapping.hooks_dir(),
         base: "HEAD".to_string(),
         rows,
         cols,
