@@ -24,7 +24,7 @@ use ratatui::layout::Rect;
 /// The Spine's fixed width (matches the v2 left-list width).
 pub const SPINE_WIDTH: u16 = 44;
 /// The width of the right-hand rail of status cards.
-pub const RAIL_WIDTH: u16 = 32;
+const RAIL_WIDTH: u16 = 32;
 /// The big pane never shrinks below this. On a terminal too narrow to fit both a
 /// readable big pane and the rail, the rail is dropped — cards aren't drawn, but
 /// every window stays focusable (focusing it makes it the big pane).

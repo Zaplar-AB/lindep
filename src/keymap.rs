@@ -171,7 +171,7 @@ const DEFAULT_PREFIX: &str = "ctrl-a";
 /// A normalized key chord: a [`KeyCode`] plus whether Ctrl/Alt were held. Shift
 /// is ignored — it's already reflected in the character a terminal delivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Binding {
+struct Binding {
     code: KeyCode,
     ctrl: bool,
     alt: bool,

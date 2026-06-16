@@ -28,7 +28,7 @@ use crate::model::{Direction, Graph, Issue};
 use crate::picker::Picker;
 use crate::session::{AgentStatus, CockpitState, PersistedKind, PersistedWindow};
 use crate::window::{
-    CoinMode, DepsCursor, GraduateOutcome, LayoutMode, WindowId, WindowKind, WindowSet,
+    CoinMode, DepsCursor, GraduateOutcome, LayoutMode, WindowId, WindowKind, WindowSet, move_state,
 };
 use crate::workspace::WorkspaceHandle;
 
@@ -2215,8 +2215,7 @@ impl App {
             None => 0,
         };
         let (key, n, total) = (members[next].clone(), next + 1, members.len());
-        self.aim_spine(key.clone());
-        self.status_msg = Some(format!("cycle {n}/{total} — {key}{}", self.hidden_note()));
+        self.set_jump_status("cycle", &key, n, total);
     }
 
     /// Jump to the next issue whose agent needs you, in display order, wrapping.
@@ -2245,12 +2244,20 @@ impl App {
             None => 0,
         };
         let (key, n, total) = (members[next].clone(), next + 1, members.len());
-        self.aim_spine(key.clone());
+        self.set_jump_status("needs you", &key, n, total);
         // If this needy issue is already a pinned coin, go straight to it (chat
         // face) so you can respond; otherwise the preview follows the selection.
+        // Runs after `set_jump_status` (which aims the spine) so this focus wins.
         self.focus_pinned_chat(&key);
+    }
+
+    /// Aim the spine at `key` and set the footer to "<prefix> n/total — key",
+    /// flagging when the landing row is hidden by the active filter. Shared by
+    /// the cycle and needs-you spine jumps.
+    fn set_jump_status(&mut self, prefix: &str, key: &str, n: usize, total: usize) {
+        self.aim_spine(key.to_string());
         self.status_msg = Some(format!(
-            "needs you {n}/{total} — {key}{}",
+            "{prefix} {n}/{total} — {key}{}",
             self.hidden_note()
         ));
     }
@@ -2331,16 +2338,6 @@ fn window_to_persisted(w: &crate::window::Window) -> Option<PersistedWindow> {
             issue: None,
         }),
     }
-}
-
-fn move_state(state: &mut ListState, len: usize, delta: i32) {
-    if len == 0 {
-        state.select(None);
-        return;
-    }
-    let cur = state.selected().unwrap_or(0) as i32;
-    let next = (cur + delta).rem_euclid(len as i32) as usize;
-    state.select(Some(next));
 }
 
 /// Compare identifiers naturally: same prefix sorts by numeric suffix.

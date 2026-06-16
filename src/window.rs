@@ -835,7 +835,9 @@ fn walk(
 }
 
 /// Step a `ListState` selection by `delta`, wrapping; empties select nothing.
-fn move_state(state: &mut ListState, len: usize, delta: i32) {
+/// The crate's one wrapping list-nav primitive — shared by the deps cursor here,
+/// the dashboard list in `app`, and the project picker.
+pub(crate) fn move_state(state: &mut ListState, len: usize, delta: i32) {
     if len == 0 {
         state.select(None);
         return;

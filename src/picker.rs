@@ -16,6 +16,7 @@ use ratatui::widgets::{
 
 use crate::linear::ProjectRef;
 use crate::theme::{self, *};
+use crate::window::move_state;
 
 /// The project list + live filter state. Drives both the startup full-screen
 /// [`pick`] and the in-cockpit switch overlay ([`render_overlay`]); the cockpit
@@ -58,13 +59,7 @@ impl Picker {
     }
 
     pub(crate) fn move_by(&mut self, delta: i32) {
-        if self.order.is_empty() {
-            return;
-        }
-        let n = self.order.len() as i32;
-        let cur = self.state.selected().unwrap_or(0) as i32;
-        self.state
-            .select(Some((cur + delta).rem_euclid(n) as usize));
+        move_state(&mut self.state, self.order.len(), delta);
     }
 
     pub(crate) fn selected(&self) -> Option<ProjectRef> {
