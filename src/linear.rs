@@ -44,8 +44,16 @@ impl Client {
     pub fn new(api_key: String) -> Self {
         // Don't treat non-2xx as a transport error — Linear returns HTTP 400
         // with a descriptive GraphQL `errors` body we want to surface.
+        //
+        // Bound every call so a stalled connection (dead network, a hung proxy,
+        // a half-open socket) surfaces as a `Result::Err` the caller can report
+        // instead of hanging the synchronous fetch — and with it the whole
+        // cockpit launch — forever. `timeout_global` caps each request/response
+        // cycle (we issue one per page), `timeout_connect` the dial phase.
         let agent = ureq::config::Config::builder()
             .http_status_as_error(false)
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .timeout_connect(Some(std::time::Duration::from_secs(10)))
             .build()
             .new_agent();
         Client { agent, api_key }
@@ -180,22 +188,22 @@ impl Client {
         }
 
         // Top up any issue whose relations overflowed the inline page cap, so
-        // the graph never silently drops edges for heavily-linked issues.
+        // the graph never silently drops edges for heavily-linked issues. Only
+        // page on a real `Some(cursor)`: `hasNextPage` with a null cursor carries
+        // nothing to page from, and `relations(after: null)` would restart from
+        // page 1 and re-fetch duplicates — the same guard the project/issue
+        // pagination uses.
         for ri in &mut raw {
-            if ri.relations.page_info.has_next_page {
-                let more = self.page_relations(
-                    &ri.identifier,
-                    false,
-                    ri.relations.page_info.end_cursor.clone(),
-                )?;
+            // Clone the trigger out first so the post-fetch `extend` doesn't
+            // overlap the borrow of `page_info`.
+            let rel_cursor = page_cursor(&ri.relations.page_info, &ri.identifier);
+            if let Some(cursor) = rel_cursor {
+                let more = self.page_relations(&ri.identifier, false, Some(cursor))?;
                 ri.relations.nodes.extend(more);
             }
-            if ri.inverse_relations.page_info.has_next_page {
-                let more = self.page_relations(
-                    &ri.identifier,
-                    true,
-                    ri.inverse_relations.page_info.end_cursor.clone(),
-                )?;
+            let inv_cursor = page_cursor(&ri.inverse_relations.page_info, &ri.identifier);
+            if let Some(cursor) = inv_cursor {
+                let more = self.page_relations(&ri.identifier, true, Some(cursor))?;
                 ri.inverse_relations.nodes.extend(more);
             }
         }
@@ -247,6 +255,26 @@ impl Client {
     }
 }
 
+/// The cursor to top up a relation connection from, or `None` if there is
+/// nothing reliable to page. `hasNextPage` with a real `Some(cursor)` yields it;
+/// `hasNextPage` with a null cursor carries nothing to page from — paging with
+/// `after: null` would restart at page 1 and re-fetch duplicates — so it warns
+/// (overflow edges are never dropped silently) and returns `None`. The same
+/// `(true, Some)` guard the project/issue pagination uses.
+fn page_cursor(info: &PageInfo, identifier: &str) -> Option<String> {
+    match (info.has_next_page, &info.end_cursor) {
+        (true, Some(cursor)) => Some(cursor.clone()),
+        (true, None) => {
+            eprintln!(
+                "lindep: warning: could not page all relations for {identifier} \
+                 (no cursor); some dependency edges may be missing"
+            );
+            None
+        }
+        (false, _) => None,
+    }
+}
+
 /// Resolve a project by (case-insensitive) name over an already-fetched list.
 /// Prefers an exact match, otherwise a unique substring match; reports ambiguity
 /// or a no-match with an actionable message. Pure, so it is unit-tested directly.
@@ -275,21 +303,35 @@ fn resolve_in(projects: &[ProjectRef], name: &str) -> Result<ProjectRef, String>
     }
 }
 
+/// Strip control characters from a one-line display string sourced from Linear.
+/// Titles and names are rendered into single-line TUI rows, where an embedded
+/// control byte (a stray `\n`/`\t`, or an ESC sequence) would break the layout or
+/// reach the terminal — and `truncate`'s width-based early-return can pass such a
+/// string through untouched — so they're cleaned once, here at the trust boundary.
+fn sanitize_oneline(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// Turn raw issues + relations into a finalized [`Graph`].
 fn build_graph(project_name: &str, raw: Vec<RawIssue>) -> Graph {
-    let mut graph = Graph::new(project_name);
+    let mut graph = Graph::new(sanitize_oneline(project_name));
 
     for ri in &raw {
         graph.add_issue(Issue {
             key: ri.identifier.clone(),
-            title: ri.title.clone(),
+            title: sanitize_oneline(&ri.title),
             status: ri
                 .state
                 .as_ref()
                 .map(|s| Status::from_type(&s.kind))
                 .unwrap_or(Status::Unknown),
             priority: Priority::from_value(ri.priority.unwrap_or(0.0)),
-            assignee: ri.assignee.as_ref().map(|a| a.display_name.clone()),
+            assignee: ri
+                .assignee
+                .as_ref()
+                .map(|a| sanitize_oneline(&a.display_name)),
             external: false,
         });
     }
@@ -302,7 +344,7 @@ fn build_graph(project_name: &str, raw: Vec<RawIssue>) -> Graph {
             if rel.kind == "blocks"
                 && let Some(target) = &rel.other
             {
-                graph.ensure_external(&target.identifier, &target.title);
+                graph.ensure_external(&target.identifier, &sanitize_oneline(&target.title));
                 graph.add_edge(&ri.identifier, &target.identifier);
             }
         }
@@ -310,7 +352,7 @@ fn build_graph(project_name: &str, raw: Vec<RawIssue>) -> Graph {
             if inv.kind == "blocks"
                 && let Some(source) = &inv.other
             {
-                graph.ensure_external(&source.identifier, &source.title);
+                graph.ensure_external(&source.identifier, &sanitize_oneline(&source.title));
                 graph.add_edge(&source.identifier, &ri.identifier);
             }
         }
@@ -547,5 +589,72 @@ mod tests {
         let projects = [proj("1", "Core PMS")];
         let err = resolve_in(&projects, "zzz").unwrap_err();
         assert!(err.contains("--list"));
+    }
+
+    fn page_info(has_next: bool, cursor: Option<&str>) -> PageInfo {
+        PageInfo {
+            has_next_page: has_next,
+            end_cursor: cursor.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn page_cursor_yields_a_real_cursor() {
+        let info = page_info(true, Some("cur-42"));
+        assert_eq!(page_cursor(&info, "ENG-1"), Some("cur-42".to_string()));
+    }
+
+    #[test]
+    fn page_cursor_stops_when_there_is_no_next_page() {
+        // The common case: relations fit inline. No top-up, regardless of cursor.
+        assert_eq!(page_cursor(&page_info(false, None), "ENG-1"), None);
+        assert_eq!(page_cursor(&page_info(false, Some("x")), "ENG-1"), None);
+    }
+
+    #[test]
+    fn page_cursor_does_not_restart_from_page_one_on_a_null_cursor() {
+        // The bug guarded here: `hasNextPage: true` with `endCursor: null` must
+        // NOT page (which would `after: null` → re-fetch page 1 and duplicate
+        // every relation). Returning None leaves the inline page as-is.
+        assert_eq!(page_cursor(&page_info(true, None), "ENG-1"), None);
+    }
+
+    #[test]
+    fn titles_and_names_are_stripped_of_control_chars_at_ingest() {
+        // A title/name/project with an embedded newline, tab or ESC must not
+        // reach the single-line TUI rows intact — `truncate`'s width-based
+        // early-return would pass it straight through and corrupt the layout (or
+        // smuggle an escape sequence to the terminal). Sanitized once at ingest.
+        let g = build_graph(
+            "proj\twith\ttabs",
+            issues(json!([
+                {
+                    "identifier": "A", "title": "line1\nline2\tcol\x1b[2Jx", "priority": null,
+                    "state": null, "assignee": { "displayName": "na\nme" },
+                    "relations": empty_rel(),
+                    "inverseRelations": { "nodes": [
+                        { "type": "blocks", "issue": { "identifier": "INFRA-9", "title": "ext\nernal" } }
+                    ], "pageInfo": { "hasNextPage": false, "endCursor": null } }
+                }
+            ])),
+        );
+        let issue = g.get("A").unwrap();
+        assert_eq!(
+            issue.title, "line1 line2 col [2Jx",
+            "controls become spaces"
+        );
+        assert_eq!(issue.assignee.as_deref(), Some("na me"));
+        assert!(
+            !g.get("INFRA-9")
+                .unwrap()
+                .title
+                .chars()
+                .any(char::is_control),
+            "external endpoint titles are sanitized too"
+        );
+        assert!(
+            !g.project.chars().any(char::is_control),
+            "the project name (rendered in the header) is sanitized"
+        );
     }
 }

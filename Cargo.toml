@@ -14,3 +14,37 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 unicode-width = "0.2.2"
 ureq = { version = "3.3.0", features = ["json"] }
+
+# ── Multi-agent spine (v1) ──────────────────────────────────────────────────
+# Async runtime for the supervisor, hook endpoint and PTY pumps. The ratatui
+# render loop stays synchronous (see main.rs); tokio only carries the background
+# work that pushes `AppEvent`s into it — hence a targeted feature set, not "full".
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "net",
+    "io-util",
+    "time",
+] }
+# Structured concurrency for the supervisor: CancellationToken (kill one agent /
+# shut all down) + TaskTracker (await every agent task on quit).
+tokio-util = { version = "0.7", features = ["rt"] }
+# Render a real interactive `claude` PTY inside a ratatui pane. tui-term 0.3.4
+# pulls ratatui-core 0.1 / ratatui-widgets 0.3, which semver-unify with our
+# ratatui 0.30.1 — no bump. `unstable` enables the portable-pty helpers; the
+# default `vt100` feature gives the parser the PseudoTerminal widget renders.
+tui-term = { version = "0.3.4", features = ["unstable"] }
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
+# Deterministic per-issue session ids (v5 from a fixed namespace) so
+# `claude --session-id` / `--resume` reconnect across process restarts.
+uuid = { version = "1", features = ["v4", "v5"] }
+# One error enum per subsystem, per the rust-best-practices skill.
+thiserror = "2"
+# Personal/repo config (currently the remappable keymap) in `config.toml`.
+toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+# Signal the agent's whole process group on stop so PTY descendants die with it.
+libc = "0.2"

@@ -7,23 +7,29 @@ use std::io;
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph,
+};
 
 use crate::linear::ProjectRef;
 use crate::theme::{self, *};
+use crate::window::move_state;
 
-struct Picker {
+/// The project list + live filter state. Drives both the startup full-screen
+/// [`pick`] and the in-cockpit switch overlay ([`render_overlay`]); the cockpit
+/// owns an instance and feeds it keys directly (see `App::on_switcher_key`).
+pub(crate) struct Picker {
     projects: Vec<ProjectRef>,
     order: Vec<usize>, // indices into `projects` that match the filter
     state: ListState,
-    query: String,
+    pub(crate) query: String,
 }
 
 impl Picker {
-    fn new(mut projects: Vec<ProjectRef>) -> Self {
+    pub(crate) fn new(mut projects: Vec<ProjectRef>) -> Self {
         projects.sort_by_key(|p| p.name.to_lowercase());
         let mut picker = Picker {
             projects,
@@ -35,7 +41,7 @@ impl Picker {
         picker
     }
 
-    fn refilter(&mut self) {
+    pub(crate) fn refilter(&mut self) {
         let needle = self.query.to_lowercase();
         self.order = self
             .projects
@@ -52,22 +58,102 @@ impl Picker {
         }
     }
 
-    fn move_by(&mut self, delta: i32) {
-        if self.order.is_empty() {
-            return;
-        }
-        let n = self.order.len() as i32;
-        let cur = self.state.selected().unwrap_or(0) as i32;
-        self.state
-            .select(Some((cur + delta).rem_euclid(n) as usize));
+    pub(crate) fn move_by(&mut self, delta: i32) {
+        move_state(&mut self.state, self.order.len(), delta);
     }
 
-    fn selected(&self) -> Option<ProjectRef> {
+    pub(crate) fn selected(&self) -> Option<ProjectRef> {
         self.state
             .selected()
             .and_then(|i| self.order.get(i))
             .map(|&idx| self.projects[idx].clone())
     }
+}
+
+/// Render the picker as a centered modal over the running cockpit (the in-session
+/// project switcher, `Ctrl-a s`). Mirrors the full-screen [`draw`] but boxed and
+/// with a `Clear` behind it so it floats above the cockpit; the cockpit feeds it
+/// keys (see `App::on_switcher_key`) instead of running its own event loop.
+pub(crate) fn render_overlay(
+    picker: &mut Picker,
+    frame: &mut Frame,
+    full: Rect,
+    needs_you: &std::collections::HashSet<String>,
+) {
+    // Widen to u32 for the arithmetic so a pathologically large terminal can't
+    // overflow u16 (`width * 6`) and panic in a debug build.
+    let width = (u32::from(full.width) * 6 / 10)
+        .clamp(u32::from(40.min(full.width)), u32::from(full.width)) as u16;
+    let height = (u32::from(full.height) * 6 / 10)
+        .clamp(u32::from(8.min(full.height)), u32::from(full.height)) as u16;
+    let area = Rect {
+        x: full.x + (full.width.saturating_sub(width)) / 2,
+        y: full.y + (full.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(GREEN_500))
+        .title(Line::from(Span::styled(
+            " SWITCH PROJECT ",
+            Style::new().fg(GREEN_100).bold(),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [query, body, hint] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let query_line = Line::from(vec![
+        Span::styled(" /", Style::new().fg(GREEN_400)),
+        Span::styled(picker.query.clone(), Style::new().fg(INK)),
+        Span::styled("▏", Style::new().fg(GREEN_500)),
+        Span::raw("  "),
+        Span::styled(
+            format!("{}/{}", picker.order.len(), picker.projects.len()),
+            Style::new().fg(MUTED),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(query_line), query);
+
+    // A project with an agent that needs you carries a breathing ⚑ — so a
+    // backgrounded prompt is visible right where you'd switch to handle it.
+    let items: Vec<ListItem> = picker
+        .order
+        .iter()
+        .map(|&i| {
+            let project = &picker.projects[i];
+            let mut spans = vec![Span::styled(project.name.clone(), Style::new().fg(INK))];
+            if needs_you.contains(&project.id) {
+                // Steady (not breathing): the switcher is a modal and a
+                // backgrounded needs-you doesn't drive the animation tick, so an
+                // animated flag here would never actually repaint.
+                spans.push(Span::styled("  ⚑", Style::new().fg(AMBER_400).bold()));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_symbol("▸ ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .highlight_style(theme::cursor_active());
+    frame.render_stateful_widget(list, body, &mut picker.state);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " type to filter · ↑↓ move · ⏎ switch · esc cancel",
+            Style::new().fg(MUTED),
+        ))),
+        hint,
+    );
 }
 
 /// Run the picker until the user selects a project (`Some`) or quits (`None`).
@@ -229,5 +315,20 @@ mod tests {
         let out = term.backend().to_string();
         assert!(out.contains("select a project"));
         assert!(out.contains("Billing"));
+    }
+
+    #[test]
+    fn the_switch_overlay_renders_without_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut p = Picker::new(projects());
+        let needs = std::collections::HashSet::from(["1".to_string()]); // Billing (id 1)
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| render_overlay(&mut p, f, f.area(), &needs))
+            .unwrap();
+        let out = term.backend().to_string();
+        assert!(out.contains("SWITCH PROJECT"));
+        assert!(out.contains("Billing"));
+        assert!(out.contains('⚑'), "a project that needs you is flagged");
     }
 }

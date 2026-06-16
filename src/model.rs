@@ -458,11 +458,7 @@ impl Graph {
     /// removed). Level 0 holds roots with no real blockers; each subsequent
     /// level sits below its deepest blocker. Returns bands in level order.
     pub fn levels(&self) -> Vec<Vec<String>> {
-        let mut level: HashMap<String, usize> = HashMap::new();
-        // Memoised DFS up the blocked_by edges, skipping back-edges.
-        for key in &self.order {
-            self.level_of(key, &mut level, &mut HashSet::new());
-        }
+        let level = self.compute_levels();
         let max = level.values().copied().max().unwrap_or(0);
         let mut bands = vec![Vec::new(); max + 1];
         for key in &self.order {
@@ -471,31 +467,71 @@ impl Graph {
         bands
     }
 
-    fn level_of(
-        &self,
-        key: &str,
-        level: &mut HashMap<String, usize>,
-        on_path: &mut HashSet<String>,
-    ) -> usize {
-        if let Some(&l) = level.get(key) {
-            return l;
-        }
-        on_path.insert(key.to_string());
-        let mut best = 0;
-        for blocker in self.neighbours(key, Direction::Upstream) {
-            // Skip the back-edge that would re-enter the current path.
-            if self
-                .back_edges
-                .contains(&(blocker.clone(), key.to_string()))
-                || on_path.contains(blocker)
-            {
+    /// A node's longest-path level: `1 + max(level of its real upstream
+    /// blockers)`, or 0 if it has none. Iterative post-order memoisation over an
+    /// explicit work-stack (like `detect_cycles`/`mark_cycle_members`) so depth
+    /// lives on the heap, not the call stack, and a deep blocker chain cannot
+    /// overflow it. Back-edges and the on-path guard prune cyclic re-entry, so
+    /// the relaxation always terminates.
+    fn compute_levels(&self) -> HashMap<String, usize> {
+        let mut level: HashMap<String, usize> = HashMap::new();
+        // True for any blocker we must never traverse: a back-edge (would re-enter
+        // the DFS path) or a blocker already on the current path (a cycle). A node
+        // skipped this way contributes nothing to a level, exactly as the old
+        // recursive `level_of` skipped it.
+        let skip = |blocker: &str, node: &str, on_path: &HashSet<&str>| {
+            on_path.contains(blocker)
+                || self
+                    .back_edges
+                    .contains(&(blocker.to_string(), node.to_string()))
+        };
+        for root in &self.order {
+            if level.contains_key(root) {
                 continue;
             }
-            best = best.max(1 + self.level_of(blocker, level, on_path));
+            // Nodes currently descended-into; a blocker already on this path is a
+            // cycle edge and is skipped, mirroring the old recursive guard.
+            let mut on_path: HashSet<&str> = HashSet::new();
+            // (node, next-blocker-index). `idx == 0` is the pre-visit.
+            let mut stack: Vec<(&str, usize)> = vec![(root.as_str(), 0)];
+            on_path.insert(root.as_str());
+            while let Some(&(node, idx)) = stack.last() {
+                let blockers = self.neighbours(node, Direction::Upstream);
+                // Walk forward to the next unresolved, traversable blocker. Already
+                // resolved blockers (memoised in `level`) need no descent; we fold
+                // them in during the post-order relax below.
+                let mut i = idx;
+                let mut pending: Option<&str> = None;
+                while i < blockers.len() {
+                    let blocker = blockers[i].as_str();
+                    i += 1;
+                    if skip(blocker, node, &on_path) || level.contains_key(blocker) {
+                        continue;
+                    }
+                    pending = Some(blocker);
+                    break;
+                }
+                if let Some(top) = stack.last_mut() {
+                    top.1 = i;
+                }
+                if let Some(blocker) = pending {
+                    on_path.insert(blocker);
+                    stack.push((blocker, 0));
+                    continue;
+                }
+                // All blockers visited: relax `node` from its resolved blockers.
+                let best = blockers
+                    .iter()
+                    .filter(|b| !skip(b.as_str(), node, &on_path))
+                    .filter_map(|b| level.get(b.as_str()).map(|&l| l + 1))
+                    .max()
+                    .unwrap_or(0);
+                level.insert(node.to_string(), best);
+                on_path.remove(node);
+                stack.pop();
+            }
         }
-        on_path.remove(key);
-        level.insert(key.to_string(), best);
-        best
+        level
     }
 }
 
@@ -648,6 +684,56 @@ mod tests {
         assert_eq!(bands.len(), 4);
         assert!(bands[0].contains(&"X-1".to_string()));
         assert!(bands[3].contains(&"C".to_string()));
+    }
+
+    #[test]
+    fn levels_take_the_longest_path_through_a_diamond() {
+        // A → B → D and A → C, C → D. D's level must follow the longer A→B→D
+        // path (L2), not the shorter A→C→D… here both are length 2, so add a
+        // detour: A→B1→B2→D (len 3) vs A→C→D (len 2). D lands at L3.
+        let mut g = Graph::new("t");
+        for k in ["A", "B1", "B2", "C", "D"] {
+            g.add_issue(node(k, Status::Started));
+        }
+        g.add_edge("A", "B1");
+        g.add_edge("B1", "B2");
+        g.add_edge("B2", "D");
+        g.add_edge("A", "C");
+        g.add_edge("C", "D");
+        g.finalize();
+
+        let bands = g.levels();
+        let level_of = |key: &str| bands.iter().position(|b| b.contains(&key.to_string()));
+        assert_eq!(level_of("A"), Some(0));
+        assert_eq!(level_of("C"), Some(1));
+        assert_eq!(level_of("B2"), Some(2));
+        // D sits below its DEEPEST blocker (B2 at L2), not the shallower C.
+        assert_eq!(level_of("D"), Some(3));
+    }
+
+    #[test]
+    fn levels_do_not_overflow_the_stack_on_a_deep_chain() {
+        // The recursive layering would consume one stack frame per node of the
+        // deepest blocker chain; a release-train-length chain (thousands of
+        // issues) overflows and aborts mid-render. The iterative relaxation must
+        // place every node with depth bounded by the heap, not the call stack.
+        const N: usize = 20_000;
+        let mut g = Graph::new("t");
+        for i in 0..N {
+            g.add_issue(node(&format!("I-{i}"), Status::Started));
+        }
+        for i in 0..N - 1 {
+            // I-i blocks I-(i+1): a single chain N deep.
+            g.add_edge(&format!("I-{i}"), &format!("I-{}", i + 1));
+        }
+        g.finalize();
+
+        let bands = g.levels();
+        assert_eq!(bands.len(), N, "one band per link in the chain");
+        let placed: usize = bands.iter().map(Vec::len).sum();
+        assert_eq!(placed, N, "every node lands in exactly one band");
+        // The tail of the chain is at the deepest level.
+        assert!(bands[N - 1].contains(&format!("I-{}", N - 1)));
     }
 
     #[test]

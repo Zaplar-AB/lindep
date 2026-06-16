@@ -1,2 +1,4 @@
 /target
 .env
+# Per-issue agent worktrees, session state and transcripts live here.
+/.lindep
