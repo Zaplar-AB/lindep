@@ -867,7 +867,10 @@ mod tests {
         // Found by issue + index (the second ENG-1 spawn), not a global position.
         let (_fake2, args) = nth_spawn(&registry, "ENG-1", 1);
         assert_eq!(args.first().map(String::as_str), Some("--resume"));
-        assert_eq!(args.get(1), Some(&SessionStore::session_id_for("ENG-1")));
+        assert_eq!(
+            args.get(1),
+            Some(&SessionStore::session_id_for("", "ENG-1"))
+        );
 
         handle.shutdown();
         join.await.unwrap();

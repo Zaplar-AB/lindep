@@ -807,7 +807,7 @@ mod tests {
     async fn an_idle_nudge_does_not_raise_the_needs_you_flag() {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
-        let sid = SessionStore::session_id_for("ENG-1");
+        let sid = SessionStore::session_id_for("", "ENG-1");
         let Endpoint { port, token } = serve(tx, store).await.unwrap();
 
         // The idle nudge Claude fires ~60 s after a turn: same hook as a real
@@ -844,7 +844,7 @@ mod tests {
             .lock()
             .unwrap()
             .set_status("ENG-1", AgentStatus::Spawning);
-        let sid = SessionStore::session_id_for("ENG-1");
+        let sid = SessionStore::session_id_for("", "ENG-1");
         let Endpoint { port, token } = serve(tx, Arc::clone(&store)).await.unwrap();
 
         let body = json!({
@@ -870,8 +870,8 @@ mod tests {
     async fn hooks_map_to_the_right_issue_across_concurrent_agents() {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
-        let sid1 = SessionStore::session_id_for("ENG-1");
-        let sid2 = SessionStore::session_id_for("ENG-2");
+        let sid1 = SessionStore::session_id_for("", "ENG-1");
+        let sid2 = SessionStore::session_id_for("", "ENG-2");
         let Endpoint { port, token } = serve(tx, store).await.unwrap();
 
         // ENG-1 raises a permission prompt; ENG-2 stops. Posted back to back.
@@ -981,7 +981,7 @@ mod tests {
     async fn a_hook_with_a_bad_or_missing_token_is_dropped() {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
-        let sid = SessionStore::session_id_for("ENG-1");
+        let sid = SessionStore::session_id_for("", "ENG-1");
         let Endpoint { port, token } = serve(tx, store).await.unwrap();
         let body = json!({
             "session_id": sid, "hook_event_name": "Notification",
@@ -1019,7 +1019,7 @@ mod tests {
     async fn malformed_bodies_are_dropped_and_the_server_stays_live() {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
-        let sid = SessionStore::session_id_for("ENG-1");
+        let sid = SessionStore::session_id_for("", "ENG-1");
         let Endpoint { port, token } = serve(tx, store).await.unwrap();
 
         // (1) Authenticated but non-JSON body → no AgentNeedsYou; server lives.
@@ -1068,7 +1068,7 @@ mod tests {
     async fn posttooluse_maps_to_an_action_with_the_tool_name() {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
-        let sid = SessionStore::session_id_for("ENG-1");
+        let sid = SessionStore::session_id_for("", "ENG-1");
         let Endpoint { port, token } = serve(tx, store).await.unwrap();
 
         // With a tool_name → "ran <tool>".
@@ -1103,7 +1103,7 @@ mod tests {
     async fn a_transcript_path_inside_the_worktree_is_persisted_lazily() {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
-        let sid = SessionStore::session_id_for("ENG-1");
+        let sid = SessionStore::session_id_for("", "ENG-1");
         let Endpoint { port, token } = serve(tx, Arc::clone(&store)).await.unwrap();
 
         // A PostToolUse carrying a transcript path *inside* ENG-1's worktree.

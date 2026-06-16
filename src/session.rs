@@ -7,9 +7,12 @@
 //! atomically-written `serde_json` file (`.lindep/state.json`); full transcripts
 //! are **not** inlined — a session only references its NDJSON log by path.
 //!
-//! The `session_id` is a deterministic UUIDv5 of the issue id under a fixed
-//! namespace, so even if `state.json` is lost the same id regenerates and
-//! `--resume` still finds the conversation.
+//! The `session_id` is a deterministic UUIDv5 of `"{project_id}:{issue}"` under
+//! a fixed namespace, so even if the state file is lost the same id regenerates
+//! and `--resume` still finds the conversation — and the same issue key in two
+//! projects gets two distinct conversations. (Sessions persisted before v1.5
+//! were keyed on the bare issue; their stored id is preserved verbatim on the
+//! v1→v2 migration so `--resume` continuity survives the rekey.)
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -108,6 +111,13 @@ impl AgentStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub issue: String,
+    /// The Linear project this session belongs to. Disambiguates the same issue
+    /// key across projects and folds into the deterministic `session_id`.
+    /// `#[serde(default)]` so a pre-v1.5 (v1) state file — which has no
+    /// `project_id` — still loads; the owning store stamps it on load via
+    /// [`SessionStore::for_project`], preserving the stored `session_id`.
+    #[serde(default)]
+    pub project_id: String,
     pub worktree_path: PathBuf,
     pub branch: String,
     /// `claude`'s session id (a UUID string), passed as `--session-id` /
@@ -171,17 +181,29 @@ struct Persisted {
     sessions: Vec<Session>,
 }
 
-const STATE_VERSION: u32 = 1;
+/// v1 → v2 (lindep v1.5): added `Session::project_id` and folded the project
+/// into the deterministic `session_id`. v2 is a purely additive shape change
+/// (the new field rides a `#[serde(default)]`), so the migration is "stamp the
+/// owning project_id onto records that lack one" — done in
+/// [`SessionStore::for_project`], not a structural transform here. Later
+/// milestones add their own fields (`last_synced_status`, `PipelineState`,
+/// `backend`) as further `#[serde(default)]` on top of v2.
+const STATE_VERSION: u32 = 2;
 
 /// Serde default for a version-less file: the first format that carried a tag.
 fn default_state_version() -> u32 {
     1
 }
 
-/// The in-memory store, backed by an atomically-written JSON file.
+/// The in-memory store, backed by an atomically-written JSON file. One store
+/// owns exactly one project's sessions (the workspace holds one per project).
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     path: PathBuf,
+    /// The Linear project this store's sessions belong to — stamped onto new
+    /// records and onto migrated v1 records (see [`SessionStore::for_project`]).
+    /// Empty for a bare [`SessionStore::load`] that hasn't been claimed yet.
+    project_id: String,
     sessions: HashMap<String, Session>, // keyed by issue id
 }
 
@@ -210,13 +232,16 @@ impl SessionStore {
                         supported: STATE_VERSION,
                     });
                 }
-                // Explicit per-version migration seam. Today every loadable
-                // version shares the `Session` shape, so v1 loads as-is; when
-                // STATE_VERSION bumps, add an arm here that transforms the older
-                // shape forward. The `> STATE_VERSION` guard above means the
+                // Explicit per-version migration seam. v1→v2 is additive (a new
+                // `project_id` carried by `#[serde(default)]`), so both versions
+                // deserialize into the same `Session` shape and load as-is here;
+                // the owning project_id is stamped onto unstamped records by
+                // [`SessionStore::for_project`] (which preserves their stored
+                // session_id, so `--resume` survives). A structural bump would add
+                // a transforming arm. The `> STATE_VERSION` guard above means the
                 // wildcard is only reachable for already-handled versions.
                 let sessions = match persisted.version {
-                    1 => persisted.sessions,
+                    1 | 2 => persisted.sessions,
                     _ => persisted.sessions,
                 };
                 sessions.into_iter().map(|s| (s.issue.clone(), s)).collect()
@@ -229,27 +254,77 @@ impl SessionStore {
                 });
             }
         };
-        Ok(SessionStore { path, sessions })
+        Ok(SessionStore {
+            path,
+            project_id: String::new(),
+            sessions,
+        })
     }
 
-    /// The deterministic `claude` session id for an issue. Pure — same issue
-    /// always yields the same id, with or without a persisted record.
-    pub fn session_id_for(issue: &str) -> String {
-        Uuid::new_v5(&SESSION_NAMESPACE, issue.as_bytes()).to_string()
+    /// Claim this store for `project_id`: record it (so new records and their
+    /// deterministic ids are project-scoped) and stamp it onto any record that
+    /// lacks one — the v1→v2 migration for a pre-v1.5 `state.json`. Stored
+    /// `session_id`s are **preserved verbatim**, never recomputed, so a
+    /// migrated agent keeps the conversation `--resume` expects even though new
+    /// agents derive their id from `{project_id}:{issue}`.
+    pub fn for_project(mut self, project_id: &str) -> Self {
+        self.project_id = project_id.to_string();
+        for session in self.sessions.values_mut() {
+            if session.project_id.is_empty() {
+                session.project_id = project_id.to_string();
+            }
+        }
+        self
+    }
+
+    /// Open project `project_id`'s store at its per-project `state_path`,
+    /// adopting a legacy single-project `state.json` (`legacy_path`) when that's
+    /// the only file present — the v1→v1.5 upgrade. The adopted store is
+    /// redirected to persist forward to `state_path` (the legacy file is left in
+    /// place for rollback); every stored `session_id` is preserved. Pass
+    /// `legacy_path: None` (or for a project that doesn't own the repo's legacy
+    /// file) to skip adoption.
+    pub fn open_project(
+        project_id: &str,
+        state_path: PathBuf,
+        legacy_path: Option<PathBuf>,
+    ) -> Result<Self, StateError> {
+        if !state_path.exists()
+            && let Some(legacy) = legacy_path.filter(|p| p.exists())
+        {
+            let mut store = SessionStore::load(&legacy)?.for_project(project_id);
+            store.path = state_path;
+            return Ok(store);
+        }
+        Ok(SessionStore::load(state_path)?.for_project(project_id))
+    }
+
+    /// The deterministic `claude` session id for a `(project_id, issue)` pair.
+    /// Pure — the same pair always yields the same id, with or without a
+    /// persisted record, and the same issue in two projects yields two ids.
+    pub fn session_id_for(project_id: &str, issue: &str) -> String {
+        Uuid::new_v5(
+            &SESSION_NAMESPACE,
+            format!("{project_id}:{issue}").as_bytes(),
+        )
+        .to_string()
     }
 
     /// Get-or-create the record for `issue` running in `worktree_path` on
     /// `branch`. A fresh record starts `Spawning` with the deterministic session
-    /// id; an existing one is returned untouched (so `--resume` reuses its id).
+    /// id for this store's project; an existing one is returned untouched (so
+    /// `--resume` reuses its id).
     pub fn ensure(&mut self, issue: &str, worktree_path: PathBuf, branch: String) -> &Session {
         let now = now_unix();
+        let project_id = self.project_id.clone();
         self.sessions
             .entry(issue.to_string())
             .or_insert_with(|| Session {
                 issue: issue.to_string(),
+                session_id: Self::session_id_for(&project_id, issue),
+                project_id,
                 worktree_path,
                 branch,
-                session_id: Self::session_id_for(issue),
                 status: AgentStatus::Spawning,
                 transcript_path: None,
                 created_at: now,
@@ -349,6 +424,7 @@ impl SessionStore {
     pub fn empty(path: impl Into<PathBuf>) -> Self {
         SessionStore {
             path: path.into(),
+            project_id: String::new(),
             sessions: HashMap::new(),
         }
     }
@@ -359,7 +435,12 @@ impl SessionStore {
     /// / [`mutate_and_persist`] so blocking fs I/O never runs under the mutex.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, StateError> {
         let mut sessions: Vec<Session> = self.sessions.values().cloned().collect();
-        sessions.sort_by(|a, b| a.issue.cmp(&b.issue));
+        // Stable (project_id, issue) order so the file diffs cleanly even if a
+        // store ever held more than one project's sessions.
+        sessions.sort_by(|a, b| {
+            (a.project_id.as_str(), a.issue.as_str())
+                .cmp(&(b.project_id.as_str(), b.issue.as_str()))
+        });
         let persisted = Persisted {
             version: STATE_VERSION,
             sessions,
@@ -761,13 +842,97 @@ mod tests {
     }
 
     #[test]
-    fn session_id_is_deterministic_per_issue() {
-        let a = SessionStore::session_id_for("ENG-392");
-        let b = SessionStore::session_id_for("ENG-392");
-        let c = SessionStore::session_id_for("ENG-393");
-        assert_eq!(a, b, "same issue → same id");
+    fn session_id_is_deterministic_per_project_and_issue() {
+        let a = SessionStore::session_id_for("proj", "ENG-392");
+        let b = SessionStore::session_id_for("proj", "ENG-392");
+        let c = SessionStore::session_id_for("proj", "ENG-393");
+        assert_eq!(a, b, "same (project, issue) → same id");
         assert_ne!(a, c, "different issue → different id");
         assert!(Uuid::parse_str(&a).is_ok(), "it's a valid UUID");
+    }
+
+    #[test]
+    fn the_same_issue_in_two_projects_yields_distinct_session_ids() {
+        // The whole point of folding project_id into the v5 input: two projects'
+        // ENG-1 must be distinct conversations, never a shared --resume target.
+        let p1 = SessionStore::session_id_for("project-a", "ENG-1");
+        let p2 = SessionStore::session_id_for("project-b", "ENG-1");
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn a_v1_state_file_is_stamped_with_the_owning_project_but_keeps_its_session_id() {
+        // A pre-v1.5 file has no project_id and a session_id derived from the bare
+        // issue. The migration must stamp the owning project_id WITHOUT recomputing
+        // the id, or a running agent loses its conversation on the first restart.
+        let path = temp_state_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"sessions":[{"issue":"ENG-7","worktree_path":"/wt/ENG-7","branch":"felix/eng-7","session_id":"legacy-sid-keep-me","status":"idle","created_at":0,"updated_at":0}]}"#,
+        )
+        .unwrap();
+        let store = SessionStore::load(&path).unwrap().for_project("proj-x");
+        let s = store.get("ENG-7").unwrap();
+        assert_eq!(s.project_id, "proj-x", "the owning project is stamped");
+        assert_eq!(
+            s.session_id, "legacy-sid-keep-me",
+            "the stored id is preserved, not recomputed — --resume survives"
+        );
+    }
+
+    #[test]
+    fn open_project_adopts_a_legacy_state_json_then_persists_per_project() {
+        let dir = temp_state_path(); // .../<unique>/.lindep/state.json
+        let legacy = dir.clone();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        // A pre-v1.5 single-project store on disk.
+        {
+            let mut old = SessionStore::load(&legacy).unwrap();
+            old.ensure("ENG-1", "/wt/ENG-1".into(), "b".into());
+            old.save().unwrap();
+        }
+        let per_project = legacy.with_file_name("state.proj-x.json");
+        assert!(!per_project.exists());
+
+        let mut store =
+            SessionStore::open_project("proj-x", per_project.clone(), Some(legacy.clone()))
+                .unwrap();
+        // The legacy session was adopted and stamped…
+        assert_eq!(store.get("ENG-1").unwrap().project_id, "proj-x");
+        // …and future saves land in the per-project file, leaving the legacy one.
+        store.set_status("ENG-1", AgentStatus::Done);
+        store.save().unwrap();
+        assert!(per_project.exists(), "saved to the per-project path");
+        assert!(
+            legacy.exists(),
+            "legacy state.json is left in place for rollback"
+        );
+        let reloaded = SessionStore::load(&per_project).unwrap();
+        assert_eq!(reloaded.get("ENG-1").unwrap().status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn open_project_prefers_the_per_project_file_over_legacy() {
+        let legacy = temp_state_path();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        {
+            let mut old = SessionStore::load(&legacy).unwrap();
+            old.ensure("ENG-1", "/wt/legacy".into(), "legacy".into());
+            old.save().unwrap();
+        }
+        let per_project = legacy.with_file_name("state.proj-x.json");
+        {
+            let mut new = SessionStore::load(&per_project)
+                .unwrap()
+                .for_project("proj-x");
+            new.ensure("ENG-9", "/wt/new".into(), "new".into());
+            new.save().unwrap();
+        }
+        let store = SessionStore::open_project("proj-x", per_project, Some(legacy)).unwrap();
+        // The per-project file wins; the legacy file is ignored once it exists.
+        assert!(store.get("ENG-9").is_some(), "per-project file was loaded");
+        assert!(store.get("ENG-1").is_none(), "legacy was not adopted");
     }
 
     #[test]
@@ -900,7 +1065,9 @@ mod tests {
     fn reverse_lookups_map_session_id_and_cwd_to_issue() {
         let path = temp_state_path();
         let store = seeded(&path);
-        let sid = SessionStore::session_id_for("ENG-2");
+        // `seeded` builds the store via plain `load` (project_id ""), so ensure
+        // derives ids under the empty project.
+        let sid = SessionStore::session_id_for("", "ENG-2");
         assert_eq!(store.issue_for_session_id(&sid), Some("ENG-2"));
         assert_eq!(store.issue_for_cwd(Path::new("/wt/ENG-1")), Some("ENG-1"));
         assert_eq!(store.issue_for_cwd(Path::new("/nope")), None);

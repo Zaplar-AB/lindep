@@ -457,9 +457,16 @@ fn start_control_plane(
         Some(prefix) => worktree::WorktreeManager::with_prefix(&repo_root, prefix).ok()?,
         None => worktree::WorktreeManager::new(&repo_root).ok()?,
     };
-    let state_path = session::SessionStore::state_path(&repo_root);
+    // Per-project state file (`state.<project_id>.json`), adopting a legacy
+    // single-project `state.json` on first v1.5 boot so existing agents keep
+    // their resumable conversations.
+    let state_path = mapping.state_path();
     let store = Arc::new(Mutex::new(
-        match session::SessionStore::load(state_path.clone()) {
+        match session::SessionStore::open_project(
+            &active.id,
+            state_path.clone(),
+            Some(mapping.legacy_state_path()),
+        ) {
             Ok(store) => store,
             // A state file from a NEWER lindep must not be clobbered with our
             // older format — bail to the read-only viewer and say why.
@@ -475,7 +482,7 @@ fn start_control_plane(
                 let _ = events.send(event::AppEvent::Notification(format!(
                     "session state unreadable ({e}); starting fresh"
                 )));
-                session::SessionStore::empty(state_path)
+                session::SessionStore::empty(state_path).for_project(&active.id)
             }
         },
     ));

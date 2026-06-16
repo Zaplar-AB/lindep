@@ -79,6 +79,21 @@ impl ProjectMapping {
     pub fn hooks_dir(&self) -> PathBuf {
         self.repo_root.join(".lindep").join("hooks")
     }
+
+    /// `<repo_root>/.lindep/state.<project_id>.json` — this project's session
+    /// store, so two projects sharing a repo never share a state file.
+    pub fn state_path(&self) -> PathBuf {
+        self.repo_root
+            .join(".lindep")
+            .join(format!("state.{}.json", self.project_id))
+    }
+
+    /// The pre-v1.5 single-project `<repo_root>/.lindep/state.json`, adopted once
+    /// on upgrade (see [`crate::session::SessionStore::open_project`]). Delegates
+    /// to the canonical helper so the legacy path has one definition.
+    pub fn legacy_state_path(&self) -> PathBuf {
+        crate::session::SessionStore::state_path(&self.repo_root)
+    }
 }
 
 /// The resolved workspace mapping: every configured project keyed by its Linear
