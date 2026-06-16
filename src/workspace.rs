@@ -150,7 +150,7 @@ pub fn reconcile_and_rehydrate(
 /// view without falsely idling agents that are still live. A *fresh* plane gets
 /// this via [`reconcile_and_rehydrate`] in [`build_plane`] instead (which DOES
 /// downgrade, because a never-started project's records are from a dead process).
-pub fn reemit_statuses(store: &Arc<Mutex<SessionStore>>, events: &AppEventTx, project_id: &str) {
+fn reemit_statuses(store: &Arc<Mutex<SessionStore>>, events: &AppEventTx, project_id: &str) {
     if let Ok(store) = store.lock() {
         for session in store.sessions() {
             let _ = events.send(AppEvent::AgentStatusChanged {
@@ -168,7 +168,7 @@ pub fn reemit_statuses(store: &Arc<Mutex<SessionStore>>, events: &AppEventTx, pr
 /// (canonicalizing the worktree root, reading the state file, listing worktrees)
 /// run on the blocking pool so the workspace command loop never stalls. Returns
 /// `None` (with a footer line) if the worktree root can't be opened.
-pub async fn build_plane(
+async fn build_plane(
     rt: &Handle,
     builder: &PlaneBuilder,
     mapping: &ProjectMapping,

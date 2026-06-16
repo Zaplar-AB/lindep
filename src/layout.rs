@@ -28,7 +28,7 @@ const RAIL_WIDTH: u16 = 32;
 /// The big pane never shrinks below this. On a terminal too narrow to fit both a
 /// readable big pane and the rail, the rail is dropped — cards aren't drawn, but
 /// every window stays focusable (focusing it makes it the big pane).
-pub const MIN_BIG_WIDTH: u16 = 50;
+const MIN_BIG_WIDTH: u16 = 50;
 
 /// A window's placement on screen: its index into the window set and the `Rect`
 /// to draw it in. The renderer iterates these, so a window with no placement

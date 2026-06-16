@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -325,7 +324,7 @@ impl SessionStore {
     /// id for this store's project; an existing one is returned untouched (so
     /// `--resume` reuses its id).
     pub fn ensure(&mut self, issue: &str, worktree_path: PathBuf, branch: String) -> &Session {
-        let now = now_unix();
+        let now = crate::ledger::now_unix();
         let project_id = self.project_id.clone();
         self.sessions
             .entry(issue.to_string())
@@ -352,7 +351,7 @@ impl SessionStore {
     pub fn set_status(&mut self, issue: &str, status: AgentStatus) -> bool {
         if let Some(s) = self.sessions.get_mut(issue) {
             s.status = status;
-            s.updated_at = now_unix();
+            s.updated_at = crate::ledger::now_unix();
             true
         } else {
             false
@@ -363,7 +362,7 @@ impl SessionStore {
     pub fn set_transcript(&mut self, issue: &str, transcript_path: Option<PathBuf>) -> bool {
         if let Some(s) = self.sessions.get_mut(issue) {
             s.transcript_path = transcript_path;
-            s.updated_at = now_unix();
+            s.updated_at = crate::ledger::now_unix();
             true
         } else {
             false
@@ -751,18 +750,6 @@ impl CockpitState {
         let seq = COCKPIT_SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         SessionStore::write_snapshot(path, &bytes, seq)
     }
-}
-
-/// Unix seconds now, as advisory wall-clock metadata only. A clock somehow
-/// before the epoch yields 0 rather than panicking — a nonsensical timestamp is
-/// preferable to taking the cockpit down. Wall-clock can jump backward, so the
-/// values this feeds (`created_at`/`updated_at`) are non-monotonic and must not
-/// be used for ordering or staleness (use a monotonic source if that's needed).
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

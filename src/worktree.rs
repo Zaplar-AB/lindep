@@ -239,23 +239,7 @@ impl WorktreeManager {
         let root = self.worktrees_root();
         let mut result = Vec::new();
 
-        // Records are blank-line separated; within a record, `worktree <path>`
-        // and `branch refs/heads/<name>` are the lines we care about.
-        for record in out.split("\n\n") {
-            let mut path: Option<PathBuf> = None;
-            let mut branch: Option<String> = None;
-            for line in record.lines() {
-                if let Some(p) = line.strip_prefix("worktree ") {
-                    path = Some(PathBuf::from(p.trim()));
-                } else if let Some(b) = line.strip_prefix("branch ") {
-                    // Strip exactly one `refs/heads/` (not `trim_start_matches`,
-                    // which would peel a repeated prefix), leaving any other ref
-                    // form intact.
-                    let raw = b.trim();
-                    branch = Some(raw.strip_prefix("refs/heads/").unwrap_or(raw).to_string());
-                }
-            }
-            let Some(path) = path else { continue };
+        for (path, branch) in parse_porcelain(&out) {
             // A managed worktree always has a branch checked out (we only ever
             // create it via `worktree add -b`/`add <branch>`). Porcelain emits
             // no `branch …` line for a detached HEAD, so a record with no branch
@@ -263,7 +247,10 @@ impl WorktreeManager {
             // surface an empty-string branch that would be persisted downstream
             // and silently corrupt the issue→branch mapping. A subsequent
             // `create` reclaims the orphan checkout deterministically.
-            let Some(branch) = branch else { continue };
+            let Some(raw) = branch else { continue };
+            // Strip exactly one `refs/heads/` (not `trim_start_matches`, which
+            // would peel a repeated prefix), leaving any other ref form intact.
+            let branch = raw.strip_prefix("refs/heads/").unwrap_or(raw).to_string();
             // Keep only an immediate `<root>/<ISSUE>` child — not the root
             // itself, nor anything nested deeper.
             if let Ok(rel) = path.strip_prefix(&root)
@@ -373,21 +360,9 @@ impl WorktreeManager {
     fn branch_holder(&self, branch: &str) -> Result<Option<PathBuf>, WorktreeError> {
         let out = self.git(&["worktree", "list", "--porcelain"])?;
         let wanted = format!("refs/heads/{branch}");
-        for record in out.split("\n\n") {
-            let mut path: Option<PathBuf> = None;
-            let mut holds = false;
-            for line in record.lines() {
-                if let Some(p) = line.strip_prefix("worktree ") {
-                    path = Some(PathBuf::from(p.trim()));
-                } else if let Some(b) = line.strip_prefix("branch ") {
-                    holds = b.trim() == wanted.as_str();
-                }
-            }
-            if holds && let Some(path) = path {
-                return Ok(Some(path));
-            }
-        }
-        Ok(None)
+        Ok(parse_porcelain(&out)
+            .find(|(_, b)| *b == Some(wanted.as_str()))
+            .map(|(path, _)| path))
     }
 
     /// Whether a local branch exists. `show-ref --verify --quiet` exits 0 if the
@@ -463,6 +438,26 @@ fn slugify(title: &str) -> String {
     }
     out.truncate(40);
     out.trim_matches('-').to_string()
+}
+
+/// Parse `git worktree list --porcelain` into `(path, branch)` records. Records
+/// are blank-line separated; within a record, `worktree <path>` and
+/// `branch <ref>` are the lines we care about. `branch` is the raw `refs/heads/…`
+/// ref (or `None` for a detached HEAD, which porcelain omits) — each caller
+/// interprets it. A record with no `worktree` line is skipped.
+fn parse_porcelain(out: &str) -> impl Iterator<Item = (PathBuf, Option<&str>)> {
+    out.split("\n\n").filter_map(|record| {
+        let mut path = None;
+        let mut branch = None;
+        for line in record.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p.trim()));
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                branch = Some(b.trim());
+            }
+        }
+        path.map(|p| (p, branch))
+    })
 }
 
 #[cfg(test)]

@@ -119,7 +119,7 @@ pub fn status_glyph(status: Status) -> (&'static str, Color) {
 
 /// Braille spinner frames — one single-width cell, so swapping frames never
 /// shifts a column. Eight frames at ~10 fps is a smooth, calm rotation.
-pub const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 /// The spinner glyph for a given animation frame.
 pub fn agent_spinner(frame: u64) -> &'static str {
