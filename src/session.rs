@@ -466,13 +466,6 @@ impl SessionStore {
         &self.path
     }
 
-    /// The Linear project this store's sessions belong to (empty until claimed
-    /// via [`for_project`](Self::for_project)). The notification bus tags the
-    /// events it emits with this so a hook is filed under the right project.
-    pub fn project_id(&self) -> &str {
-        &self.project_id
-    }
-
     /// All persisted sessions, for seeding the fleet view on a cockpit restart.
     pub fn sessions(&self) -> impl Iterator<Item = &Session> {
         self.sessions.values()

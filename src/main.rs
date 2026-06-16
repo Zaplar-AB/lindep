@@ -496,13 +496,22 @@ fn start_control_plane(
     // before the first paint.
     let resumable = workspace::reconcile_and_rehydrate(&worktree, &store, &events, &active.id);
 
+    // Workspace store registry: the one loopback hook endpoint and the global
+    // fleet view resolve hooks/sessions across every project through it. Seed it
+    // with the active project's store; background projects add theirs as their
+    // planes build.
+    let stores: workspace::StoreRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut registry) = stores.lock() {
+        registry.insert(active.id.clone(), Arc::clone(&store));
+    }
+
     // The hook endpoint must bind before agents launch so their settings can
     // point at it. block_on is safe here — we're on the synchronous main thread.
     let notify::Endpoint {
         port: hook_port,
         token: hook_token,
     } = runtime
-        .block_on(notify::serve(events.clone(), Arc::clone(&store)))
+        .block_on(notify::serve(events.clone(), Arc::clone(&stores)))
         .ok()?;
 
     let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("lindep").to_path_buf());
@@ -547,7 +556,7 @@ fn start_control_plane(
         },
     );
     let (ws_handle, ws_join) =
-        workspace::Workspace::start(runtime.handle().clone(), builder, config, planes);
+        workspace::Workspace::start(runtime.handle().clone(), builder, config, planes, stores);
     app.active_project = active.id.clone();
     app.workspace = Some(ws_handle.clone());
 

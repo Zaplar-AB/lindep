@@ -32,6 +32,12 @@ use crate::session::{AgentStatus, SessionStore};
 use crate::supervisor::{Supervisor, SupervisorConfig, SupervisorHandle};
 use crate::worktree::WorktreeManager;
 
+/// Every started project's session store, keyed by `project_id`. Shared between
+/// the workspace (which inserts a store when it builds a project's plane) and the
+/// notification bus (which scans the stores to resolve a hook back to its
+/// `(project_id, issue)`) and the global fleet view (which reads them all).
+pub type StoreRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<SessionStore>>>>>;
+
 /// The shared, per-project-invariant ingredients for building a supervisor:
 /// everything a [`SupervisorConfig`] needs except the project's own worktree,
 /// store and id. One builder serves every project so the workspace-wide cap and
@@ -142,6 +148,7 @@ pub async fn build_plane(
     rt: &Handle,
     builder: &PlaneBuilder,
     mapping: &ProjectMapping,
+    stores: &StoreRegistry,
 ) -> Option<ProjectPlane> {
     let repo_root = mapping.repo_root.clone();
     let branch_prefix = mapping.branch_prefix.clone();
@@ -181,6 +188,11 @@ pub async fn build_plane(
         Err(_) => return None,
     };
     let store = Arc::new(Mutex::new(store));
+    // Register the store so the notification bus and the global view can find this
+    // project's sessions even while you're inside another project.
+    if let Ok(mut registry) = stores.lock() {
+        registry.insert(mapping.project_id.clone(), Arc::clone(&store));
+    }
 
     // Reconcile + rehydrate off the workers (worktree.list() shells out to git).
     {
@@ -262,6 +274,7 @@ pub struct Workspace {
     builder: PlaneBuilder,
     config: WorkspaceConfig,
     planes: HashMap<String, ProjectPlane>,
+    stores: StoreRegistry,
 }
 
 impl Workspace {
@@ -274,6 +287,7 @@ impl Workspace {
         builder: PlaneBuilder,
         config: WorkspaceConfig,
         initial: HashMap<String, ProjectPlane>,
+        stores: StoreRegistry,
     ) -> (WorkspaceHandle, JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let spawn_handle = rt.clone();
@@ -282,6 +296,7 @@ impl Workspace {
             builder,
             config,
             planes: initial,
+            stores,
         };
         let join = spawn_handle.spawn(workspace.run(cmd_rx));
         (WorkspaceHandle { cmd_tx }, join)
@@ -339,7 +354,7 @@ impl Workspace {
                 return None;
             }
         };
-        let plane = build_plane(&self.rt, &self.builder, &mapping).await?;
+        let plane = build_plane(&self.rt, &self.builder, &mapping, &self.stores).await?;
         let handle = plane.handle.clone();
         self.planes.insert(project_id.to_string(), plane);
         Some(handle)
@@ -426,7 +441,13 @@ mod tests {
         // (A real boot supplies branch_prefix via projects.toml; ensure_mapped
         // defaults it to None, which is fine — the worktree manager picks one.)
 
-        let (ws, join) = Workspace::start(Handle::current(), b, config, HashMap::new());
+        let (ws, join) = Workspace::start(
+            Handle::current(),
+            b,
+            config,
+            HashMap::new(),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
 
         // Launch ENG-1 in BOTH projects: distinct worktree roots, so both spawn.
         ws.launch("proj-a".into(), "ENG-1".into(), "one".into(), None);
@@ -463,6 +484,7 @@ mod tests {
             b,
             WorkspaceConfig::default(),
             HashMap::new(),
+            Arc::new(Mutex::new(HashMap::new())),
         );
 
         ws.launch("ghost".into(), "ENG-1".into(), "x".into(), None);

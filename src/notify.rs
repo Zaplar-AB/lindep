@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 use crate::event::{AppEvent, AppEventTx};
 use crate::session::{AgentStatus, SessionStore};
+use crate::workspace::StoreRegistry;
 
 /// Cap on a hook request we'll read, so a misbehaving client can't grow memory
 /// unbounded. Hook payloads are a few hundred bytes.
@@ -108,10 +109,7 @@ pub struct Endpoint {
 /// bearer token, and return both (to hand to agents via the hook settings). The
 /// accept loop runs as a detached task on the current runtime for the cockpit's
 /// lifetime.
-pub async fn serve(
-    events: AppEventTx,
-    store: Arc<Mutex<SessionStore>>,
-) -> std::io::Result<Endpoint> {
+pub async fn serve(events: AppEventTx, stores: StoreRegistry) -> std::io::Result<Endpoint> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     // An opaque, unguessable per-run secret. v4 UUIDs are CSPRNG-backed
@@ -137,7 +135,7 @@ pub async fn serve(
                         continue;
                     };
                     let events = events.clone();
-                    let store = Arc::clone(&store);
+                    let stores = stores.clone();
                     let token = Arc::clone(&token);
                     // Bound each connection so a stalled peer can't pin a task +
                     // fd forever; the only legitimate client posts and closes
@@ -145,7 +143,7 @@ pub async fn serve(
                     tokio::spawn(async move {
                         let _ = tokio::time::timeout(
                             CONN_TIMEOUT,
-                            handle_conn(stream, events, store, &token),
+                            handle_conn(stream, events, stores, &token),
                         )
                         .await;
                         drop(permit); // release the in-flight slot
@@ -180,7 +178,7 @@ pub async fn serve(
 async fn handle_conn(
     mut stream: TcpStream,
     events: AppEventTx,
-    store: Arc<Mutex<SessionStore>>,
+    stores: StoreRegistry,
     token: &str,
 ) {
     if let Some(req) = read_request(&mut stream).await
@@ -190,7 +188,7 @@ async fn handle_conn(
         && req.token.as_deref() == Some(token)
     {
         match serde_json::from_slice::<HookPayload>(&req.body) {
-            Ok(payload) => route(&payload, &store, &events).await,
+            Ok(payload) => route(&payload, &stores, &events).await,
             // An authenticated but unparseable hook is dropped silently *unless*
             // it lacked a Content-Length — the likeliest cause of a future
             // forwarder/transport regression (e.g. chunked encoding), which
@@ -211,24 +209,54 @@ async fn handle_conn(
     let _ = stream.shutdown().await;
 }
 
-/// Map a hook to an issue and emit the corresponding event. An unmapped session
-/// still surfaces a footer notification rather than vanishing.
-async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: &AppEventTx) {
+/// Map a hook to its `(project_id, issue)` and emit the corresponding event. The
+/// one shared loopback endpoint serves the whole workspace: a hook carries only a
+/// `session_id`/`cwd`, so we scan every started project's store to find the owner
+/// (a hook-supplied project id would be loopback-forgeable, so it's never
+/// trusted). An unmapped session still surfaces a footer rather than vanishing.
+async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventTx) {
     let event_name = payload.hook_event_name.as_deref().unwrap_or("");
 
+    // Find the project whose store owns this hook. Snapshot the (project_id, store)
+    // candidates under the registry lock, release it, then scan each store — so the
+    // registry lock is never held across an inner store lock (no nested-lock order
+    // to deadlock on). The per-hook linear scan is cheap at expected agent counts;
+    // a session_id index would be premature.
+    let candidates: Vec<(String, Arc<Mutex<SessionStore>>)> = match stores.lock() {
+        Ok(reg) => reg
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect(),
+        Err(_) => return,
+    };
+    let n_projects = candidates.len();
+    let resolved = candidates.into_iter().find(|(_, store)| {
+        store
+            .lock()
+            .map(|s| resolve_issue(payload, &s).is_some())
+            .unwrap_or(false)
+    });
+    let Some((project_id, store)) = resolved else {
+        // No project's store recognizes this session — surface one footer line
+        // rather than dropping it silently (a forwarder/transport regression would
+        // otherwise make every prompt vanish).
+        let _ = events.send(AppEvent::Notification(format!(
+            "hook {:?} from a session unmapped across {n_projects} project(s)",
+            clamp_display(event_name)
+        )));
+        return;
+    };
+
     // Resolve the issue, capture the transcript path, and apply the hook-implied
-    // status under a *single* lock acquisition, then PERSIST the durable store so
-    // it tracks the live fleet: a restart must see NeedsYou/Idle (not the stale
-    // Spawning the supervisor last wrote), and the transcript path must survive
-    // even if no further status write happens. Snapshot under the lock; the
-    // blocking write runs after the guard drops so a rename never stalls another
-    // hook on the mutex. A poisoned lock drops the hook rather than panicking.
-    let (issue, project_id, snapshot, notif_needs_you) = match store.lock() {
+    // status under a *single* lock acquisition on the owning project's store, then
+    // PERSIST it so the durable state tracks the live fleet: a restart must see
+    // NeedsYou/Idle (not the stale Spawning the supervisor last wrote), and the
+    // transcript path must survive even if no further status write happens.
+    // Snapshot under the lock; the blocking write runs after the guard drops so a
+    // rename never stalls another hook. A poisoned lock drops the hook.
+    let (issue, snapshot, notif_needs_you) = match store.lock() {
         Ok(mut store) => {
             let issue = resolve_issue(payload, &store);
-            // Tag the events this hook produces with the store's owning project so
-            // the cockpit files them under the right project's fleet.
-            let project_id = store.project_id().to_string();
             let mut dirty = false;
 
             // Transcript path: kept as a path, never inlined. Accept it only if
@@ -299,7 +327,7 @@ async fn route(payload: &HookPayload, store: &Arc<Mutex<SessionStore>>, events: 
             } else {
                 None
             };
-            (issue, project_id, snapshot, notif_needs_you)
+            (issue, snapshot, notif_needs_you)
         }
         Err(_) => return,
     };
@@ -657,6 +685,75 @@ mod tests {
         Arc::new(Mutex::new(store))
     }
 
+    /// Wrap a single store in a one-project registry — the workspace shape the
+    /// endpoint now serves. The project key is empty (the test stores load via
+    /// `SessionStore::load`, which leaves `project_id` unset); the events the bus
+    /// emits then carry `project_id: ""`, which the assertions don't inspect.
+    fn registry_of(store: Arc<Mutex<SessionStore>>) -> StoreRegistry {
+        Arc::new(Mutex::new(std::collections::HashMap::from([(
+            String::new(),
+            store,
+        )])))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_resolves_to_the_right_project_when_two_share_an_issue_key() {
+        // The workspace rekey's core promise: with several projects live behind one
+        // endpoint, a hook for ENG-1 must reach the project whose worktree/session
+        // it actually came from — never the other project's same-keyed ENG-1.
+        let mk = |pid: &str, wt: &str| -> Arc<Mutex<SessionStore>> {
+            let path = std::env::temp_dir()
+                .join(format!("lindep-notify-{pid}-{}.json", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let mut store = SessionStore::load(&path).unwrap().for_project(pid);
+            store.ensure("ENG-1", wt.into(), "b".into());
+            Arc::new(Mutex::new(store))
+        };
+        let a = mk("proj-a", "/wt/a/ENG-1");
+        let b = mk("proj-b", "/wt/b/ENG-1");
+        let registry: StoreRegistry = Arc::new(Mutex::new(std::collections::HashMap::from([
+            ("proj-a".to_string(), Arc::clone(&a)),
+            ("proj-b".to_string(), Arc::clone(&b)),
+        ])));
+        let (tx, mut rx) = crate::event::channel();
+
+        // A hook carrying project B's ENG-1 session id resolves to (proj-b, ENG-1).
+        let payload = HookPayload {
+            session_id: Some(SessionStore::session_id_for("proj-b", "ENG-1")),
+            hook_event_name: Some("Stop".into()),
+            ..Default::default()
+        };
+        route(&payload, &registry, &tx).await;
+        match rx.try_recv().expect("an event was emitted") {
+            AppEvent::AgentStatusChanged {
+                project_id, issue, ..
+            } => assert_eq!(
+                (project_id.as_str(), issue.as_str()),
+                ("proj-b", "ENG-1"),
+                "the session id routed to project B"
+            ),
+            other => panic!("expected AgentStatusChanged, got {other:?}"),
+        }
+
+        // And one carrying project A's worktree cwd resolves to (proj-a, ENG-1).
+        let payload = HookPayload {
+            cwd: Some("/wt/a/ENG-1".into()),
+            hook_event_name: Some("Stop".into()),
+            ..Default::default()
+        };
+        route(&payload, &registry, &tx).await;
+        match rx.try_recv().expect("an event was emitted") {
+            AppEvent::AgentStatusChanged {
+                project_id, issue, ..
+            } => assert_eq!(
+                (project_id.as_str(), issue.as_str()),
+                ("proj-a", "ENG-1"),
+                "the cwd routed to project A"
+            ),
+            other => panic!("expected AgentStatusChanged, got {other:?}"),
+        }
+    }
+
     /// Drain every queued event into a vec, polling briefly so the off-thread
     /// handler has a chance to route before we look.
     async fn drain(rx: &mut crate::event::AppEventRx) -> Vec<AppEvent> {
@@ -822,7 +919,7 @@ mod tests {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
         let sid = SessionStore::session_id_for("", "ENG-1");
-        let Endpoint { port, token } = serve(tx, store).await.unwrap();
+        let Endpoint { port, token } = serve(tx, registry_of(store)).await.unwrap();
 
         // The idle nudge Claude fires ~60 s after a turn: same hook as a real
         // prompt, but it must surface quietly (AgentAction), never AgentNeedsYou.
@@ -859,7 +956,7 @@ mod tests {
             .unwrap()
             .set_status("ENG-1", AgentStatus::Spawning);
         let sid = SessionStore::session_id_for("", "ENG-1");
-        let Endpoint { port, token } = serve(tx, Arc::clone(&store)).await.unwrap();
+        let Endpoint { port, token } = serve(tx, registry_of(Arc::clone(&store))).await.unwrap();
 
         let body = json!({
             "session_id": sid, "cwd": "/wt/ENG-1",
@@ -886,7 +983,7 @@ mod tests {
         let store = seeded_store();
         let sid1 = SessionStore::session_id_for("", "ENG-1");
         let sid2 = SessionStore::session_id_for("", "ENG-2");
-        let Endpoint { port, token } = serve(tx, store).await.unwrap();
+        let Endpoint { port, token } = serve(tx, registry_of(store)).await.unwrap();
 
         // ENG-1 raises a permission prompt; ENG-2 stops. Posted back to back.
         let body1 = json!({
@@ -933,7 +1030,7 @@ mod tests {
     async fn an_unmapped_session_still_surfaces_a_notification() {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
-        let Endpoint { port, token } = serve(tx, store).await.unwrap();
+        let Endpoint { port, token } = serve(tx, registry_of(store)).await.unwrap();
         let body =
             json!({ "session_id": "unknown", "hook_event_name": "Notification" }).to_string();
         post_hook(port, &token, body.as_bytes()).unwrap();
@@ -961,7 +1058,7 @@ mod tests {
         // exercising the cwd arm end to end.
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
-        let Endpoint { port, token } = serve(tx, store).await.unwrap();
+        let Endpoint { port, token } = serve(tx, registry_of(store)).await.unwrap();
 
         // No `session_id` at all → resolution must fall back to cwd = /wt/ENG-2.
         let body = json!({
@@ -996,7 +1093,7 @@ mod tests {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
         let sid = SessionStore::session_id_for("", "ENG-1");
-        let Endpoint { port, token } = serve(tx, store).await.unwrap();
+        let Endpoint { port, token } = serve(tx, registry_of(store)).await.unwrap();
         let body = json!({
             "session_id": sid, "hook_event_name": "Notification",
             "notification_type": "permission_prompt"
@@ -1034,7 +1131,7 @@ mod tests {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
         let sid = SessionStore::session_id_for("", "ENG-1");
-        let Endpoint { port, token } = serve(tx, store).await.unwrap();
+        let Endpoint { port, token } = serve(tx, registry_of(store)).await.unwrap();
 
         // (1) Authenticated but non-JSON body → no AgentNeedsYou; server lives.
         post_hook(port, &token, b"not json at all").unwrap();
@@ -1083,7 +1180,7 @@ mod tests {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
         let sid = SessionStore::session_id_for("", "ENG-1");
-        let Endpoint { port, token } = serve(tx, store).await.unwrap();
+        let Endpoint { port, token } = serve(tx, registry_of(store)).await.unwrap();
 
         // With a tool_name → "ran <tool>".
         let with_tool = json!({
@@ -1118,7 +1215,7 @@ mod tests {
         let (tx, mut rx) = crate::event::channel();
         let store = seeded_store();
         let sid = SessionStore::session_id_for("", "ENG-1");
-        let Endpoint { port, token } = serve(tx, Arc::clone(&store)).await.unwrap();
+        let Endpoint { port, token } = serve(tx, registry_of(Arc::clone(&store))).await.unwrap();
 
         // A PostToolUse carrying a transcript path *inside* ENG-1's worktree.
         let inside = json!({
