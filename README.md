@@ -66,7 +66,7 @@ keep your selection in sight.
 Move the selection on the spine and an open dependency window re-aims instantly.
 Focus a dependency window (<kbd>Ctrl-A</kbd> <kbd>→</kbd>) and press
 <kbd>Enter</kbd> on any node to *re-root* the lens on it and walk the graph one hop
-at a time; <kbd>Tab</kbd> flips between its upstream and downstream trees.
+at a time; <kbd>←</kbd>/<kbd>→</kbd> (or <kbd>h</kbd>/<kbd>l</kbd>) flip between its upstream and downstream trees.
 
 When the **spine** is focused:
 
@@ -81,12 +81,16 @@ When the **spine** is focused:
 | <kbd>s</kbd> | sort: ready / blocked / status / priority / id |
 | <kbd>c</kbd> | jump through issues that sit on a cycle |
 | <kbd>r</kbd> | flip the spine: issue list ↔ agents roster |
+| <kbd>i</kbd> | summary card for the selected issue (details + deps) |
+| <kbd>t</kbd> | agent run ledger for the selected issue (its session history) |
 | <kbd>?</kbd> | help (quit is <kbd>Ctrl-A</kbd> <kbd>q</kbd> — see the cockpit, below) |
 
 When a **dependency window** is focused: <kbd>↑</kbd>/<kbd>↓</kbd> move,
-<kbd>←</kbd>/<kbd>→</kbd> · <kbd>Tab</kbd> switch the active tree (upstream ↔
-downstream), <kbd>Enter</kbd> re-root onto the selected node, <kbd>Space</kbd>
-collapse / expand, <kbd>b</kbd>/<kbd>Backspace</kbd> back to the previous root.
+<kbd>←</kbd>/<kbd>→</kbd> (or <kbd>h</kbd>/<kbd>l</kbd>) switch the active tree
+(upstream ↔ downstream), <kbd>Enter</kbd> re-root onto the selected node,
+<kbd>Space</kbd> collapse / expand, <kbd>b</kbd>/<kbd>Backspace</kbd> back to the
+previous root. <kbd>Tab</kbd> flips a docked agent window between its chat and
+deps faces.
 Window management (focus, zoom, pin, close, layout) lives behind the
 <kbd>Ctrl-A</kbd> prefix — see the cockpit section.
 
@@ -120,13 +124,16 @@ twice to send a literal `Ctrl-A` through to the agent).
 | <kbd>Ctrl-A</kbd> <kbd>p</kbd> | Pin / unpin the focused window — pinned windows persist and auto-resume on restart |
 | <kbd>Ctrl-A</kbd> <kbd>w</kbd> | Close = undock the focused window (the agent keeps running) |
 | <kbd>Ctrl-A</kbd> <kbd>x</kbd> | Kill the focused agent (confirmed) |
-| <kbd>Ctrl-A</kbd> <code>&#124;</code> | Toggle the layout: filmstrip ⇄ mosaic |
+| <kbd>Ctrl-A</kbd> <code>&#124;</code> | Pin the layout: rail ⇄ mosaic (otherwise auto, by docked-window count) |
+| <kbd>Ctrl-A</kbd> <kbd>s</kbd> | Switch project (opens the project switcher) |
+| <kbd>Ctrl-A</kbd> <kbd>g</kbd> | Jump focus home to the spine |
 | <kbd>Ctrl-A</kbd> <kbd>q</kbd> | Quit the cockpit |
 | <kbd>n</kbd> | Jump to the next issue whose agent needs you |
 | <kbd>r</kbd> | Flip the spine: issue list ↔ agents roster |
+| <kbd>i</kbd> · <kbd>t</kbd> | Summary card · agent run ledger for the selected issue |
 
 Each issue **row** carries its agent's state two ways: a whole-row colour tint
-plus a trailing marker — `◌` spawning · `▸` running · `⚑` needs you (the row
+plus a marker in a fixed left gutter — `◌` spawning · `⠙` running (an animated spinner) · `⚑` needs you (the row
 breathes) · `◦` idle · `✓` done · `✗` failed; the header shows a fleet summary
 (`3 agents · 1 needs you`). The **agents roster** (`r`) is a salience-sorted tab
 on the spine — needs-you first, then live work, then idle, then finished — so
@@ -134,8 +141,9 @@ triage is one glance.
 
 Open as many **agent windows** as fit side by side and drive each live `claude`
 directly — the focused window gets every keystroke, so answering a prompt or
-nudging an agent is just focusing its column and typing. Tile them as a scrolling
-**filmstrip** or a **mosaic** (<kbd>Ctrl-A</kbd> <code>&#124;</code>); zoom one
+nudging an agent is just focusing its column and typing. They tile automatically
+by count — a **mosaic** for a few, a scrolling **rail** beyond that — or pin a
+layout yourself (<kbd>Ctrl-A</kbd> <code>&#124;</code>); zoom one
 full-screen (<kbd>Ctrl-A</kbd> <kbd>z</kbd>); **pin** the ones worth keeping
 (<kbd>Ctrl-A</kbd> <kbd>p</kbd>) — pinned windows and the layout persist to
 `.lindep/cockpit.json` and **auto-resume** on the next launch (`--no-resume`
@@ -147,6 +155,16 @@ lindep persists each agent's `session_id` and `--resume`s it on relaunch, so the
 *process* is disposable but the *conversation* is not. All cockpit state lives
 under `.lindep/` (gitignored); outside a git repo (or with `--demo`) lindep is
 just the graph viewer.
+
+### Multiple projects
+
+lindep is multi-project. Map each Linear project to a repo in
+`<repo>/.lindep/projects.toml`, then switch between them in-cockpit with
+<kbd>Ctrl-A</kbd> <kbd>s</kbd>. Backing out of a project never stops its agents —
+each project keeps its own supervised fleet running while you work in another.
+A backgrounded project with an agent waiting on you shows a `⚑N elsewhere` badge
+in the header (and a `⚑` beside it in the switcher), so a prompt is never lost no
+matter which project is open.
 
 ### Rebinding keys
 
@@ -172,9 +190,10 @@ layout = "|"
 
 Direct-key action names: `move-up` `move-down` `switch-side` `enter`
 `toggle-collapse` `back` `deps` `fleet` `jump-cycle` `jump-needs-you` `agents`
-`filter` `sort` `search` `help`. Verb names: `focus-left` `focus-right` `zoom`
-`pin` `close` `kill` `layout` `open` `quit` `search` `help` `roster`
-`jump-needs-you`.
+`filter` `sort` `search` `help` `summary` `ledger` `context`. Verb names:
+`focus-left` `focus-right` `focus-nav` `zoom` `pin` `close` `kill` `layout`
+`open` `quit` `search` `help` `roster` `jump-needs-you` `summary` `ledger`
+`context` `switch-project` `command-mode`.
 
 Keys: single chars (`a`, `/`), `f1`–`f12`, the named keys (`enter` `tab` `space`
 `up` `down` `left` `right` `home` `end` `pageup` `pagedown` `backspace` `delete`
@@ -227,7 +246,10 @@ Modules: `model` (graph + cycle/level algorithms, pure), `linear` (GraphQL
 client), `app` (state + input), `ui` (ratatui rendering), `theme` (palette),
 `demo` (synthetic graph). Cockpit spine: `event` (tokio runtime + `AppEvent`
 channel), `worktree` (one git worktree/branch per issue), `session` (durable
-issue↔session-id state), `backend` (the `AgentBackend` trait + PTY-hosted Claude
-backend), `notify` (Claude hooks → loopback endpoint → events), `supervisor`
-(launch / cancel / shutdown of the agent fleet), `keymap` (remappable bindings
-from `config.toml`).
+per-`(project, issue)` session-id state), `backend` (the `AgentBackend` trait +
+PTY-hosted Claude backend), `notify` (Claude hooks → loopback endpoint → events),
+`supervisor` (launch / cancel / shutdown of the agent fleet), `keymap`
+(remappable bindings from `config.toml`), `window` + `layout` (the tiling window
+manager), `picker` (project picker / switcher), `projects` (project↔repo mapping
+in `.lindep/projects.toml`), `workspace` (one supervised fleet per project, kept
+alive across switches), `ledger` (durable per-issue agent run history).

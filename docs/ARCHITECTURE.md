@@ -1,5 +1,10 @@
 # lindep architecture — the v1 multi-agent spine
 
+> **Status (2026-06): partly stale — full rewrite deferred to v1.6.**
+> This file describes the **v1 spine + the Cockpit-v2 "chat wall" UI**. Two things have since changed and are only partly reflected below:
+> - **v1.5 multi-project**: the session store, supervisor, and notification bus are now keyed by `(project_id, issue)` (not `issue`); `STATE_VERSION` is `2`; per-project state lives at `.lindep/state.<project_id>.json`; there are new `projects`, `workspace`, `picker`, and `ledger` modules; hooks now carry an `x-lindep-token` and route via a workspace-wide registry.
+> - **Cockpit v3.2**: the live UI is a `Ctrl-a`-prefixed tiling window manager (Spine / Coin / Fleet, auto mosaic/rail) — **not** the chat-wall / composer model the Operating Guide below still describes. `i` = issue summary and `t` = ledger (there is no composer). For current keybindings, trust the **README** and the in-app `?` overlay, not this file.
+
 This is the connective-tissue doc: how the pieces fit, where work runs, how data
 flows, and how to operate the cockpit. Per-module and per-item details live in
 the source as `//!` / `///` docs (`cargo doc --open` renders them). The original
@@ -184,6 +189,8 @@ connection with a timeout, and survives transient `accept()` errors.
 
 ## Operating guide
 
+> ⚠️ This UI section predates Cockpit v3.2 and is obsolete — see the README for current keybindings.
+
 ```sh
 cargo run                    # cockpit, in a git repo (or: cargo run -- "Project")
 cargo run -- --demo          # graph viewer only, no agents, no key needed
@@ -283,7 +290,7 @@ function key does not.
 
 ## Testing
 
-81 tests run headlessly. Notably: the worktree manager against a real temp git
+272 tests run headlessly. Notably: the worktree manager against a real temp git
 repo; the session store round-trip/reconcile; the hook endpoint via real loopback
 POSTs mapping concurrent agents; the **PTY plumbing end-to-end against a non-`claude`
 program** (`sh`); the supervisor (launch/cancel/shutdown/relaunch/reap) against a
