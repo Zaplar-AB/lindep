@@ -1086,6 +1086,35 @@ fn render_help(app: &App, frame: &mut Frame) {
             verb(Action::LayoutToggle),
             "force rail ⇄ mosaic (auto by coin count)",
         ),
+        (format!("— workspace ({} prefix) —", app.prefix_label()), ""),
+        (
+            verb(Action::SwitchProject),
+            "switch project (set one up the first time you open it)",
+        ),
+        (
+            verb(Action::ConfigureProject),
+            "(re)configure this project's repos / scratch — applies on restart",
+        ),
+        (
+            verb(Action::GlobalView),
+            "global all-agents screen (every project)",
+        ),
+        (
+            verb(Action::OpenInEditor),
+            "open the focused agent's workspace in your editor",
+        ),
+        (
+            verb(Action::DiscardWorkspace),
+            "discard a finished issue's workspace (push + remove worktrees)",
+        ),
+        (
+            verb(Action::ReclaimMirrors),
+            "reclaim disk: free unreferenced mirrors",
+        ),
+        (
+            verb(Action::CommandMode),
+            "command mode: verbs without re-pressing the prefix",
+        ),
         (verb(Action::Quit), "quit the cockpit"),
     ];
 

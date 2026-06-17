@@ -44,6 +44,10 @@ uuid = { version = "1", features = ["v4", "v5"] }
 thiserror = "2"
 # Personal/repo config (currently the remappable keymap) in `config.toml`.
 toml = "0.8"
+# Format-preserving TOML editing for the onboarding wizard: it appends/edits
+# `[[repo]]`/`[[project]]` entries in `registry.toml` without disturbing the user's
+# existing comments or ordering (the `toml` crate's serializer can't round-trip those).
+toml_edit = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 # Signal the agent's whole process group on stop so PTY descendants die with it.

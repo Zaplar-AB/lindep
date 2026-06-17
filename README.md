@@ -110,8 +110,10 @@ When the active Linear project is registered in `~/.lindep/registry.toml` (see
 per issue, each in its own git worktree + branch, in a workspace lindep clones and
 owns (you can run it from anywhere, not just inside a checkout). Linear stays the
 source of truth; lindep is the visibility + orchestration layer (it spawns the
-real `claude`, it does not reimplement it). With `--demo`, or for an unregistered
-project, lindep is just the read-only graph viewer.
+real `claude`, it does not reimplement it). Open a project that isn't registered
+yet and lindep walks you through connecting it to a repo (see
+[Managed workspaces](#managed-workspaces-v16)); with `--demo` it stays the
+read-only graph viewer.
 
 The cockpit is a **tiling window manager**: a horizontal strip of focusable
 columns — the permanent **spine** (issue list / agents roster), live **agent**
@@ -130,6 +132,11 @@ twice to send a literal `Ctrl-A` through to the agent).
 | <kbd>Ctrl-A</kbd> <kbd>x</kbd> | Kill the focused agent (confirmed) |
 | <kbd>Ctrl-A</kbd> <code>&#124;</code> | Pin the layout: rail ⇄ mosaic (otherwise auto, by docked-window count) |
 | <kbd>Ctrl-A</kbd> <kbd>s</kbd> | Switch project (opens the project switcher) |
+| <kbd>Ctrl-A</kbd> <kbd>o</kbd> | (Re)configure this project — re-open the setup wizard (applies on restart) |
+| <kbd>Ctrl-A</kbd> <kbd>a</kbd> | Global all-agents screen — every project's live agents |
+| <kbd>Ctrl-A</kbd> <kbd>e</kbd> | Open the focused agent's workspace in your editor |
+| <kbd>Ctrl-A</kbd> <kbd>d</kbd> | Discard a finished issue's workspace (push branches + remove worktrees) |
+| <kbd>Ctrl-A</kbd> <kbd>m</kbd> | Reclaim disk — free unreferenced mirrors |
 | <kbd>Ctrl-A</kbd> <kbd>g</kbd> | Jump focus home to the spine |
 | <kbd>Ctrl-A</kbd> <kbd>q</kbd> | Quit the cockpit |
 | <kbd>n</kbd> | Jump to the next issue whose agent needs you |
@@ -183,6 +190,15 @@ primary       = "lindep"                  # always materialised at launch
 branch_prefix = "felix"
 ```
 
+You don't have to write this by hand. The first time you open a project that
+isn't in the registry, lindep runs a short **setup wizard** — point it at a local
+clone or paste a remote URL, pick the primary repo (advanced fields like
+`branch_prefix` and per-issue scratch datastores are skippable) — and it appends
+the `[[repo]]`/`[[project]]` blocks for you, leaving any existing comments intact.
+Re-open the wizard any time on a connected project with <kbd>Ctrl-A</kbd>
+<kbd>o</kbd> to add a repo or a scratch datastore; the edit is written in place
+(your comments preserved) and applies on the next launch.
+
 Opening a project **materialises its isolated workspace** under
 `~/.lindep/projects/<handle>/` via a 3-layer git model — a shared bare **mirror**
 (`~/.lindep/mirrors/<handle>.git`) → a per-(project,repo) **reference clone** that
@@ -223,7 +239,8 @@ Direct-key action names: `move-up` `move-down` `switch-side` `enter`
 `filter` `sort` `search` `help` `summary` `ledger` `context`. Verb names:
 `focus-left` `focus-right` `focus-nav` `zoom` `pin` `close` `kill` `layout`
 `open` `quit` `search` `help` `roster` `jump-needs-you` `summary` `ledger`
-`context` `switch-project` `open-in-editor` `command-mode`.
+`context` `switch-project` `open-in-editor` `reclaim-mirrors` `discard-workspace`
+`global-view` `configure-project` `command-mode`.
 
 Keys: single chars (`a`, `/`), `f1`–`f12`, the named keys (`enter` `tab` `space`
 `up` `down` `left` `right` `home` `end` `pageup` `pagedown` `backspace` `delete`

@@ -330,6 +330,9 @@ pub struct App {
     /// The project a switch is currently fetching, if any — so re-selecting the
     /// current project can cancel it and the footer can reflect "loading…".
     pending_switch: Option<String>,
+    /// Set by the `configure-project` verb (`Ctrl-a o`); drained by the event loop,
+    /// which suspends the cockpit, runs the onboarding wizard, then resumes.
+    pending_configure: bool,
     /// Switcher plumbing, wired by [`Self::enable_project_switching`] when the
     /// control plane arms: the Linear client + runtime for the off-thread graph
     /// fetch, and the event sender to wake the render loop.
@@ -441,6 +444,7 @@ impl App {
             switch_inbox: Arc::new(Mutex::new(None)),
             switch_seq: 0,
             pending_switch: None,
+            pending_configure: false,
             linear: None,
             runtime: None,
             events: None,
@@ -802,9 +806,39 @@ impl App {
             Action::ReclaimMirrors => self.open_reclaim(),
             Action::DiscardWorkspace => self.arm_discard(),
             Action::GlobalView => self.open_global(),
+            Action::ConfigureProject => self.request_configure(),
             // The rest are direct (Spine/Deps) actions, never prefix verbs.
             _ => {}
         }
+    }
+
+    /// Ask the event loop to re-open the onboarding wizard for the active project
+    /// (`Ctrl-a o`): the wizard owns the terminal, so the loop must suspend the
+    /// cockpit's alternate screen around it (see [`Self::take_configure_request`]).
+    /// Only meaningful for a connected project — in the read-only viewer there's no
+    /// active project id to edit, so we footer instead.
+    fn request_configure(&mut self) {
+        if self.active_project.is_empty() {
+            self.set_footer("no connected project to configure — relaunch to set one up".into());
+            return;
+        }
+        self.pending_configure = true;
+    }
+
+    /// Taken by the event loop once per request: the project to re-configure, or
+    /// `None`. Returning a [`ProjectRef`] (id + display name) is all the wizard needs;
+    /// it reloads the registry itself.
+    pub fn take_configure_request(&mut self) -> Option<ProjectRef> {
+        std::mem::take(&mut self.pending_configure).then(|| ProjectRef {
+            id: self.active_project.clone(),
+            name: self.graph.project.clone(),
+        })
+    }
+
+    /// Set the footer/status line — used by the event loop to report the wizard's
+    /// outcome after it resumes the cockpit.
+    pub fn note_status(&mut self, msg: String) {
+        self.set_footer(msg);
     }
 
     /// Open the focused agent's workspace directory in an external editor (v1.6,
@@ -856,8 +890,9 @@ impl App {
     }
 
     /// Open the project switcher overlay, or explain why it can't open. Offers only
-    /// *mapped* projects (those with a repo in `projects.toml`) — switching to an
-    /// unmapped project would swap the graph but never be able to run agents.
+    /// *registered* projects (those with a `[[project]]` in `~/.lindep/registry.toml`)
+    /// — switching to an unregistered project would swap the graph but never be able
+    /// to run agents.
     fn open_project_switcher(&mut self) {
         if self.linear.is_none() || self.runtime.is_none() || self.events.is_none() {
             self.set_footer("project switching needs the agent control plane".into());
@@ -871,7 +906,8 @@ impl App {
             .collect();
         if choices.len() < 2 {
             self.set_footer(
-                "no other mapped project — add a [[project]] to .lindep/projects.toml".into(),
+                "no other connected project — open one to set it up, or edit ~/.lindep/registry.toml"
+                    .into(),
             );
             return;
         }
