@@ -988,6 +988,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit",
  "tui-term",
  "unicode-width",
  "ureq",

@@ -20,6 +20,7 @@ mod window;
 mod backend;
 mod mirror;
 mod notify;
+mod onboard;
 mod registry;
 mod scratch;
 mod session;
@@ -499,12 +500,40 @@ fn start_control_plane(
 ) -> Option<(workspace::WorkspaceHandle, tokio::task::JoinHandle<()>)> {
     use std::sync::{Arc, Mutex};
 
-    let (registry, warnings) = registry::Registry::load();
+    let (mut registry, warnings) = registry::Registry::load();
     for w in warnings {
         let _ = events.send(event::AppEvent::Notification(format!("registry: {w}")));
     }
     // The active project must be registered to run agents — lindep needs to know
-    // which repos it owns. An unregistered project degrades to the read-only graph.
+    // which repos it owns. If it isn't, run the onboarding wizard to connect it now
+    // (it writes ~/.lindep/registry.toml); we're still pre-TUI here, so the wizard
+    // owns the terminal exactly like the project picker did. Cancelling — or a write
+    // that doesn't take — degrades to the read-only graph, the prior behaviour.
+    if registry.project(&active.id).is_err() {
+        match onboard::run(active, &registry) {
+            Ok(true) => {
+                let (reloaded, warnings) = registry::Registry::load();
+                for w in warnings {
+                    let _ = events.send(event::AppEvent::Notification(format!("registry: {w}")));
+                }
+                registry = reloaded;
+            }
+            Ok(false) => {
+                let _ = events.send(event::AppEvent::Notification(format!(
+                    "agents disabled: {} isn't connected to a repo — re-open it to set up, \
+                     or edit ~/.lindep/registry.toml",
+                    active.name
+                )));
+                return None;
+            }
+            Err(e) => {
+                let _ = events.send(event::AppEvent::Notification(format!(
+                    "agents disabled: onboarding couldn't run ({e})"
+                )));
+                return None;
+            }
+        }
+    }
     let descriptor = match registry.project(&active.id) {
         Ok(d) => d.clone(),
         Err(_) => {
@@ -745,6 +774,21 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
                 }
                 _ => {} // mouse / focus / paste change nothing on screen
             }
+        }
+
+        // The `configure-project` verb (Ctrl-a o) re-opens the onboarding wizard. The
+        // wizard owns the terminal (its own alternate screen), so suspend the
+        // cockpit's, run it, then resume and report. It writes registry.toml; the
+        // change applies on the next launch — the live workspace is untouched.
+        if let Some(project) = app.take_configure_request() {
+            ratatui::restore();
+            let footer = onboard::run_for_project(&project)?;
+            *terminal = ratatui::init();
+            if let Ok(size) = terminal.size() {
+                app.set_viewport(Rect::new(0, 0, size.width, size.height));
+            }
+            app.note_status(footer);
+            dirty = true;
         }
 
         // Drain every queued background event in one batch; repaint once if any

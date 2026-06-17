@@ -77,6 +77,18 @@ pub enum RegistryError {
          add a [[project]] entry to ~/.lindep/registry.toml"
     )]
     UnknownProject { project_id: String },
+    #[error("writing registry at {}: {source}", .path.display())]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("registry {} is invalid TOML, can't edit it in place: {source}", .path.display())]
+    EditParse {
+        path: PathBuf,
+        #[source]
+        source: Box<toml_edit::TomlError>,
+    },
 }
 
 /// One repo you own, named once by its `handle`. The handle is the stable
@@ -382,10 +394,24 @@ impl Registry {
     }
 
     /// Every registered project id — the set the startup picker and the in-cockpit
-    /// switcher offer (v1.6 lists *all* projects, since lindep provisions clones
+    /// switcher offer (the registered projects, since lindep provisions clones
     /// itself rather than gating on a cwd repo).
     pub fn project_ids(&self) -> Vec<String> {
         self.projects.keys().cloned().collect()
+    }
+
+    /// Every registered repo handle — the onboarding wizard offers these for reuse
+    /// and dedupes against them so it never writes a second `[[repo]]` for a handle
+    /// already present.
+    pub fn repo_handles(&self) -> Vec<String> {
+        self.repos.keys().cloned().collect()
+    }
+
+    /// Every registered project's on-disk `handle` — the onboarding wizard derives a
+    /// fresh handle for a new project and must keep it unique across the registry
+    /// (each handle is a distinct `~/.lindep/projects/<handle>/` world).
+    pub fn project_handles(&self) -> Vec<String> {
+        self.projects.values().map(|p| p.handle.clone()).collect()
     }
 
     /// The resolved [`RepoEntry`]s a project may materialise (its `candidates`),
@@ -429,6 +455,238 @@ pub fn is_safe_handle(handle: &str) -> bool {
         && handle
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Derive a [`is_safe_handle`]-safe repo handle from a remote URL or local path:
+/// the last path segment, with any `.git` suffix dropped and every byte that isn't
+/// handle-safe collapsed to `-`. `"core"` for `git@github.com:org/core.git`,
+/// `/home/me/core/`, or `https://host/org/core`. May return an empty string for a
+/// degenerate input (the caller validates with [`is_safe_handle`] and asks again).
+pub fn handle_from_source(source: &str) -> String {
+    let trimmed = source.trim().trim_end_matches('/');
+    // The last segment after a `/` or `:` — the `:` also splits an scp-style
+    // `git@host:org/repo` remote when there is no `/`.
+    let last = trimmed.rsplit(['/', ':']).next().unwrap_or(trimmed);
+    let stem = last.strip_suffix(".git").unwrap_or(last);
+    let mapped: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // A leading `-`/`.` is rejected by `is_safe_handle`, so trim any.
+    mapped.trim_start_matches(['-', '.']).to_string()
+}
+
+/// A repo the onboarding wizard will add to the registry — the resolved `[[repo]]`
+/// fields. `remote`/`local` mirror [`RepoEntry`]; at least one must be present (the
+/// wizard guarantees it), and `local` is stored as the raw string the user gave so
+/// a `~` still expands at load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoDraft {
+    pub handle: String,
+    pub remote: Option<String>,
+    pub local: Option<String>,
+}
+
+/// A project binding the onboarding wizard will write — the `[[project]]` fields.
+/// Scratch datastores ride alongside as [`ScratchDraft`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDraft {
+    pub id: String,
+    pub handle: String,
+    pub name: String,
+    pub candidates: Vec<String>,
+    pub primary: String,
+    pub branch_prefix: Option<String>,
+}
+
+/// A scratch datastore the wizard will write as a nested `[[project.scratch]]` — the
+/// on-disk shape of [`ScratchSpec`] (the wizard collects it; the loader resolves it).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScratchDraft {
+    pub name: String,
+    pub provision: String,
+    pub teardown: String,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub needs_port: bool,
+    pub required: bool,
+    pub persist: bool,
+}
+
+/// Write a project binding into `registry.toml`, **preserving the file's existing
+/// comments and ordering** via format-preserving `toml_edit` (the `toml` crate's
+/// serializer can't round-trip those):
+///
+/// * each repo in `new_repos` is appended as a fresh `[[repo]]` (the wizard passes
+///   only genuinely-new handles, so an already-registered repo is left untouched);
+/// * the `[[project]]` whose `id` matches is **updated in place** — so re-running the
+///   wizard edits the binding instead of duplicating it — or appended when new, with
+///   any `scratch` rendered as nested `[[project.scratch]]`.
+///
+/// The first block this call appends is tagged with a provenance comment; an updated
+/// project keeps its own leading comment. The write is atomic (tmp → rename), like the
+/// rest of lindep's on-disk state.
+pub fn write_binding(
+    layout: &Layout,
+    new_repos: &[RepoDraft],
+    project: &ProjectDraft,
+    scratch: &[ScratchDraft],
+) -> Result<(), RegistryError> {
+    use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
+
+    let path = layout.registry_path();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => return Err(RegistryError::Write { path, source }),
+    };
+    let mut doc = existing
+        .parse::<DocumentMut>()
+        .map_err(|source| RegistryError::EditParse {
+            path: path.clone(),
+            source: Box::new(source),
+        })?;
+
+    // The first block we append gets a provenance marker; subsequent ones just a
+    // blank-line separator. (`first_new` is threaded so the marker lands once.)
+    let mut first_new = true;
+    fn mark(t: &mut Table, first_new: &mut bool) {
+        t.decor_mut().set_prefix(if *first_new {
+            "\n# ── added by lindep ──\n"
+        } else {
+            "\n"
+        });
+        *first_new = false;
+    }
+
+    let not_aot = |path: &Path, key: &'static str| RegistryError::Write {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("`{key}` in registry.toml is not an array of tables"),
+        ),
+    };
+
+    // Append the genuinely-new repos.
+    if !new_repos.is_empty() {
+        let item = doc
+            .entry("repo")
+            .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+        let repos = item
+            .as_array_of_tables_mut()
+            .ok_or_else(|| not_aot(&path, "repo"))?;
+        for d in new_repos {
+            let mut t = Table::new();
+            t["handle"] = value(d.handle.clone());
+            if let Some(r) = &d.remote {
+                t["remote"] = value(r.clone());
+            }
+            if let Some(l) = &d.local {
+                t["local"] = value(l.clone());
+            }
+            mark(&mut t, &mut first_new);
+            repos.push(t);
+        }
+    }
+
+    // Build the `[[project]]` table. `candidates` is omitted when it's just the
+    // primary (the loader always folds `primary` in), keeping a single-repo block tidy.
+    let candidates = if project.candidates.iter().all(|c| c == &project.primary) {
+        Vec::new()
+    } else {
+        project.candidates.clone()
+    };
+    let mut ptable = Table::new();
+    ptable["id"] = value(project.id.clone());
+    ptable["handle"] = value(project.handle.clone());
+    if !project.name.is_empty() {
+        ptable["name"] = value(project.name.clone());
+    }
+    if !candidates.is_empty() {
+        ptable["candidates"] = value(candidates.into_iter().collect::<Array>());
+    }
+    ptable["primary"] = value(project.primary.clone());
+    if let Some(bp) = &project.branch_prefix {
+        ptable["branch_prefix"] = value(bp.clone());
+    }
+    if !scratch.is_empty() {
+        let mut aot = ArrayOfTables::new();
+        for s in scratch {
+            let mut st = Table::new();
+            st["name"] = value(s.name.clone());
+            st["provision"] = value(s.provision.clone());
+            if !s.teardown.is_empty() {
+                st["teardown"] = value(s.teardown.clone());
+            }
+            if !s.env.is_empty() {
+                let mut env = toml_edit::InlineTable::new();
+                for (k, v) in &s.env {
+                    env.insert(k.as_str(), v.clone().into());
+                }
+                st["env"] = value(env);
+            }
+            if s.needs_port {
+                st["needs_port"] = value(true);
+            }
+            if s.required {
+                st["required"] = value(true);
+            }
+            if s.persist {
+                st["persist"] = value(true);
+            }
+            aot.push(st);
+        }
+        ptable["scratch"] = Item::ArrayOfTables(aot);
+    }
+
+    // Upsert by `id`: replace the matching project in place (keeping the comment that
+    // sits above it), else append a new one.
+    let item = doc
+        .entry("project")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+    let projects = item
+        .as_array_of_tables_mut()
+        .ok_or_else(|| not_aot(&path, "project"))?;
+    let existing_idx = projects
+        .iter()
+        .position(|t| t.get("id").and_then(|v| v.as_str()) == Some(project.id.as_str()));
+    match existing_idx.and_then(|i| projects.get_mut(i)) {
+        Some(slot) => {
+            let prefix = slot
+                .decor()
+                .prefix()
+                .and_then(|p| p.as_str())
+                .map(str::to_string);
+            *slot = ptable;
+            if let Some(p) = prefix {
+                slot.decor_mut().set_prefix(p);
+            }
+        }
+        None => {
+            mark(&mut ptable, &mut first_new);
+            projects.push(ptable);
+        }
+    }
+
+    let out = doc.to_string();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| RegistryError::Write {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    let mut tmp = path.clone();
+    tmp.set_file_name("registry.toml.tmp");
+    std::fs::write(&tmp, &out).map_err(|source| RegistryError::Write {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|source| RegistryError::Write { path, source })
 }
 
 /// Parse the registry document: repos first (so projects can cross-reference
@@ -1032,5 +1290,172 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("LINDEP_HOME", v) },
             None => unsafe { std::env::remove_var("LINDEP_HOME") },
         }
+    }
+
+    #[test]
+    fn handle_from_source_strips_path_git_suffix_and_unsafe_chars() {
+        assert_eq!(
+            handle_from_source("git@github.com:zaplar/core-pms.git"),
+            "core-pms"
+        );
+        assert_eq!(
+            handle_from_source("https://github.com/zaplar/core-pms"),
+            "core-pms"
+        );
+        assert_eq!(handle_from_source("/home/felix/code/lindep/"), "lindep");
+        assert_eq!(handle_from_source("dotfiles.git"), "dotfiles");
+        // A space (and other unsafe bytes) collapse to '-'; a leading dash is trimmed.
+        assert_eq!(handle_from_source("My Repo"), "My-Repo");
+        // The result is always handle-safe (or empty, which the wizard re-prompts on).
+        assert!(is_safe_handle(&handle_from_source(
+            "git@github.com:org/api_2.git"
+        )));
+    }
+
+    #[test]
+    fn write_binding_writes_a_loadable_repo_and_project() {
+        let root = temp_root("append-new");
+        let layout = Layout::new(&root);
+        let repo = RepoDraft {
+            handle: "core-pms".into(),
+            remote: Some("git@github.com:zaplar/core-pms".into()),
+            local: Some("/home/felix/code/core-pms".into()),
+        };
+        let project = ProjectDraft {
+            id: "p-uuid".into(),
+            handle: "core-pms".into(),
+            name: "Core PMS".into(),
+            candidates: vec!["core-pms".into()],
+            primary: "core-pms".into(),
+            branch_prefix: None,
+        };
+        write_binding(&layout, std::slice::from_ref(&repo), &project, &[]).unwrap();
+
+        let (reg, warnings) = Registry::load_at(Layout::new(&root));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            reg.repo("core-pms").unwrap().remote.as_deref(),
+            Some("git@github.com:zaplar/core-pms")
+        );
+        let proj = reg.project("p-uuid").unwrap();
+        assert_eq!(proj.primary, "core-pms");
+        assert_eq!(proj.candidates, vec!["core-pms"]);
+    }
+
+    #[test]
+    fn write_binding_preserves_existing_comments_and_repos() {
+        let root = temp_root("append-keep");
+        // A registry the user hand-wrote, with a comment and one repo already present.
+        let layout = write_registry(
+            &root,
+            "# my notes — keep me\n[[repo]]\nhandle = \"lindep\"\nremote = \"git@github.com:zaplar/lindep\"\n",
+        );
+        // Reuse the existing `lindep` repo (no new [[repo]]) and add a project.
+        let project = ProjectDraft {
+            id: "p2".into(),
+            handle: "lindep-core".into(),
+            name: "Lindep Core".into(),
+            candidates: vec!["lindep".into()],
+            primary: "lindep".into(),
+            branch_prefix: Some("felix".into()),
+        };
+        write_binding(&layout, &[], &project, &[]).unwrap();
+
+        let text = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        assert!(
+            text.contains("# my notes — keep me"),
+            "the comment survives: {text}"
+        );
+
+        let (reg, warnings) = Registry::load_at(Layout::new(&root));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Both the pre-existing repo and the appended project resolve.
+        assert!(reg.repo("lindep").is_some());
+        let proj = reg.project("p2").unwrap();
+        assert_eq!(proj.branch_prefix.as_deref(), Some("felix"));
+    }
+
+    #[test]
+    fn write_binding_updates_an_existing_project_in_place() {
+        let root = temp_root("upsert");
+        let layout = write_registry(
+            &root,
+            "[[repo]]\nhandle = \"core\"\nremote = \"git@github.com:zaplar/core\"\n\n\
+             [[project]]\nid = \"p3\"\nhandle = \"core\"\nname = \"Core\"\nprimary = \"core\"\n",
+        );
+        // Re-run the wizard on the same project id with a branch prefix added.
+        let project = ProjectDraft {
+            id: "p3".into(),
+            handle: "core".into(),
+            name: "Core".into(),
+            candidates: vec!["core".into()],
+            primary: "core".into(),
+            branch_prefix: Some("felix".into()),
+        };
+        write_binding(&layout, &[], &project, &[]).unwrap();
+
+        let text = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        // Edited in place, not duplicated: exactly one [[project]] header remains.
+        assert_eq!(
+            text.matches("[[project]]").count(),
+            1,
+            "no duplicate project: {text}"
+        );
+
+        let (reg, warnings) = Registry::load_at(Layout::new(&root));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            reg.project("p3").unwrap().branch_prefix.as_deref(),
+            Some("felix")
+        );
+    }
+
+    #[test]
+    fn write_binding_renders_nested_scratch_tables() {
+        let root = temp_root("scratch-write");
+        let layout = Layout::new(&root);
+        let repo = RepoDraft {
+            handle: "api".into(),
+            remote: Some("git@github.com:zaplar/api".into()),
+            local: None,
+        };
+        let project = ProjectDraft {
+            id: "p4".into(),
+            handle: "api".into(),
+            name: "API".into(),
+            candidates: vec!["api".into()],
+            primary: "api".into(),
+            branch_prefix: None,
+        };
+        let scratch = ScratchDraft {
+            name: "db".into(),
+            provision: "createdb scratch_{slug}".into(),
+            teardown: "dropdb scratch_{slug}".into(),
+            env: std::collections::BTreeMap::from([(
+                "DATABASE_URL".to_string(),
+                "postgres:///scratch_{slug}".to_string(),
+            )]),
+            needs_port: false,
+            required: true,
+            persist: false,
+        };
+        write_binding(
+            &layout,
+            std::slice::from_ref(&repo),
+            &project,
+            std::slice::from_ref(&scratch),
+        )
+        .unwrap();
+
+        let (reg, warnings) = Registry::load_at(Layout::new(&root));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let specs = &reg.project("p4").unwrap().scratch;
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "db");
+        assert!(specs[0].required);
+        assert_eq!(
+            specs[0].env.get("DATABASE_URL").map(String::as_str),
+            Some("postgres:///scratch_{slug}")
+        );
     }
 }

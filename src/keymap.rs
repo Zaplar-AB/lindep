@@ -118,6 +118,10 @@ pub enum Action {
     /// workspace as `project · ISSUE · status`, reachable from any graph (v1.6,
     /// `Ctrl-a a`). Enter on a row re-roots onto it (switching projects if needed).
     GlobalView,
+    /// Re-open the onboarding wizard for the active project to edit its repo binding /
+    /// scratch datastores (v1.6, `Ctrl-a o`). Writes `~/.lindep/registry.toml`; the
+    /// change applies on the next launch (the running workspace keeps its binding).
+    ConfigureProject,
 }
 
 /// `(action, config name, default keys)` for the **direct** keys consulted when
@@ -183,6 +187,8 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::DiscardWorkspace, "discard-workspace", &["d"]),
     // `Ctrl-a a` opens the global all-agents screen (every project's live agents).
     (Action::GlobalView, "global-view", &["a"]),
+    // `Ctrl-a o` re-opens the onboarding wizard to (re)configure the active project.
+    (Action::ConfigureProject, "configure-project", &["o"]),
     // `Ctrl-a Tab` flips the active window chat⇄deps from any focus — notably
     // from inside a chat, where a bare Tab would go to the agent's PTY.
     (Action::ContextToggle, "context", &["tab"]),
