@@ -6,11 +6,12 @@
 //! are two binding tables:
 //!
 //! * **`[keys]`** — *direct* keys, consulted only when a non-Agent window
-//!   (Spine / Deps) is focused: movement, search, the roster toggle, re-root,
-//!   collapse. An Agent window forwards every direct key to its PTY.
+//!   (Spine / Deps) is focused: movement, the issue sort/filter, search, help,
+//!   summary, ledger, re-root, collapse. An Agent window forwards every direct
+//!   key to its PTY.
 //! * **`[verbs]`** — *prefix* keys, reached as `<prefix> <key>` from any focus:
 //!   focus-move, zoom, pin, close, kill, layout, the attach/spawn button, quit,
-//!   search, help, roster.
+//!   switch-project, and the from-anywhere jumps (jump-needs-you, context).
 //!
 //! ```toml
 //! prefix = "ctrl-a"        # the escape chord (pressed twice → literal Ctrl-A)
@@ -59,8 +60,6 @@ pub enum Action {
     JumpCycle,
     /// Jump to the next agent that needs you.
     JumpNeedsYou,
-    /// Flip the Spine between the issue list and the agents roster.
-    ToggleRoster,
     /// Spine: cycle the issue filter.
     CycleFilter,
     /// Spine: cycle the issue sort.
@@ -95,10 +94,6 @@ pub enum Action {
     /// from any window via the prefix.
     AttachOrSpawn,
     Quit,
-    /// Latch into command mode: keys act as window verbs *without* re-pressing the
-    /// prefix, until Esc or the prefix exits. Keeps the one-shot `prefix key`
-    /// rhythm available, while a run of verbs (focus, pin, zoom…) needs no repeats.
-    CommandMode,
     /// Open the project switcher overlay — pick another mapped Linear project to
     /// view; the project you leave keeps its agents running in the background.
     SwitchProject,
@@ -145,9 +140,10 @@ const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::OpenFleet, "fleet", &["g"]),
     (Action::JumpCycle, "jump-cycle", &["c"]),
     (Action::JumpNeedsYou, "jump-needs-you", &["n"]),
-    (Action::ToggleRoster, "agents", &["r"]),
     (Action::CycleFilter, "filter", &["f"]),
-    (Action::CycleSort, "sort", &["s"]),
+    // `r` (vacated by the v1.7 roster fold) cycles the sort, leaving `s` solely
+    // to the prefix project-switcher — no more direct-`s` / prefix-`s` clash.
+    (Action::CycleSort, "sort", &["r"]),
     (Action::StartSearch, "search", &["/"]),
     (Action::ToggleHelp, "help", &["?"]),
     (Action::ToggleSummary, "summary", &["i"]),
@@ -159,8 +155,9 @@ const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
 const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::FocusLeft, "focus-left", &["left", "h"]),
     (Action::FocusRight, "focus-right", &["right", "l"]),
-    // `Ctrl-a g` / `Ctrl-a 0` (tmux's "window 0") jump straight home to the nav.
-    (Action::FocusNav, "focus-nav", &["g", "0"]),
+    // `Ctrl-a 0` (tmux's "window 0") jumps straight home to the nav. (v1.7
+    // dropped the `g` alias so the prefix no longer shadows the direct `g` map.)
+    (Action::FocusNav, "focus-nav", &["0"]),
     (Action::ZoomToggle, "zoom", &["z"]),
     (Action::PinWindow, "pin", &["p"]),
     (Action::CloseWindow, "close", &["w"]),
@@ -168,14 +165,12 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::LayoutToggle, "layout", &["|"]),
     (Action::AttachOrSpawn, "open", &["enter", "space"]),
     (Action::Quit, "quit", &["q"]),
-    // `Ctrl-a .` latches command mode (keys = verbs until Esc / the prefix). The
-    // one-shot `Ctrl-a key` rhythm is untouched; this just removes the repeats.
-    (Action::CommandMode, "command-mode", &["."]),
-    (Action::StartSearch, "search", &["/"]),
-    (Action::ToggleHelp, "help", &["?"]),
-    (Action::ToggleSummary, "summary", &["i"]),
-    (Action::ToggleLedger, "ledger", &["t"]),
-    (Action::ToggleRoster, "roster", &["r"]),
+    // The overlay / issue actions (search, help, summary, ledger) are direct-only
+    // as of v1.7 (ENG-562): they're spine-list operations, so the prefix no
+    // longer duplicates them. `JumpNeedsYou` keeps its prefix binding, though —
+    // jumping to a needy agent is a from-*any*-focus gesture (a focused pane
+    // consults only its own nav keys, not the spine's direct `n`), so `Ctrl-a n`
+    // is reachability, not redundancy — the same rationale as `Ctrl-a Tab`.
     (Action::JumpNeedsYou, "jump-needs-you", &["n"]),
     // `Ctrl-a s` opens the project switcher (`p` is taken by `pin`).
     (Action::SwitchProject, "switch-project", &["s"]),
@@ -889,14 +884,14 @@ mod tests {
     #[test]
     fn a_conflicting_rebind_is_refused_with_a_warning() {
         let mut km = Keymap::default();
-        // Bind filter to 'r', which the roster toggle already owns.
-        let w = km.apply(&[("filter".into(), vec!["r".into()])]);
+        // Bind filter to 'd', which the deps jump already owns.
+        let w = km.apply(&[("filter".into(), vec!["d".into()])]);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("already bound"));
-        // 'r' still toggles the roster (the rebind was refused, not stolen)…
+        // 'd' still opens deps (the rebind was refused, not stolen)…
         assert_eq!(
-            km.action_for(ev(KeyCode::Char('r'), KeyModifiers::NONE)),
-            Some(Action::ToggleRoster)
+            km.action_for(ev(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Some(Action::OpenDeps)
         );
         // …and because every requested key conflicted, filter KEEPS its default
         // 'f' rather than being left unbound.
