@@ -73,16 +73,6 @@ const FLASH_FRAMES: u64 = 4;
 /// force-cleared so an idle cockpit goes quiet.
 const RESUME_GRACE_FRAMES: u64 = 200;
 
-/// What fills the Spine: the full issue list (the navigation spine) or the
-/// agents roster — every issue that has an agent, sorted by how much it wants
-/// your attention. A "tab" you flip with the roster key; selecting a roster row
-/// re-aims the spine selection at that agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LeftView {
-    Issues,
-    Agents,
-}
-
 /// A brief, self-extinguishing highlight on an issue's node — the "juice" that
 /// makes a launch or a finish register. Lives for a few animation frames then
 /// expires.
@@ -95,22 +85,19 @@ pub enum Flash {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
     All,
-    Blocked,
     HasDeps,
 }
 
 impl Filter {
     const fn next(self) -> Self {
         match self {
-            Filter::All => Filter::Blocked,
-            Filter::Blocked => Filter::HasDeps,
+            Filter::All => Filter::HasDeps,
             Filter::HasDeps => Filter::All,
         }
     }
     pub const fn label(self) -> &'static str {
         match self {
             Filter::All => "all",
-            Filter::Blocked => "blocked",
             Filter::HasDeps => "has-deps",
         }
     }
@@ -118,40 +105,72 @@ impl Filter {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
-    /// Ready-to-start work first: unblocked issues on top, highest downstream
-    /// impact within each group.
-    Ready,
-    Blocked,
-    Status,
-    Priority,
+    /// The readiness schedule: issues banded NEEDS-YOU · RUNNING · READY ·
+    /// BLOCKED · DONE (top→bottom), highest downstream impact within each band,
+    /// then priority, then id. The default — the spine draws this one with
+    /// section dividers + a ready rail (see `render_spine`). Unlike `Key` it
+    /// reads the fleet, so the order rebuilds when an agent event moves an issue
+    /// between bands. (v1.7 ENG-563 deleted `Blocked`/`Status`/`Priority`: the
+    /// bands show blocked inline, and priority folded into the within-band tiebreak.)
+    Readiness,
+    /// Plain natural id order — the one residual escape hatch from the schedule.
     Key,
 }
 
 impl Sort {
     const fn next(self) -> Self {
         match self {
-            Sort::Ready => Sort::Blocked,
-            Sort::Blocked => Sort::Status,
-            Sort::Status => Sort::Priority,
-            Sort::Priority => Sort::Key,
-            Sort::Key => Sort::Ready,
+            Sort::Readiness => Sort::Key,
+            Sort::Key => Sort::Readiness,
         }
     }
     pub const fn label(self) -> &'static str {
         match self {
-            Sort::Ready => "ready",
-            Sort::Blocked => "blocked",
-            Sort::Status => "status",
-            Sort::Priority => "priority",
+            Sort::Readiness => "readiness",
             Sort::Key => "id",
         }
     }
+}
+
+/// The single fused per-issue *state* — the type the cockpit was missing.
+///
+/// lindep has one noun (the Issue) but, until v1.7, no one place that said what
+/// state an issue is *in*: the graph truth (blocked / done) lives in
+/// [`Graph`](crate::model::Graph), the agent truth (running / needs-you) lives
+/// in [`AgentStatus`], and the two never met. `Readiness` is where they meet —
+/// [`App::readiness`] is its only producer, and the spine bands, the dispatch
+/// gate, and the Fleet tints are all facets of it rather than each re-deriving
+/// "blocked" / "ready" locally.
+///
+/// Variants are declared in band / salience order, top→bottom, so the derived
+/// `Ord` *is* the schedule order (`NeedsYou < Running < Ready < Blocked <
+/// Done`): the spine can sort on it directly, with no separate comparator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Readiness {
+    /// A live agent is waiting on you — the one thing you must act on.
+    NeedsYou,
+    /// A live agent is on it (spawning / running / idle, but not waiting).
+    Running,
+    /// Unblocked, unresolved, no live agent — the launchpad. The one genuinely
+    /// new state; every other band already had a home in the codebase.
+    Ready,
+    /// At least one upstream blocker is unresolved, or it sits in a dependency
+    /// cycle (`↺`, an un-runnable sub-state of Blocked, not a band of its own).
+    Blocked,
+    /// Finished or abandoned — resolved in Linear.
+    Done,
 }
 
 pub struct App {
     pub graph: Graph,
     pub order: Vec<String>,
     pub list_state: ListState,
+    /// Render-space selection for the readiness-banded spine: its index counts
+    /// the section dividers, so it can't share `list_state` (which indexes pure
+    /// issue keys for navigation). Persisted on `App` only so its scroll *offset*
+    /// survives across frames — a fresh `ListState` each draw would pin the
+    /// selection to the viewport bottom on a long list.
+    pub banded_list_state: ListState,
 
     /// The Spine's current selection — the issue the detail bar describes and the
     /// attach/spawn button acts on. Re-aimed by list/roster navigation and the
@@ -171,7 +190,6 @@ pub struct App {
     /// real frame) without `draw` mutating state.
     pub viewport: Rect,
 
-    pub left_view: LeftView,
     pub filter: Filter,
     pub sort: Sort,
     pub search_query: String,
@@ -218,11 +236,6 @@ pub struct App {
     /// second prefix, forwarded to a focused agent as the literal chord). The v3
     /// generalisation of v2's single `pending_leader` detach gesture.
     pub prefix_armed: bool,
-    /// Latched command mode (`Ctrl-a .`): while `true`, keys resolve as window
-    /// verbs *without* the prefix, until Esc or the prefix exits. The one-shot
-    /// `prefix key` rhythm stays available; this only removes the repeats for a run
-    /// of verbs.
-    pub command_mode: bool,
     /// The issue whose agent a `Ctrl-a x` kill is awaiting confirmation for. While
     /// `Some`, the next key confirms (`y`/Enter) or cancels — kill is destructive,
     /// so it's never a single keystroke.
@@ -398,13 +411,13 @@ impl App {
             graph,
             order: Vec::new(),
             list_state: ListState::default(),
+            banded_list_state: ListState::default(),
             root,
             windows,
             preview_size: HashMap::new(),
             viewport: Rect::new(0, 0, 80, 24),
-            left_view: LeftView::Issues,
             filter: Filter::All,
-            sort: Sort::Ready,
+            sort: Sort::Readiness,
             search_query: String::new(),
             search_active: false,
             show_help: false,
@@ -419,7 +432,6 @@ impl App {
             frame: 0,
             flash: HashMap::new(),
             prefix_armed: false,
-            command_mode: false,
             kill_confirm: None,
             discard_confirm: None,
             repo_confirm: None,
@@ -501,35 +513,54 @@ impl App {
 
     // ── Derived list ordering (the Spine's issue list) ─────────────────────────
 
-    fn rebuild_order(&mut self) {
+    /// Rebuild the Spine's visible `order` from the active filter/search/sort.
+    /// `pub(crate)` so `render_spine` can re-band a stale Readiness order (the
+    /// only sort whose ordering depends on live fleet state) just before drawing.
+    pub(crate) fn rebuild_order(&mut self) {
         let needle = self.search_query.to_lowercase();
-        let g = &self.graph;
         let (filter, sort) = (self.filter, self.sort);
 
-        let mut decorated: Vec<((u8, u64), String)> = g
-            .keys()
-            .iter()
+        // Own the key list so the per-key sort key can borrow `&self` — the
+        // Readiness band reads the fleet, not just the graph — without aliasing
+        // `self.graph`. `rebuild_order` runs on sort/filter/search changes (and,
+        // for the fleet-dependent Readiness sort, when `render_spine` finds the
+        // order stale), never per render, so the clone is not on a hot path.
+        let keys = self.graph.keys().to_vec();
+        let mut decorated: Vec<((u8, u64), String)> = keys
+            .into_iter()
             .filter_map(|k| {
-                let issue = g.get(k)?;
+                let issue = self.graph.get(&k)?;
                 if issue.external {
                     return None; // externals show in trees, not the project list
                 }
                 let pass_filter = match filter {
                     Filter::All => true,
-                    Filter::Blocked => g.is_blocked(k),
                     Filter::HasDeps => {
-                        g.direct_count(k, Direction::Upstream) > 0
-                            || g.direct_count(k, Direction::Downstream) > 0
+                        self.graph.direct_count(&k, Direction::Upstream) > 0
+                            || self.graph.direct_count(&k, Direction::Downstream) > 0
                     }
                 };
                 let pass_search = needle.is_empty()
                     || issue.key.to_lowercase().contains(&needle)
                     || issue.title.to_lowercase().contains(&needle);
-                (pass_filter && pass_search).then(|| (sort_key(g, k, sort), k.clone()))
+                (pass_filter && pass_search).then(|| (self.sort_key(&k, sort), k.clone()))
             })
             .collect();
 
-        decorated.sort_by(|(ka, a), (kb, b)| ka.cmp(kb).then_with(|| natural_key_cmp(a, b)));
+        // Within a band+impact tie, the Readiness schedule prefers higher
+        // priority (the folded-in priority sort), then a stable natural id.
+        let by_priority = sort == Sort::Readiness;
+        decorated.sort_by(|(ka, a), (kb, b)| {
+            ka.cmp(kb)
+                .then_with(|| {
+                    if by_priority {
+                        self.priority_rank(a).cmp(&self.priority_rank(b))
+                    } else {
+                        Ordering::Equal
+                    }
+                })
+                .then_with(|| natural_key_cmp(a, b))
+        });
         self.order = decorated.into_iter().map(|(_, k)| k).collect();
         // If the active filter/search hid the current selection, re-aim it at the
         // first visible issue so the list highlight and the detail bar agree.
@@ -537,6 +568,83 @@ impl App {
             self.root = self.order[0].clone();
         }
         self.sync_list_selection();
+    }
+
+    /// Fuse an issue's graph truth (blocked / done) and agent truth (running /
+    /// needs-you) into the one [`Readiness`] band it belongs to. This is the
+    /// keystone of v1.7: the spine bands, the dispatch gate, and the Fleet
+    /// tints all read from here, so "what state is this issue in" has exactly
+    /// one answer instead of five partial re-derivations.
+    ///
+    /// Precedence is salience, top band first:
+    /// 1. **A live agent outranks the graph.** A `NeedsYou` agent → `NeedsYou`;
+    ///    any other live agent (spawning / running / idle) → `Running`. An
+    ///    agent working an issue Linear already marks resolved still reads as
+    ///    `Running` — the live process is the actionable thing, not the label.
+    /// 2. **A terminal agent (stopped / done / failed) pins no band** — the
+    ///    issue reverts to its graph truth, so a failed launch shows `Ready`
+    ///    again (re-dispatchable) and a clean finish shows `Done`.
+    /// 3. **Graph truth for an agent-less issue:** `Done` if resolved, else
+    ///    `Blocked` if it has an unresolved blocker or sits in a cycle, else
+    ///    `Ready` — the one line the codebase didn't already compute somewhere.
+    ///
+    /// `key` may be a fleet member that has left the graph (an archived issue
+    /// whose session survived reconcile); the agent-truth branch classifies it
+    /// without needing a graph node.
+    pub fn readiness(&self, key: &str) -> Readiness {
+        if let Some(status) = self.fleet.get(key) {
+            if status.needs_you() {
+                return Readiness::NeedsYou;
+            }
+            if status.is_live() {
+                return Readiness::Running;
+            }
+            // Terminal: fall through to graph truth below.
+        }
+        if self.graph.get(key).is_some_and(|i| i.status.is_resolved()) {
+            return Readiness::Done;
+        }
+        if self.graph.is_blocked(key) || self.graph.in_cycle(key) {
+            return Readiness::Blocked;
+        }
+        Readiness::Ready
+    }
+
+    /// The once-per-node sort key for the active sort mode. Lower sorts first;
+    /// `natural_key_cmp` breaks ties. A method (not a free fn) because the
+    /// Readiness band reads the fleet via [`App::readiness`], not just the graph.
+    fn sort_key(&self, key: &str, sort: Sort) -> (u8, u64) {
+        match sort {
+            // Band (top→bottom), then highest downstream impact within the band;
+            // priority then id break the remaining ties in `rebuild_order`.
+            Sort::Readiness => (
+                self.readiness(key) as u8,
+                u64::MAX - self.graph.transitive(key, Direction::Downstream) as u64,
+            ),
+            Sort::Key => (0, 0),
+        }
+    }
+
+    /// Priority rank (Urgent first … None last) — the within-band tiebreak the
+    /// Readiness schedule folds in, in place of the deleted standalone priority sort.
+    fn priority_rank(&self, key: &str) -> u8 {
+        self.graph.get(key).map_or(u8::MAX, |i| i.priority.rank())
+    }
+
+    /// Whether `order` is still sorted exactly as `rebuild_order` would sort it
+    /// under `Sort::Readiness` — by (band, downstream impact), then priority, then
+    /// natural id. Agent events (and a graph refetch) move the fleet/graph under
+    /// `order` without re-sorting, so `render_spine` re-bands when this returns
+    /// false — keeping the section dividers contiguous AND the within-band order
+    /// fresh, not just the band sequence. Must mirror `rebuild_order`'s comparator.
+    pub fn order_is_banded(&self) -> bool {
+        self.order.windows(2).all(|w| {
+            self.sort_key(&w[0], Sort::Readiness)
+                .cmp(&self.sort_key(&w[1], Sort::Readiness))
+                .then_with(|| self.priority_rank(&w[0]).cmp(&self.priority_rank(&w[1])))
+                .then_with(|| natural_key_cmp(&w[0], &w[1]))
+                != Ordering::Greater
+        })
     }
 
     fn sync_list_selection(&mut self) {
@@ -631,15 +739,6 @@ impl App {
         //     can't answer the prompt for you.
         if self.repo_confirm.is_some() {
             self.on_repo_confirm_key(key);
-            return;
-        }
-
-        // 3. Latched command mode: keys are window verbs directly (no prefix), so a
-        //    run of focus/pin/zoom/… needs no repeats. Esc or the prefix exits.
-        //    After kill_confirm so a confirm still wins; before the prefix-arm so the
-        //    prefix toggles the latch off rather than arming a one-shot inside it.
-        if self.command_mode {
-            self.on_command_mode_key(key);
             return;
         }
 
@@ -751,20 +850,6 @@ impl App {
         self.dispatch_verb(verb);
     }
 
-    /// Resolve a key while latched in command mode: Esc or the prefix chord exits;
-    /// any bound window verb fires and keeps the latch (so a run of verbs needs no
-    /// repeats); unbound keys are harmless no-ops.
-    fn on_command_mode_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Esc || self.keymap.is_prefix(key) {
-            self.command_mode = false;
-            self.set_footer("command mode off".to_string());
-            return;
-        }
-        if let Some(verb) = self.keymap.verb_for(key) {
-            self.dispatch_verb(verb);
-        }
-    }
-
     /// Run a window-manager verb (always reached behind the prefix).
     fn dispatch_verb(&mut self, verb: Action) {
         match verb {
@@ -785,10 +870,6 @@ impl App {
             Action::LayoutToggle => self.toggle_layout(),
             Action::AttachOrSpawn => self.button(),
             Action::Quit => self.should_quit = true,
-            Action::CommandMode => {
-                self.command_mode = true;
-                self.set_footer("command mode — keys are verbs · Esc or the prefix exits".into());
-            }
             Action::StartSearch => {
                 self.windows.focus = 0;
                 self.start_search();
@@ -796,10 +877,6 @@ impl App {
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ToggleSummary => self.show_summary = !self.show_summary,
             Action::ToggleLedger => self.show_ledger = !self.show_ledger,
-            Action::ToggleRoster => {
-                self.windows.focus = 0;
-                self.toggle_roster();
-            }
             Action::JumpNeedsYou => self.jump_to_needs_you(),
             Action::SwitchProject => self.open_project_switcher(),
             Action::OpenInEditor => self.open_in_editor(),
@@ -1112,7 +1189,6 @@ impl App {
             Action::OpenFleet => self.open_fleet(),
             Action::JumpCycle => self.jump_to_cycle(),
             Action::JumpNeedsYou => self.jump_to_needs_you(),
-            Action::ToggleRoster => self.toggle_roster(),
             Action::CycleFilter => {
                 self.filter = self.filter.next();
                 self.rebuild_order();
@@ -1211,16 +1287,9 @@ impl App {
 
     fn start_search(&mut self) {
         self.search_active = true;
-        // Search filters the issue list, so surface it (you can't fuzzy-find the
-        // agents roster).
-        self.left_view = LeftView::Issues;
     }
 
     fn move_selection(&mut self, delta: i32) {
-        if self.left_view == LeftView::Agents {
-            self.move_roster(delta);
-            return;
-        }
         move_state(&mut self.list_state, self.order.len(), delta);
         if let Some(i) = self.list_state.selected()
             && let Some(k) = self.order.get(i).cloned()
@@ -1322,6 +1391,17 @@ impl App {
     /// no live one. The v3 merge of v2's `launch_agent` + `attach`: one agent per
     /// issue, never duplicated; a live one is revealed, a terminal one relaunched
     /// (which resumes its conversation).
+    /// The first unresolved upstream blocker of `key`, if any — the issue a
+    /// blocked dispatch is waiting on (mirrors `Graph::is_blocked`'s predicate),
+    /// used to name it in the refusal footer.
+    fn first_unresolved_blocker(&self, key: &str) -> Option<String> {
+        self.graph
+            .neighbours(key, Direction::Upstream)
+            .iter()
+            .find(|b| self.graph.get(b).is_none_or(|i| !i.status.is_resolved()))
+            .cloned()
+    }
+
     fn button(&mut self) {
         let Some(issue) = self.focused_issue() else {
             self.status_msg = Some("no issue selected".into());
@@ -1345,6 +1425,30 @@ impl App {
         if self.pending_launch.contains(&key) {
             self.open_agent_window(&key);
             self.set_footer(format!("already opening an agent on {key}…"));
+            return;
+        }
+        // Readiness gate (ENG-559): manual dispatch *is* this button. Refuse a
+        // blocked issue with a deps-aware footer instead of launching an agent
+        // that can't make progress (today it launches one silently). A live or
+        // needs-you agent has a backend and was handled above, so only
+        // Ready / Blocked / Done reach here.
+        if self.readiness(&key) == Readiness::Blocked {
+            let msg = match self.first_unresolved_blocker(&key) {
+                Some(blocker) => format!("{key} blocked by {blocker} — dispatch refused"),
+                None => format!("{key} is in a dependency cycle — dispatch refused"),
+            };
+            self.set_footer(msg);
+            return;
+        }
+        // Capacity gate: the workspace caps concurrent agents (`max_concurrent`).
+        // A refusal here is NOT a dependency block — say so plainly, or a full
+        // fleet reads as a bogus dep block (RFC §6).
+        let load = self.backends.len() + self.resuming.len();
+        if self.resume_cap > 0 && load >= self.resume_cap {
+            self.set_footer(format!(
+                "fleet at capacity ({load}/{}) — finish or stop an agent first",
+                self.resume_cap
+            ));
             return;
         }
         // Absent, or terminal → (re)launch; the supervisor resumes transparently
@@ -2869,68 +2973,6 @@ impl App {
         }
     }
 
-    // ── Agents roster (the Spine's "AGENTS" tab) ────────────────────────────────
-
-    /// The agents roster: every issue with an agent, ordered by salience —
-    /// needs-you first, then live work, then idle, then the terminal states that
-    /// linger until reaped. Ties break on the natural issue id.
-    pub fn agent_order(&self) -> Vec<String> {
-        // Every issue with a fleet entry (live, or a terminal one lingering until
-        // reaped), plus any *pinned* coin without one — so an agent you've docked
-        // stays reachable from the roster even after it was killed/reaped (it used
-        // to vanish, leaving "no issue"). Sorted by salience (needs-you first …
-        // terminal last); pinned-only coins rank past them all.
-        let mut agents: Vec<(String, u8)> = self
-            .fleet
-            .iter()
-            .map(|(k, s)| (k.clone(), s.salience_rank()))
-            .collect();
-        for w in &self.windows.windows {
-            if w.pinned
-                && let Some(issue) = w.issue()
-                && !self.fleet.contains_key(issue)
-            {
-                agents.push((issue.to_string(), u8::MAX));
-            }
-        }
-        agents.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| natural_key_cmp(&a.0, &b.0)));
-        agents.into_iter().map(|(k, _)| k).collect()
-    }
-
-    /// Step the roster cursor by `delta` (wrapping) and re-aim the selection at
-    /// the agent it lands on, so the detail bar follows. No-op when empty.
-    fn move_roster(&mut self, delta: i32) {
-        let agents = self.agent_order();
-        if agents.is_empty() {
-            return;
-        }
-        let next = match agents.iter().position(|k| *k == self.root) {
-            Some(i) => (i as i32 + delta).rem_euclid(agents.len() as i32) as usize,
-            None if delta >= 0 => 0,
-            None => agents.len() - 1,
-        };
-        self.aim_spine(agents[next].clone());
-    }
-
-    /// Flip the Spine between the issue list and the agents roster.
-    fn toggle_roster(&mut self) {
-        self.left_view = match self.left_view {
-            LeftView::Issues => LeftView::Agents,
-            LeftView::Agents => LeftView::Issues,
-        };
-        if self.left_view == LeftView::Agents {
-            let roster = self.agent_order();
-            if roster.is_empty() {
-                self.status_msg = Some("no agents yet — Enter on an issue to open one".into());
-            } else if !roster.contains(&self.root) {
-                // Land on a real agent so the detail bar + button reflect it,
-                // instead of whatever non-agent issue the Issues view had selected
-                // (which read as "no issue" against the roster).
-                self.aim_spine(roster[0].clone());
-            }
-        }
-    }
-
     // ── Spine jumps ──────────────────────────────────────────────────────────
 
     fn jump_to_cycle(&mut self) {
@@ -3191,34 +3233,7 @@ fn natural_key_cmp(a: &str, b: &str) -> Ordering {
     pa.cmp(pb).then(na.cmp(&nb))
 }
 
-/// The once-per-node sort key for the active sort mode. Lower sorts first;
-/// `natural_key_cmp` breaks ties.
-fn sort_key(graph: &Graph, key: &str, sort: Sort) -> (u8, u64) {
-    let by_impact = || u64::MAX - graph.transitive(key, Direction::Downstream) as u64;
-    match sort {
-        Sort::Ready => (u8::from(graph.is_blocked(key)), by_impact()),
-        Sort::Blocked => (u8::from(!graph.is_blocked(key)), by_impact()),
-        Sort::Status => (status_rank(graph, key), 0),
-        Sort::Priority => (graph.get(key).map_or(u8::MAX, |i| i.priority.rank()), 0),
-        Sort::Key => (0, 0),
-    }
-}
-
 /// Sort rank that surfaces live work first.
-fn status_rank(graph: &Graph, key: &str) -> u8 {
-    use crate::model::Status::*;
-    match graph.get(key).map(|i| i.status) {
-        Some(Started) => 0,
-        Some(Triage) => 1,
-        Some(Unstarted) => 2,
-        Some(Backlog) => 3,
-        Some(Completed) => 4,
-        Some(Duplicate) => 5,
-        Some(Canceled) => 6,
-        _ => 7,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3274,6 +3289,9 @@ mod tests {
         let mut a = app();
         a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
         a.active_project = "proj".into();
+        // Aim at a Ready issue — ENG-559's gate refuses a blocked dispatch, and
+        // the demo's default selection (ZAP-204) is blocked.
+        a.aim_spine("ZAP-188".into());
         let key = a.root.clone();
         a.project_candidates
             .insert("proj".into(), vec![repo("api", true), repo("web", false)]);
@@ -3302,6 +3320,7 @@ mod tests {
         let mut a = app();
         a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
         a.active_project = "proj".into();
+        a.aim_spine("ZAP-188".into()); // a Ready issue (the ENG-559 gate)
         let key = a.root.clone();
         a.project_candidates
             .insert("proj".into(), vec![repo("only", true)]);
@@ -3319,6 +3338,7 @@ mod tests {
         let mut a = app();
         a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
         a.active_project = "proj".into();
+        a.aim_spine("ZAP-188".into()); // a Ready issue (the ENG-559 gate)
         a.project_candidates
             .insert("proj".into(), vec![repo("api", true), repo("web", false)]);
 
@@ -3923,7 +3943,9 @@ mod tests {
         // Regression: `Ctrl-a n` (JumpNeedsYou) fired while the PREVIEW is focused
         // must re-aim the preview to the needy issue — not leave the focused pane
         // stuck on the old one. (reaim_preview used to bail when the preview was
-        // focused, which dropped the re-aim for a verb-driven jump.)
+        // focused, which dropped the re-aim for a verb-driven jump.) This is why
+        // JumpNeedsYou keeps its prefix binding (ENG-562): a focused pane consults
+        // only its own nav keys, so the from-anywhere jump must be a verb.
         let mut app = app();
         let start = app.root.clone();
         let target = app.order.iter().find(|k| **k != start).unwrap().clone();
@@ -3997,21 +4019,6 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(!app.search_active);
         assert!(app.order.len() > 1);
-    }
-
-    #[test]
-    fn the_roster_tab_drives_the_selection_through_agents() {
-        let mut app = app();
-        let k: Vec<String> = app.order.iter().take(2).cloned().collect();
-        app.fleet.insert(k[0].clone(), AgentStatus::Idle);
-        app.fleet.insert(k[1].clone(), AgentStatus::NeedsYou);
-        press(&mut app, KeyCode::Char('r')); // flip to the roster
-        assert_eq!(app.left_view, LeftView::Agents);
-        press(&mut app, KeyCode::Down);
-        let first = app.root.clone();
-        assert!(app.fleet.contains_key(&first));
-        press(&mut app, KeyCode::Down);
-        assert_ne!(first, app.root, "each step lands on a different agent");
     }
 
     // ── The attach/spawn button + agent windows ─────────────────────────────
@@ -4412,58 +4419,25 @@ mod tests {
     }
 
     #[test]
-    fn command_mode_latches_so_verbs_need_no_prefix() {
-        let mut app = app();
-        verb(&mut app, KeyCode::Char('.')); // Ctrl-a . → latch command mode
-        assert!(app.command_mode);
-        let before = app.windows.focus;
-        press(&mut app, KeyCode::Char('l')); // a *bare* verb key → focus right
-        assert!(
-            app.windows.focus > before,
-            "a bare verb moved focus while latched"
-        );
-        assert!(app.command_mode, "a verb keeps the latch on");
-    }
-
-    #[test]
-    fn esc_exits_command_mode() {
-        let mut app = app();
-        verb(&mut app, KeyCode::Char('.'));
-        press(&mut app, KeyCode::Esc);
-        assert!(!app.command_mode, "esc leaves command mode");
-    }
-
-    #[test]
-    fn the_one_shot_prefix_is_unchanged_by_command_mode() {
-        // A single `Ctrl-a l` still fires one verb and does NOT latch.
+    fn the_one_shot_prefix_fires_a_single_verb() {
+        // `Ctrl-a l` fires exactly one window verb (focus right). v1.7 (ENG-562)
+        // removed command mode, so the prefix is now purely one-shot.
         let mut app = app();
         let before = app.windows.focus;
         verb(&mut app, KeyCode::Char('l'));
-        assert!(app.windows.focus > before, "the one-shot verb still fires");
-        assert!(!app.command_mode, "a one-shot verb never latches");
+        assert!(app.windows.focus > before, "the one-shot verb fires");
     }
 
     #[test]
-    fn the_roster_lands_on_a_live_agent_and_kill_targets_it() {
+    fn kill_targets_the_selected_agent() {
         let mut app = app();
         app.fleet.insert("ZAP-210".into(), AgentStatus::Running);
-        // Switching to the roster from a non-agent selection lands on the agent…
-        press(&mut app, KeyCode::Char('r'));
-        assert_eq!(app.root, "ZAP-210", "the roster lands on the live agent");
-        // …and Ctrl-a x from the navbar arms a kill of that selected agent.
+        // The roster fold (ENG-563) removed the AGENTS tab; select the agent's
+        // issue directly on the nav, then Ctrl-a x arms a kill of that agent.
+        app.aim_spine("ZAP-210".into());
+        app.windows.focus = 0; // the nav (what flipping to the roster used to do)
         verb(&mut app, KeyCode::Char('x'));
         assert_eq!(app.kill_confirm.as_deref(), Some("ZAP-210"));
-    }
-
-    #[test]
-    fn a_pinned_coin_is_reachable_from_the_roster_without_a_live_agent() {
-        let mut app = app();
-        verb(&mut app, KeyCode::Char('l')); // focus the preview (deps on ZAP-204)
-        verb(&mut app, KeyCode::Char('p')); // pin it → a docked coin, no agent
-        assert!(
-            app.agent_order().contains(&"ZAP-204".to_string()),
-            "a pinned coin keeps its issue reachable from the roster"
-        );
     }
 
     #[test]
@@ -4730,20 +4704,6 @@ mod tests {
         assert_eq!(app.windows.focus, focus_before);
         assert!(!app.windows.references_agent("ZAP-205"));
         assert_eq!(app.fleet.get("ZAP-205"), Some(&AgentStatus::Spawning));
-    }
-
-    #[test]
-    fn agent_order_sorts_by_salience_not_id() {
-        let mut app = app();
-        let k: Vec<String> = app.order.iter().take(4).cloned().collect();
-        app.fleet.insert(k[0].clone(), AgentStatus::Done);
-        app.fleet.insert(k[1].clone(), AgentStatus::NeedsYou);
-        app.fleet.insert(k[2].clone(), AgentStatus::Running);
-        app.fleet.insert(k[3].clone(), AgentStatus::Idle);
-        assert_eq!(
-            app.agent_order(),
-            vec![k[1].clone(), k[2].clone(), k[3].clone(), k[0].clone()]
-        );
     }
 
     #[test]
@@ -5149,6 +5109,233 @@ mod tests {
             app.windows.layout,
             LayoutMode::Mosaic,
             "but the saved layout mode is adopted"
+        );
+    }
+
+    // ── Readiness classifier (ENG-557) ───────────────────────────────────────
+
+    /// A graph exercising every graph-truth branch of [`App::readiness`]:
+    /// `ready` (unblocked, unstarted), `blocked` (held by the unresolved
+    /// `gate`), `done` (completed), and a `cyc1`↔`cyc2` cycle whose `cyc2` is
+    /// resolved — so `cyc1` is *in a cycle yet not `is_blocked`*, isolating the
+    /// in_cycle arm.
+    fn readiness_graph() -> Graph {
+        use crate::model::{Priority, Status};
+        let node = |key: &str, status: Status| Issue {
+            key: key.into(),
+            title: key.into(),
+            status,
+            priority: Priority::None,
+            assignee: None,
+            external: false,
+        };
+        let mut g = Graph::new("t");
+        g.add_issue(node("gate", Status::Started)); // an unresolved blocker
+        g.add_issue(node("blocked", Status::Unstarted));
+        g.add_issue(node("ready", Status::Unstarted));
+        g.add_issue(node("done", Status::Completed));
+        g.add_issue(node("cyc1", Status::Unstarted));
+        g.add_issue(node("cyc2", Status::Completed));
+        g.add_edge("gate", "blocked");
+        g.add_edge("cyc1", "cyc2"); // cyc1 ↔ cyc2 — a structural cycle
+        g.add_edge("cyc2", "cyc1");
+        g.finalize();
+        g
+    }
+
+    fn readiness_app() -> App {
+        let mut a = App::new(readiness_graph());
+        a.set_viewport(Rect::new(0, 0, 200, 40));
+        a
+    }
+
+    #[test]
+    fn readiness_classifies_graph_truth_for_agentless_issues() {
+        let a = readiness_app();
+        assert_eq!(a.readiness("ready"), Readiness::Ready);
+        assert_eq!(a.readiness("blocked"), Readiness::Blocked);
+        assert_eq!(a.readiness("done"), Readiness::Done);
+        // `gate` holds `blocked` but is itself unblocked → Ready.
+        assert_eq!(a.readiness("gate"), Readiness::Ready);
+    }
+
+    #[test]
+    fn readiness_treats_a_cycle_member_as_blocked_even_when_unblocked() {
+        let a = readiness_app();
+        // cyc1's only blocker (cyc2) is resolved, so `is_blocked` is false — but
+        // it sits in a cycle, an un-runnable sub-state of Blocked. Without the
+        // in_cycle arm this would wrongly read as Ready.
+        assert_eq!(a.readiness("cyc1"), Readiness::Blocked);
+        // A *resolved* cycle member is Done — resolution outranks the cycle.
+        assert_eq!(a.readiness("cyc2"), Readiness::Done);
+    }
+
+    #[test]
+    fn readiness_lets_a_live_agent_outrank_graph_truth() {
+        let mut a = readiness_app();
+        // A needs-you agent is the top band, even on a blocked issue.
+        a.fleet.insert("blocked".into(), AgentStatus::NeedsYou);
+        assert_eq!(a.readiness("blocked"), Readiness::NeedsYou);
+        // Spawning / Running / Idle are all live → Running.
+        for s in [
+            AgentStatus::Spawning,
+            AgentStatus::Running,
+            AgentStatus::Idle,
+        ] {
+            a.fleet.insert("ready".into(), s);
+            assert_eq!(a.readiness("ready"), Readiness::Running, "{s:?} is live");
+        }
+        // A live agent even outranks a resolved issue.
+        a.fleet.insert("done".into(), AgentStatus::Running);
+        assert_eq!(a.readiness("done"), Readiness::Running);
+    }
+
+    #[test]
+    fn readiness_reverts_to_graph_truth_when_the_agent_is_terminal() {
+        let mut a = readiness_app();
+        // Stopped / Done / Failed pin no band — the issue is its graph state, so
+        // a failed launch is re-dispatchable (Ready) and a blocked one stays Blocked.
+        for s in [AgentStatus::Stopped, AgentStatus::Done, AgentStatus::Failed] {
+            a.fleet.insert("ready".into(), s);
+            assert_eq!(a.readiness("ready"), Readiness::Ready, "{s:?} → Ready");
+            a.fleet.insert("blocked".into(), s);
+            assert_eq!(
+                a.readiness("blocked"),
+                Readiness::Blocked,
+                "{s:?} → Blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_classifies_a_fleet_member_absent_from_the_graph() {
+        // An archived issue whose session survived reconcile isn't in the graph,
+        // but a needs-you agent on it must still classify (the header counts it).
+        let mut a = readiness_app();
+        a.fleet.insert("ENG-archived".into(), AgentStatus::NeedsYou);
+        assert_eq!(a.readiness("ENG-archived"), Readiness::NeedsYou);
+    }
+
+    #[test]
+    fn readiness_band_order_is_the_schedule_order() {
+        // The derived Ord is the top→bottom band order ENG-558 will sort on.
+        assert!(Readiness::NeedsYou < Readiness::Running);
+        assert!(Readiness::Running < Readiness::Ready);
+        assert!(Readiness::Ready < Readiness::Blocked);
+        assert!(Readiness::Blocked < Readiness::Done);
+    }
+
+    #[test]
+    fn order_is_banded_detects_within_band_staleness() {
+        // The self-heal oracle must catch a WITHIN-band drift, not just band
+        // monotonicity — else a same-band transition (NeedsYou→Running) leaves
+        // the band mis-sorted by impact until an unrelated rebuild. `gate`
+        // (downstream impact 1, blocks `blocked`) must out-rank `ready` (impact 0)
+        // inside the READY band; the reversed order must read as un-banded.
+        let mut a = readiness_app();
+        a.order = vec!["ready".into(), "gate".into()];
+        assert!(
+            !a.order_is_banded(),
+            "within-band impact drift is detected, not just band order"
+        );
+        a.rebuild_order();
+        assert!(a.order_is_banded(), "a rebuild restores the full ordering");
+    }
+
+    // ── Readiness-gated dispatch (ENG-559) ───────────────────────────────────
+
+    #[test]
+    fn dispatching_a_blocked_issue_is_refused_with_a_deps_footer() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        // ZAP-205 is blocked by ZAP-204 (Started) in the demo graph.
+        a.aim_spine("ZAP-205".into());
+        a.button();
+        assert!(
+            a.pending_launch.is_empty(),
+            "a blocked dispatch launches nothing"
+        );
+        let msg = a.status_msg.clone().unwrap_or_default();
+        assert!(
+            msg.contains("ZAP-205") && msg.contains("blocked by") && msg.contains("refused"),
+            "deps-aware refusal footer, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn dispatching_a_ready_issue_launches() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        // ZAP-188 is ready — its one blocker (ZAP-150) is Completed.
+        a.aim_spine("ZAP-188".into());
+        a.button();
+        assert!(
+            a.pending_launch.contains("ZAP-188"),
+            "a ready dispatch launches an agent"
+        );
+    }
+
+    #[test]
+    fn a_capacity_refusal_reads_differently_from_a_dep_block() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.resume_cap = 1; // a fleet ceiling of one…
+        register(&mut a, "ZAP-201"); // …already filled by one live backend
+        a.aim_spine("ZAP-188".into()); // a READY issue, so this is NOT a dep block
+        a.button();
+        assert!(
+            a.pending_launch.is_empty(),
+            "a full fleet refuses the launch"
+        );
+        let msg = a.status_msg.clone().unwrap_or_default();
+        assert!(
+            msg.contains("capacity"),
+            "capacity refusal names capacity, got: {msg:?}"
+        );
+        assert!(
+            !msg.contains("blocked by"),
+            "a capacity refusal must not read as a dependency block, got: {msg:?}"
+        );
+    }
+
+    // ── Subtraction acceptance gate (ENG-563) ────────────────────────────────
+
+    #[test]
+    fn the_sort_and_filter_cycles_are_the_collapsed_v17_residual() {
+        // v1.7 is net-smaller by construction: the readiness schedule replaced
+        // the old 5 sorts and the BLOCKED filter. Cycling must return to start in
+        // exactly the residual number of stops — a guard against re-growing them.
+        let mut s = Sort::Readiness;
+        let mut sorts = vec![s];
+        loop {
+            s = s.next();
+            if s == Sort::Readiness {
+                break;
+            }
+            sorts.push(s);
+        }
+        assert_eq!(
+            sorts,
+            vec![Sort::Readiness, Sort::Key],
+            "sorts collapsed to {{readiness, id}}"
+        );
+
+        let mut f = Filter::All;
+        let mut filters = vec![f];
+        loop {
+            f = f.next();
+            if f == Filter::All {
+                break;
+            }
+            filters.push(f);
+        }
+        assert_eq!(
+            filters,
+            vec![Filter::All, Filter::HasDeps],
+            "filters collapsed to {{all, has-deps}}"
         );
     }
 }

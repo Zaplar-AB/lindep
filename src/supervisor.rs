@@ -223,6 +223,12 @@ struct AgentTask {
     title: String,
     generation: u64,
     token: CancellationToken,
+    /// A handle to the supervisor's *parent* token (the one a shutdown cancels).
+    /// Lets a tearing-down agent tell a whole-cockpit shutdown (parent cancelled,
+    /// cascading to this child) from a per-agent kill (only its own child token
+    /// cancelled), so it can preserve a waiting agent's `NeedsYou` across the
+    /// former — see `grade_teardown`.
+    parent: CancellationToken,
     worktree: WorktreeManager,
     /// The up-front-selected repo set for this launch (ENG-536). Empty → primary only.
     repos: Vec<String>,
@@ -363,6 +369,7 @@ impl Supervisor {
             title,
             generation,
             token,
+            parent: self.parent.clone(),
             worktree: self.cfg.worktree.clone(),
             repos,
             provision: self.cfg.provision.clone(),
@@ -418,6 +425,31 @@ impl Supervisor {
 
     fn notify(&self, message: String) {
         let _ = self.cfg.events.send(AppEvent::Notification(message));
+    }
+}
+
+/// Post-mortem status for a torn-down agent, graded off the pre-teardown
+/// lifecycle snapshot (so our own SIGTERM/SIGKILL can't recolour the verdict).
+///
+/// A self-exit is graded by its code: `Done` (0 / signalled) or `Failed`. A
+/// *cancel* of a still-running process is `Stopped` — dead but resumable —
+/// EXCEPT when the whole cockpit is shutting down (`parent_cancelled`) and the
+/// agent was waiting on you (`prior == NeedsYou`): then `NeedsYou` is preserved
+/// on disk so the next launch's startup `⚑` flags the project that was waiting.
+/// A per-agent kill (only the agent's own child token cancelled, parent not)
+/// is always `Stopped` — you deliberately stopped it.
+fn grade_teardown(
+    pre_shutdown: Lifecycle,
+    parent_cancelled: bool,
+    prior: Option<AgentStatus>,
+) -> AgentStatus {
+    match pre_shutdown {
+        Lifecycle::Running if parent_cancelled && prior == Some(AgentStatus::NeedsYou) => {
+            AgentStatus::NeedsYou
+        }
+        Lifecycle::Running => AgentStatus::Stopped,
+        Lifecycle::Exited(Some(0)) | Lifecycle::Exited(None) => AgentStatus::Done,
+        Lifecycle::Exited(Some(_)) => AgentStatus::Failed,
     }
 }
 
@@ -922,12 +954,14 @@ async fn supervise(task: &AgentTask) {
         // from Idle (resting *but still up*), so the header stops counting a cancelled
         // agent as live the instant you stop it. (The backend's own AgentExited event
         // only drives the footer + frees the render handle.)
-        let status = match pre_shutdown {
-            // Still alive when we cancelled: we killed it — a clean, resumable stop.
-            Lifecycle::Running => AgentStatus::Stopped,
-            Lifecycle::Exited(Some(0)) | Lifecycle::Exited(None) => AgentStatus::Done,
-            Lifecycle::Exited(Some(_)) => AgentStatus::Failed,
-        };
+        // The store's last-known status, read before grading so a whole-cockpit
+        // shutdown can preserve a waiting agent's NeedsYou (see `grade_teardown`).
+        let prior = task
+            .store
+            .lock()
+            .ok()
+            .and_then(|s| s.get(&task.issue).map(|sess| sess.status));
+        let status = grade_teardown(pre_shutdown, task.parent.is_cancelled(), prior);
         crate::session::mutate_and_persist(&task.store, &task.events, |store| {
             store.set_status(&task.issue, status);
         })
@@ -988,6 +1022,38 @@ mod tests {
     use std::process::Command as Git;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn teardown_preserves_needs_you_only_on_whole_cockpit_shutdown() {
+        use AgentStatus::*;
+        // A per-agent kill of a waiting agent → Stopped (you stopped it).
+        assert_eq!(
+            grade_teardown(Lifecycle::Running, false, Some(NeedsYou)),
+            Stopped
+        );
+        // A whole-cockpit shutdown of a waiting agent → NeedsYou preserved on disk,
+        // so the next launch's startup ⚑ flags the project (ENG-562 review #8).
+        assert_eq!(
+            grade_teardown(Lifecycle::Running, true, Some(NeedsYou)),
+            NeedsYou
+        );
+        // Shutdown of a live but non-waiting agent → Stopped (it wasn't waiting).
+        assert_eq!(
+            grade_teardown(Lifecycle::Running, true, Some(Running)),
+            Stopped
+        );
+        assert_eq!(grade_teardown(Lifecycle::Running, true, None), Stopped);
+        // Self-exit grading is unaffected by the shutdown flag.
+        assert_eq!(
+            grade_teardown(Lifecycle::Exited(Some(0)), true, Some(NeedsYou)),
+            Done
+        );
+        assert_eq!(grade_teardown(Lifecycle::Exited(None), false, None), Done);
+        assert_eq!(
+            grade_teardown(Lifecycle::Exited(Some(2)), true, Some(NeedsYou)),
+            Failed
+        );
+    }
 
     /// A throwaway git repo + manager, like the worktree tests use.
     fn temp_repo() -> (PathBuf, WorktreeManager) {

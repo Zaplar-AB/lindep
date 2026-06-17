@@ -262,8 +262,33 @@ fn resolve_or_pick(client: &Client, name: Option<&str>) -> Result<Option<Project
     match projects.len() {
         0 => Err("no projects visible to this API key".into()),
         1 => Ok(Some(projects.remove(0))),
-        _ => picker::pick(projects).map_err(|e| e.to_string()),
+        _ => {
+            let needs = projects_needing_you(&projects);
+            picker::pick(projects, &needs).map_err(|e| e.to_string())
+        }
     }
+}
+
+/// Which of `projects` have a persisted agent waiting on you — scanned from each
+/// configured project's saved session state so the startup picker flags them with
+/// the same `⚑` as the in-cockpit switcher (ENG-562). Best-effort: a project with
+/// no `~/.lindep` registry entry or no state file simply isn't flagged.
+fn projects_needing_you(projects: &[ProjectRef]) -> std::collections::HashSet<String> {
+    use crate::session::{AgentStatus, SessionStore};
+    let (registry, _warnings) = crate::registry::Registry::load();
+    let mut needs = std::collections::HashSet::new();
+    for p in projects {
+        let Ok(descriptor) = registry.project(&p.id) else {
+            continue; // not configured locally — it has no agents to need you
+        };
+        let state_path = registry.layout().state_path(&descriptor.handle);
+        if let Ok(store) = SessionStore::open_project(&p.id, state_path)
+            && store.sessions().any(|s| s.status == AgentStatus::NeedsYou)
+        {
+            needs.insert(p.id.clone());
+        }
+    }
+    needs
 }
 
 fn parse_size(spec: &str) -> (u16, u16) {
@@ -946,6 +971,32 @@ mod tests {
         );
         assert!(out.contains("L0"));
         assert!(out.contains("INFRA-77"), "external blocker missing");
+    }
+
+    #[test]
+    fn the_spine_bands_issues_by_readiness() {
+        // ENG-558: the Issues spine is a readiness schedule — section dividers
+        // NEEDS-YOU · RUNNING · READY · BLOCKED · DONE, top→bottom. Reuses the
+        // existing list (no new view). Host two agents on otherwise-blocked
+        // issues so the agent bands appear without emptying the READY band.
+        let mut app = App::new(demo::graph());
+        app.fleet.insert("ZAP-201".into(), AgentStatus::NeedsYou);
+        app.fleet.insert("ZAP-205".into(), AgentStatus::Running);
+        let out = render_snapshot(&mut app, 160, 48).expect("render");
+        for band in ["NEEDS YOU", "RUNNING", "READY", "BLOCKED", "DONE"] {
+            assert!(out.contains(band), "band header {band} missing:\n{out}");
+        }
+        // The READY divider carries the dispatch affordance.
+        assert!(out.contains("dispatch"), "ready lane hint missing:\n{out}");
+        // Bands are ordered top→bottom.
+        let pos = |s: &str| out.find(s).expect("band header present");
+        assert!(
+            pos("NEEDS YOU") < pos("RUNNING"),
+            "needs-you above running:\n{out}"
+        );
+        assert!(pos("RUNNING") < pos("READY"), "running above ready:\n{out}");
+        assert!(pos("READY") < pos("BLOCKED"), "ready above blocked:\n{out}");
+        assert!(pos("BLOCKED") < pos("DONE"), "blocked above done:\n{out}");
     }
 
     #[test]

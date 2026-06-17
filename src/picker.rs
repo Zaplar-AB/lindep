@@ -410,16 +410,23 @@ pub(crate) fn render_repo_overlay(picker: &mut RepoPicker, frame: &mut Frame, fu
 
 /// Run the picker until the user selects a project (`Some`) or quits (`None`).
 /// Manages its own alternate screen; the caller restores nothing.
-pub fn pick(projects: Vec<ProjectRef>) -> io::Result<Option<ProjectRef>> {
+pub fn pick(
+    projects: Vec<ProjectRef>,
+    needs_you: &std::collections::HashSet<String>,
+) -> io::Result<Option<ProjectRef>> {
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut Picker::new(projects));
+    let result = run(&mut terminal, &mut Picker::new(projects), needs_you);
     ratatui::restore();
     result
 }
 
-fn run(terminal: &mut DefaultTerminal, picker: &mut Picker) -> io::Result<Option<ProjectRef>> {
+fn run(
+    terminal: &mut DefaultTerminal,
+    picker: &mut Picker,
+    needs_you: &std::collections::HashSet<String>,
+) -> io::Result<Option<ProjectRef>> {
     loop {
-        terminal.draw(|frame| draw(picker, frame))?;
+        terminal.draw(|frame| draw(picker, frame, needs_you))?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -450,7 +457,7 @@ fn run(terminal: &mut DefaultTerminal, picker: &mut Picker) -> io::Result<Option
     }
 }
 
-fn draw(picker: &mut Picker, frame: &mut Frame) {
+fn draw(picker: &mut Picker, frame: &mut Frame, needs_you: &std::collections::HashSet<String>) {
     let [header, body, hint] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -483,10 +490,14 @@ fn draw(picker: &mut Picker, frame: &mut Frame) {
         .order
         .iter()
         .map(|&i| {
-            ListItem::new(Line::from(Span::styled(
-                picker.projects[i].name.clone(),
-                Style::new().fg(INK),
-            )))
+            let project = &picker.projects[i];
+            let mut spans = vec![Span::styled(project.name.clone(), Style::new().fg(INK))];
+            // The same ⚑ the in-cockpit switcher shows (render_overlay), now at
+            // launch too (ENG-562) — see which project wants you before you pick.
+            if needs_you.contains(&project.id) {
+                spans.push(Span::styled("  ⚑", Style::new().fg(AMBER_400).bold()));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let list = List::new(items)
@@ -558,15 +569,19 @@ mod tests {
     }
 
     #[test]
-    fn renders_without_panic() {
+    fn renders_without_panic_and_flags_a_needy_project() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut p = Picker::new(projects());
+        // Billing (id 1) has an agent waiting — the startup picker flags it with
+        // the same ⚑ as the in-cockpit switcher (ENG-562 picker symmetry).
+        let needs = std::collections::HashSet::from(["1".to_string()]);
         let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        term.draw(|f| draw(&mut p, f)).unwrap();
+        term.draw(|f| draw(&mut p, f, &needs)).unwrap();
         let out = term.backend().to_string();
         assert!(out.contains("select a project"));
         assert!(out.contains("Billing"));
+        assert!(out.contains('⚑'), "the needy project is flagged at launch");
     }
 
     fn repo_choices() -> Vec<RepoChoice> {
