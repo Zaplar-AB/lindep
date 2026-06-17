@@ -33,9 +33,10 @@
 //! caller on the tokio runtime invokes them via `spawn_blocking`, exactly like the
 //! worktree manager.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -47,6 +48,12 @@ pub enum MirrorError {
     /// `git` could not be launched at all (not installed / not on `PATH`).
     #[error("could not run git: {0}")]
     Spawn(#[source] std::io::Error),
+
+    /// An I/O failure while streaming a `git clone`'s progress — reading its stderr
+    /// pipe or waiting on the child — distinct from failing to launch git
+    /// ([`Spawn`](Self::Spawn)) or a non-zero exit ([`Git`](Self::Git)).
+    #[error("streaming git clone: {0}")]
+    Stream(#[source] std::io::Error),
 
     /// A `git` invocation exited non-zero.
     #[error("`{command}` failed (exit {code:?}): {stderr}")]
@@ -86,6 +93,14 @@ pub enum MirrorError {
     Referenced { handle: String, refs: usize },
 }
 
+/// A sink for `git clone` progress: invoked with each parsed `(phase, percent)`
+/// update (e.g. `("Receiving objects", 45)`), already throttled to one call per
+/// change so a caller can surface it (footer / stderr) without flooding. The first
+/// materialisation of a project pays a real `git clone --mirror` of hundreds of MB,
+/// so streaming this is what keeps the cockpit from looking frozen for 30 s+
+/// (the v1.6 "surface progress" gap). Called synchronously on the cloning thread.
+pub type ProgressFn<'a> = &'a dyn Fn(&str, u8);
+
 /// Ensure the L1 bare mirror for `repo` exists at [`Layout::mirror_path`] and is
 /// cloned from the registry's source, returning its path. Idempotent: an existing,
 /// matching mirror is returned untouched; a mismatched remote is a hard error
@@ -114,7 +129,7 @@ pub fn ensure_mirror(layout: &Layout, repo: &RepoEntry) -> Result<PathBuf, Mirro
     let mirrors_dir = layout.mirrors_dir();
     mkdir_p(&mirrors_dir)?;
     let _lock = FileLock::acquire(&lock_path(&mirrors_dir, &repo.handle))?;
-    ensure_mirror_locked(layout, repo, &source, &mirror)
+    ensure_mirror_locked(layout, repo, &source, &mirror, None)
 }
 
 /// Materialise the bare mirror assuming the per-handle `flock` is **already held**.
@@ -127,6 +142,7 @@ fn ensure_mirror_locked(
     repo: &RepoEntry,
     source: &str,
     mirror: &Path,
+    progress: Option<ProgressFn>,
 ) -> Result<PathBuf, MirrorError> {
     if is_git_dir(mirror) {
         verify_mirror_source(mirror, repo, source)?;
@@ -137,8 +153,19 @@ fn ensure_mirror_locked(
     sweep_partials(&mirrors_dir, &format!("{}.git", repo.handle));
     let tmp = partial_path(mirror);
     // `--mirror` gives a bare repo whose refs map 1:1 to the source — the shared
-    // object DB every reference clone borrows from.
-    git(&["clone", "--mirror", source, &tmp.to_string_lossy()], None)?;
+    // object DB every reference clone borrows from. This is the slow,
+    // hundreds-of-MB clone (the first-materialisation cost), so it streams
+    // `--progress` to the sink.
+    git_clone_streaming(
+        &[
+            "clone",
+            "--mirror",
+            "--progress",
+            source,
+            &tmp.to_string_lossy(),
+        ],
+        progress,
+    )?;
     if !is_git_dir(&tmp) {
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(MirrorError::Git {
@@ -163,6 +190,19 @@ pub fn ensure_clone(
     project_handle: &str,
     repo: &RepoEntry,
 ) -> Result<PathBuf, MirrorError> {
+    ensure_clone_with_progress(layout, project_handle, repo, None)
+}
+
+/// [`ensure_clone`] that streams the slow `git clone --mirror` (and the near-instant
+/// `--shared` reference clone) to a `progress` sink, so the cockpit can surface
+/// "materialising … Receiving objects 45%" on first materialisation instead of a
+/// frozen footer. With `progress: None` it behaves exactly like [`ensure_clone`].
+pub fn ensure_clone_with_progress(
+    layout: &Layout,
+    project_handle: &str,
+    repo: &RepoEntry,
+    progress: Option<ProgressFn>,
+) -> Result<PathBuf, MirrorError> {
     let mirror_path = layout.mirror_path(&repo.handle);
     let source = repo
         .mirror_source()
@@ -178,7 +218,7 @@ pub fn ensure_clone(
     // the held lock also closes the former lockless window between resolving the
     // mirror path and re-acquiring the lock, where a reclaim could delete it.
     let _lock = FileLock::acquire(&lock_path(&mirrors_dir, &repo.handle))?;
-    let mirror = ensure_mirror_locked(layout, repo, &source, &mirror_path)?;
+    let mirror = ensure_mirror_locked(layout, repo, &source, &mirror_path, progress)?;
     let dst = layout.repo_clone_path(project_handle, &repo.handle);
 
     if dst.exists() {
@@ -199,15 +239,17 @@ pub fn ensure_clone(
 
     // `--shared` borrows the mirror's object DB via `objects/info/alternates`
     // (~0 objects copied), the offline-fast local equivalent of `--reference`.
-    // We deliberately never `--dissociate`: the borrow is the whole point.
-    git(
+    // We deliberately never `--dissociate`: the borrow is the whole point. Streamed
+    // for symmetry, though a shared clone copies almost nothing and reports little.
+    git_clone_streaming(
         &[
             "clone",
             "--shared",
+            "--progress",
             &mirror.to_string_lossy(),
             &tmp.to_string_lossy(),
         ],
-        None,
+        progress,
     )?;
     if !is_git_dir(&tmp.join(".git")) && !is_git_dir(&tmp) {
         let _ = std::fs::remove_dir_all(&tmp);
@@ -586,6 +628,130 @@ fn verify_mirror_source(mirror: &Path, repo: &RepoEntry, source: &str) -> Result
     }
 }
 
+/// Run a `git clone … --progress`, streaming its stderr progress meter to
+/// `progress` as it downloads. Git only emits a progress meter under `--progress`
+/// when stderr isn't a TTY (ours is a pipe), and writes it as `\r`-delimited
+/// in-place updates; we read the pipe byte-stream, split on `\r`/`\n`, parse the
+/// `"<phase>: NN%"` lines, throttle to one call per `(phase, percent)` change, and
+/// hand each through. `\n`-terminated lines (git's real messages, e.g. `fatal: …`)
+/// are kept as a small tail so a failing clone still reports a meaningful `stderr`
+/// — exactly like [`git`]. With `progress: None` it still clones (and captures the
+/// error tail); it just doesn't surface the meter.
+fn git_clone_streaming(args: &[&str], progress: Option<ProgressFn>) -> Result<(), MirrorError> {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.args(args);
+    // `git clone` writes nothing useful to stdout; the progress meter and every
+    // message go to stderr, which we pipe so we can read it incrementally.
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(MirrorError::Spawn)?;
+    let mut stderr = child.stderr.take().expect("stderr piped above");
+
+    // Last `(phase, percent)` surfaced, so we emit only on a real change (git
+    // repaints the same percent many times a second). Last few `\n`-terminated
+    // lines, so a non-zero exit can report the actual error, not progress chatter.
+    let mut last: Option<(String, u8)> = None;
+    let mut tail: VecDeque<String> = VecDeque::new();
+    let mut seg: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    let mut handle_segment = |seg: &[u8], to_tail: bool| {
+        if seg.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(seg);
+        if let Some((phase, percent)) = parse_clone_progress(&text) {
+            let changed = match &last {
+                Some((p, pc)) => p != &phase || *pc != percent,
+                None => true,
+            };
+            if let Some(emit) = progress
+                && changed
+            {
+                emit(&phase, percent);
+                last = Some((phase, percent));
+            }
+        }
+        if to_tail {
+            let line = text.trim().to_string();
+            if !line.is_empty() {
+                tail.push_back(line);
+                while tail.len() > 12 {
+                    tail.pop_front();
+                }
+            }
+        }
+    };
+
+    loop {
+        let n = match stderr.read(&mut chunk) {
+            Ok(n) => n,
+            // A signal interrupting the read isn't a clone failure — retry, exactly
+            // as std's own `read_to_end` (the old `Command::output()` path) did.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A real read error abandons the clone: kill + reap the child first so we
+            // don't leave a zombie/orphan git holding the half-built `*.partial` dir.
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MirrorError::Stream(e));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        for &b in &chunk[..n] {
+            match b {
+                // Progress overwrite — parse for the meter, never the error tail.
+                b'\r' => {
+                    handle_segment(&seg, false);
+                    seg.clear();
+                }
+                // A real line — both a possible progress tick AND error context.
+                b'\n' => {
+                    handle_segment(&seg, true);
+                    seg.clear();
+                }
+                _ => seg.push(b),
+            }
+        }
+    }
+    // A trailing fragment with no final newline (rare) is still error context.
+    handle_segment(&seg, true);
+
+    let status = child.wait().map_err(MirrorError::Stream)?;
+    if !status.success() {
+        return Err(MirrorError::Git {
+            command: format!("git {}", args.join(" ")),
+            code: status.code(),
+            stderr: Vec::from(tail).join("\n"),
+        });
+    }
+    Ok(())
+}
+
+/// Parse one `git --progress` stderr line into `(phase, percent)`, or `None` if it
+/// carries no percentage (`"Cloning into …"`, `"Counting objects: 2740, done."`).
+/// Handles the `remote: ` prefix on server-side phases. Only percent-bearing lines
+/// drive the meter, so the footer ticks cleanly through "Compressing objects",
+/// "Receiving objects", "Resolving deltas" rather than flickering on every line.
+fn parse_clone_progress(raw: &str) -> Option<(String, u8)> {
+    let line = raw.trim();
+    let line = line.strip_prefix("remote:").map(str::trim).unwrap_or(line);
+    let (phase, rest) = line.split_once(':')?;
+    let phase = phase.trim();
+    if phase.is_empty() {
+        return None;
+    }
+    // The percent is the first `NN%` token in the remainder.
+    let percent: u8 = rest
+        .split_whitespace()
+        .find_map(|tok| tok.split('%').next().filter(|_| tok.contains('%')))
+        .and_then(|n| n.trim().parse().ok())?;
+    Some((phase.to_string(), percent.min(100)))
+}
+
 /// Run `git <args>` (optionally `-C <cwd>`), returning stdout on success.
 fn git(args: &[&str], cwd: Option<&Path>) -> Result<String, MirrorError> {
     let mut cmd = Command::new("git");
@@ -661,6 +827,41 @@ impl Drop for FileLock {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn parse_clone_progress_reads_only_percent_bearing_lines() {
+        // The percent-bearing meter lines — including the `remote:`-prefixed
+        // server-side phases — parse to (phase, percent).
+        assert_eq!(
+            parse_clone_progress("Receiving objects:  45% (1234/2740), 5.00 MiB | 4.00 MiB/s"),
+            Some(("Receiving objects".to_string(), 45))
+        );
+        assert_eq!(
+            parse_clone_progress("remote: Compressing objects: 100% (1234/1234), done."),
+            Some(("Compressing objects".to_string(), 100))
+        );
+        assert_eq!(
+            parse_clone_progress("Resolving deltas:   0% (0/1500)"),
+            Some(("Resolving deltas".to_string(), 0))
+        );
+
+        // Lines with no percentage drive nothing — no flicker on these.
+        assert_eq!(
+            parse_clone_progress("Cloning into bare repository '/tmp/x.git'..."),
+            None
+        );
+        assert_eq!(parse_clone_progress("Counting objects: 2740, done."), None);
+        assert_eq!(
+            parse_clone_progress("remote: Enumerating objects: 2740, done."),
+            None
+        );
+        assert_eq!(parse_clone_progress(""), None);
+        // A real error line (kept as the failure tail, never surfaced as a tick).
+        assert_eq!(
+            parse_clone_progress("fatal: repository 'x' does not exist"),
+            None
+        );
+    }
 
     /// A throwaway bare repo with one commit, standing in for a "true remote".
     /// Returns its path (under a unique temp dir).

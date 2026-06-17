@@ -23,8 +23,9 @@
 //! reconciles its store against its live worktrees and rehydrates its fleet view.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
@@ -102,6 +103,22 @@ impl PlaneBuilder {
 pub struct ProjectPlane {
     pub handle: SupervisorHandle,
     pub join: JoinHandle<()>,
+}
+
+/// Where [`build_plane`] surfaces first-materialisation clone progress. The slow
+/// `git clone --mirror` only runs the first time a project's repo is provisioned;
+/// these two callers see it in different places:
+///
+/// - [`CloneProgressOut::Footer`] — the in-cockpit path (switch / lazy open): the
+///   render loop is live, so each tick rides an [`AppEvent::MaterializeProgress`]
+///   to the footer.
+/// - [`CloneProgressOut::Stderr`] — the eager boot build, which runs *before* the
+///   TUI starts: there is no render loop yet, so it writes git's own style of
+///   in-place meter straight to stderr.
+#[derive(Clone, Copy)]
+pub enum CloneProgressOut {
+    Footer,
+    Stderr,
 }
 
 /// Reconcile a project's store against its live worktrees and rehydrate the fleet
@@ -280,8 +297,39 @@ fn teardown_issue(
         }
     }
 
-    if all_removed && let Ok(mut s) = store.lock() {
-        s.forget(issue);
+    // Tear down the issue's scratch datastores (ENG-561) recorded at launch, running
+    // each stored (already-substituted) teardown. Each that SUCCEEDS is pruned from the
+    // record; a failure keeps only that record, so a re-discard (e.g. after a repo push
+    // retry) retries just the still-undone teardowns. Without per-record pruning, a
+    // non-idempotent teardown (`dropdb` errors once the DB is gone) would re-run on
+    // every retry, keep `all_removed` false, and wedge the discard forever.
+    let scratch = match store.lock() {
+        Ok(s) => s
+            .get(issue)
+            .map(|sess| sess.scratch.clone())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let mut remaining = Vec::new();
+    for record in scratch {
+        if let Err(e) = crate::scratch::teardown(&record) {
+            let _ = events.send(AppEvent::Notification(format!(
+                "teardown {issue}/{}: {e}",
+                record.name
+            )));
+            all_removed = false;
+            remaining.push(record);
+        }
+    }
+
+    if let Ok(mut s) = store.lock() {
+        if all_removed {
+            s.forget(issue);
+        } else {
+            // Keep the session, but persist the pruned scratch set so a retry doesn't
+            // re-run a teardown that already succeeded.
+            s.set_scratch(issue, remaining);
+        }
         let _ = s.save();
     }
 }
@@ -427,6 +475,7 @@ pub async fn build_plane(
     registry: &Registry,
     project_id: &str,
     stores: &StoreRegistry,
+    progress: CloneProgressOut,
 ) -> Option<(ProjectPlane, HashSet<String>)> {
     // Resolve the project + its primary repo against the registry.
     let descriptor = match registry.project(project_id) {
@@ -463,10 +512,14 @@ pub async fn build_plane(
             .iter()
             .filter_map(|h| registry.repo(h).map(|e| (h.clone(), e.clone())))
             .collect(),
+        scratch: descriptor.scratch.clone(),
     };
 
     // Materialise the primary repo (mirror → reference clone) and re-root the
     // worktree manager there — all on the blocking pool, since `git clone` is slow.
+    // The first time, that clone is a real hundreds-of-MB `git clone --mirror`, so
+    // it streams `--progress` to `progress` (footer in-cockpit, stderr at boot)
+    // rather than leaving the cockpit looking frozen for 30 s+.
     let worktree = {
         let layout = layout.clone();
         let handle = project_handle.clone();
@@ -475,33 +528,106 @@ pub async fn build_plane(
         let exe = builder.exe.to_string_lossy().into_owned();
         let port = builder.hook_port;
         let token = builder.hook_token.clone();
-        match tokio::task::spawn_blocking(move || -> Result<WorktreeManager, String> {
-            // Best-effort, throttled mirror refresh so a (re)built clone forks off
-            // current upstream rather than the mirror's state at first create.
-            let _ = crate::mirror::refresh_mirror(&layout, &primary);
-            let clone = crate::mirror::ensure_clone(&layout, &handle, &primary)
+        let events = builder.events.clone();
+        let pid = project_id.to_string();
+        let pname = descriptor.name.clone();
+        // Did the clone actually draw a progress meter (vs. an already-present mirror
+        // that returns instantly)? Shared with the sink on the blocking thread so
+        // EVERY result arm below — success, clone error, or task panic — can close
+        // the meter out: the boot path owes a trailing newline, the footer path a
+        // terminal "materialised …" line. `Arc<AtomicBool>` because the sink runs on
+        // another thread; the post-`await` load happens-after it via the join.
+        let emitted = Arc::new(AtomicBool::new(false));
+        let result = tokio::task::spawn_blocking({
+            let emitted = Arc::clone(&emitted);
+            move || -> Result<WorktreeManager, String> {
+                // Best-effort, throttled mirror refresh so a (re)built clone forks off
+                // current upstream rather than the mirror's state at first create.
+                let _ = crate::mirror::refresh_mirror(&layout, &primary);
+                let sink = |phase: &str, percent: u8| match progress {
+                    CloneProgressOut::Footer => {
+                        emitted.store(true, Ordering::Relaxed);
+                        let _ = events.send(AppEvent::MaterializeProgress {
+                            project_id: pid.clone(),
+                            phase: phase.to_string(),
+                            percent,
+                        });
+                    }
+                    // Pre-TUI: an in-place meter, but only when stderr is a real
+                    // terminal — a redirected stderr (`lindep 2>log`) must not collect
+                    // `\r`/escape chatter. `\x1b[K` clears a longer previous phase; the
+                    // closing newline is printed by the caller once the clone finishes.
+                    CloneProgressOut::Stderr => {
+                        let mut err = std::io::stderr();
+                        if err.is_terminal() {
+                            emitted.store(true, Ordering::Relaxed);
+                            let _ =
+                                write!(err, "\r  materialising {pname} · {phase} {percent}%\x1b[K");
+                            let _ = err.flush();
+                        }
+                    }
+                };
+                let sink_ref: crate::mirror::ProgressFn = &sink;
+                let clone = crate::mirror::ensure_clone_with_progress(
+                    &layout,
+                    &handle,
+                    &primary,
+                    Some(sink_ref),
+                )
                 .map_err(|e| e.to_string())?;
-            // Install/refresh the v1.6 auto-push post-commit hook with THIS run's
-            // port + token (the stale-port trap). Hooks are shared per L2 clone, so
-            // one install covers every worktree of this (project, repo).
-            let _ =
-                crate::notify::write_post_commit_hook(&clone, &exe, port, &token, &primary.handle);
-            let worktrees_root = layout.worktrees_dir(&handle);
-            let prefix = prefix.unwrap_or_else(crate::worktree::default_branch_prefix);
-            WorktreeManager::with_layout(&clone, prefix, &worktrees_root, &primary.handle)
-                .map_err(|e| e.to_string())
+                // Install/refresh the v1.6 auto-push post-commit hook with THIS run's
+                // port + token (the stale-port trap). Hooks are shared per L2 clone, so
+                // one install covers every worktree of this (project, repo).
+                let _ = crate::notify::write_post_commit_hook(
+                    &clone,
+                    &exe,
+                    port,
+                    &token,
+                    &primary.handle,
+                );
+                let worktrees_root = layout.worktrees_dir(&handle);
+                let prefix = prefix.unwrap_or_else(crate::worktree::default_branch_prefix);
+                WorktreeManager::with_layout(&clone, prefix, &worktrees_root, &primary.handle)
+                    .map_err(|e| e.to_string())
+            }
         })
-        .await
-        {
-            Ok(Ok(worktree)) => worktree,
+        .await;
+
+        let drew_meter = emitted.load(Ordering::Relaxed);
+        // Close the boot meter's in-place line in EVERY arm so later output (or the
+        // error line) starts fresh — the success-only newline was the asymmetry that
+        // left a dangling meter when a clone failed mid-download.
+        let close_stderr_meter = || {
+            if drew_meter && matches!(progress, CloneProgressOut::Stderr) {
+                eprintln!();
+            }
+        };
+        match result {
+            Ok(Ok(worktree)) => {
+                close_stderr_meter();
+                // In-cockpit: settle the lingering "materialising … 100%" tick into a
+                // terminal "materialised …" line (only if we actually drew progress —
+                // the fast path leaves the "switched to …" footer untouched).
+                if drew_meter && matches!(progress, CloneProgressOut::Footer) {
+                    let _ = builder.events.send(AppEvent::MaterializeDone {
+                        project_id: project_id.to_string(),
+                    });
+                }
+                worktree
+            }
             Ok(Err(e)) => {
+                close_stderr_meter();
+                // The footer path's error Notification below replaces any stale tick.
                 let _ = builder.events.send(AppEvent::Notification(format!(
                     "project {}: can't provision repo: {e}",
                     descriptor.name
                 )));
                 return None;
             }
-            Err(_) => return None,
+            Err(_) => {
+                close_stderr_meter();
+                return None;
+            }
         }
     };
 
@@ -852,6 +978,9 @@ impl Workspace {
             &self.registry,
             project_id,
             &self.stores,
+            // The render loop is live here (switch / lazy open), so a slow first
+            // clone ticks into the footer rather than looking frozen.
+            CloneProgressOut::Footer,
         )
         .await?;
         let handle = plane.handle.clone();
@@ -1235,6 +1364,89 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_launch_provisions_scratch_injects_its_env_and_records_it() {
+        // ENG-561 end to end: a project's [[scratch]] is provisioned at launch, its
+        // resolved env (the spec table + any KEY=VALUE the command prints) is injected
+        // into the agent, and the resource is recorded on the session for teardown.
+        let api = temp_repo("scr-api");
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("lindep-scr-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let body = format!(
+            "[[repo]]\nhandle = \"api\"\nlocal = \"{}\"\n\n\
+             [[project]]\nid = \"proj\"\nhandle = \"proj\"\n\
+             candidates = [\"api\"]\nprimary = \"api\"\n\n\
+             [[project.scratch]]\nname = \"db\"\n\
+             provision = \"echo CAPTURED=yes\"\nteardown = \"true\"\n\
+             env = {{ SCRATCH_DB = \"scratch_{{slug}}\" }}\n",
+            api.display(),
+        );
+        std::fs::write(root.join("registry.toml"), body).unwrap();
+        let layout = Layout::new(&root);
+        let (registry, warnings) = Registry::load_at(layout.clone());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let (tx, _rx) = crate::event::channel();
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let cfgs: CfgLog = Arc::new(Mutex::new(HashMap::new()));
+        let b = builder(
+            tx,
+            capturing_spawn(Arc::clone(&spawns), Arc::clone(&cfgs)),
+            Arc::new(AtomicUsize::new(0)),
+            10,
+        );
+        let stores: StoreRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (ws, join) = Workspace::start(
+            Handle::current(),
+            b,
+            registry,
+            HashMap::new(),
+            Arc::clone(&stores),
+        );
+
+        ws.launch_with_repos(
+            "proj".into(),
+            "ENG-1".into(),
+            "Feature".into(),
+            None,
+            vec![],
+        );
+        assert!(
+            eventually(|| spawns.load(Ordering::Relaxed) >= 1).await,
+            "the agent spawns"
+        );
+
+        let cfg = cfgs.lock().unwrap().get("ENG-1").cloned().expect("a spawn");
+        // The spec's env table value is substituted: {slug} for "ENG-1" canonicalises
+        // to the readable prefix `eng_1` plus a collision-free hash suffix.
+        assert!(
+            cfg.env.iter().any(|(k, v)| k == "SCRATCH_DB"
+                && v.starts_with("scratch_eng_1")
+                && *v == format!("scratch_{}", crate::scratch::slug("ENG-1"))),
+            "scratch env is injected: {:?}",
+            cfg.env
+        );
+        // …and a KEY=VALUE printed by the provision command is captured + injected.
+        assert!(
+            cfg.env
+                .contains(&("CAPTURED".to_string(), "yes".to_string())),
+            "stdout-captured env is injected: {:?}",
+            cfg.env
+        );
+        // The resource is recorded on the session so teardown/sweep can drop it.
+        let store = stores.lock().unwrap().get("proj").cloned().unwrap();
+        let scratch = store.lock().unwrap().get("ENG-1").unwrap().scratch.clone();
+        assert_eq!(scratch.len(), 1);
+        assert_eq!(scratch[0].name, "db");
+        assert_eq!(scratch[0].teardown, "true");
+
+        ws.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_live_agent_cap_spans_projects() {
         // The cap's load-bearing promise: max_concurrent bounds live agents across
         // the WHOLE workspace via the shared live_count, not per project. With a cap
@@ -1327,6 +1539,7 @@ mod tests {
             branch_prefix: "felix".to_string(),
             primary: "p".to_string(),
             candidates: HashMap::new(),
+            scratch: Vec::new(),
         };
         let resumable = reconcile_and_rehydrate(&wt, &provision, &store, &tx, "proj-x");
 
@@ -1390,6 +1603,7 @@ mod tests {
             branch_prefix: "felix".to_string(),
             primary: "api".to_string(),
             candidates: HashMap::from([("api".to_string(), entry.clone())]),
+            scratch: Vec::new(),
         };
         // Materialise the primary clone + a worktree for ENG-1.
         let clone = crate::mirror::ensure_clone(&layout, "proj", &entry).unwrap();

@@ -2272,6 +2272,28 @@ impl App {
                 self.set_footer(text);
                 true
             }
+            // First-materialisation clone progress for the project being entered (the
+            // scope guard above already dropped a backgrounded clone's ticks). Set the
+            // footer directly — unlike a `Notification` this is a high-frequency tick,
+            // so it must NOT clear `pending_launch` or disturb a needs-you alert.
+            AppEvent::MaterializeProgress {
+                project_id,
+                phase,
+                percent,
+            } => {
+                let name = self.project_name(&project_id);
+                self.status_msg = Some(format!("materialising {name} · {phase} {percent}%"));
+                true
+            }
+            // The first clone finished — replace the terminal "… 100%" tick with a
+            // settled line. Like the progress arm, this must NOT clear `pending_launch`
+            // (a launch queued during the clone stays pending) or touch a needs-you
+            // alert, so it sets the footer directly rather than via `set_footer`.
+            AppEvent::MaterializeDone { project_id } => {
+                let name = self.project_name(&project_id);
+                self.status_msg = Some(format!("materialised {name}"));
+                true
+            }
             // A disk-reclaim scan/delete finished on the blocking pool: open,
             // refresh, or close the prompt off the result (see `apply_reclaim_scan`).
             AppEvent::ReclaimScanned {

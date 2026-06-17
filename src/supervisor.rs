@@ -29,7 +29,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::backend::{AgentBackend, Lifecycle, SpawnConfig, SpawnFn};
 use crate::event::{AppEvent, AppEventTx};
-use crate::registry::{Layout, RepoEntry};
+use crate::registry::{Layout, RepoEntry, ScratchSpec};
 use crate::session::{AgentStatus, SessionStore};
 use crate::worktree::WorktreeManager;
 
@@ -47,6 +47,9 @@ pub struct RepoProvision {
     pub branch_prefix: String,
     pub primary: String,
     pub candidates: StdHashMap<String, RepoEntry>,
+    /// The project's declared scratch datastores (ENG-561), provisioned per issue at
+    /// launch and recorded for teardown. Empty for a project with no `[[scratch]]`.
+    pub scratch: Vec<ScratchSpec>,
 }
 
 impl RepoProvision {
@@ -435,6 +438,22 @@ async fn run_agent(task: AgentTask) {
 /// paired with per-secondary failure messages (skipped, not fatal — see the loop).
 type MaterializeOutcome = Result<(Vec<(String, crate::worktree::Worktree)>, Vec<String>), String>;
 
+/// Best-effort teardown of freshly-provisioned scratch records on the blocking pool —
+/// rolls back what a launch created when it then aborts (cancel, or a `required`
+/// failure), so an external resource isn't orphaned before it's ever recorded on the
+/// session. Reused (pre-existing persisted) resources are filtered out by the caller.
+async fn rollback_scratch(records: Vec<crate::session::ScratchRecord>) {
+    if records.is_empty() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        for record in &records {
+            let _ = crate::scratch::teardown(record);
+        }
+    })
+    .await;
+}
+
 async fn supervise(task: &AgentTask) {
     let notify = |msg: String| {
         let _ = task.events.send(AppEvent::Notification(msg));
@@ -458,6 +477,15 @@ async fn supervise(task: &AgentTask) {
         .lock()
         .ok()
         .and_then(|s| s.get(&task.issue).map(|sess| sess.repos.clone()))
+        .unwrap_or_default();
+    // The issue's prior scratch records (ENG-561), read once: lets a `persist`ed
+    // resource reuse its recorded port across a resume, and lets us retain a record
+    // whose spec was removed from the registry so discard still tears it down.
+    let existing_scratch: Vec<crate::session::ScratchRecord> = task
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.get(&task.issue).map(|sess| sess.scratch.clone()))
         .unwrap_or_default();
     let materialize = {
         let provision = task.provision.clone();
@@ -593,6 +621,90 @@ async fn supervise(task: &AgentTask) {
         }
     }
 
+    // ── Scratch datastores (ENG-561) ──────────────────────────────────────────
+    // Provision the project's [[scratch]] resources for this issue on the blocking
+    // pool (they shell out) so the agent's app/tests get an isolated DB / ports. The
+    // resolved env is injected into the spawn below; the records are persisted so
+    // teardown/sweep can drop them. Best-effort per resource unless `required`; a
+    // `persist`ed resource reuses its recorded port across a resume.
+    let mut scratch_env: Vec<(String, String)> = Vec::new();
+    let mut scratch_records: Vec<crate::session::ScratchRecord> = Vec::new();
+    if !task.provision.scratch.is_empty() {
+        let specs = task.provision.scratch.clone();
+        let prior = existing_scratch.clone();
+        let ctx = crate::scratch::Context {
+            issue: task.issue.clone(),
+            project: task.provision.project_handle.clone(),
+            workspace: workspace_dir.clone(),
+        };
+        // Await the provision to completion rather than racing the cancel token: a
+        // scratch resource is EXTERNAL (a DB/container/port), not on-disk under the
+        // worktree, so unlike the git materialize there's no reconcile sweep to mop it
+        // up — abandoning a mid-flight provision would orphan whatever the detached
+        // thread then creates. The wait is bounded by one provision; on cancel we roll
+        // back what THIS pass freshly created (a reused persisted resource pre-dates the
+        // launch and is left alone) and bail before spawning.
+        let provisioned = match tokio::task::spawn_blocking(move || {
+            crate::scratch::provision_all(&specs, &ctx, &prior)
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return notify(format!("scratch task for {} panicked: {e}", task.issue)),
+        };
+        if task.token.is_cancelled() {
+            rollback_scratch(
+                provisioned
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|p| !p.reused)
+                    .map(|p| p.record)
+                    .collect(),
+            )
+            .await;
+            return;
+        }
+        let mut ok: Vec<crate::scratch::Provisioned> = Vec::new();
+        let mut fatal: Option<String> = None;
+        for outcome in provisioned {
+            match outcome {
+                Ok(p) => ok.push(p),
+                // `required` → the agent can't run without it; abort the launch.
+                Err(e) if e.required => {
+                    if fatal.is_none() {
+                        fatal = Some(format!(
+                            "{}: scratch `{}` failed: {}",
+                            task.issue, e.name, e.message
+                        ));
+                    }
+                }
+                // Best-effort: footer it and launch anyway.
+                Err(e) => notify(format!(
+                    "{}: scratch `{}` skipped — {}",
+                    task.issue, e.name, e.message
+                )),
+            }
+        }
+        if let Some(msg) = fatal {
+            // Roll back only what this pass freshly CREATED — a reused persisted
+            // resource pre-dates the launch (the resume reconnected to it) and the
+            // persist contract keeps it across an abort. Freshly-created records aren't
+            // persisted yet, so without this they'd orphan.
+            rollback_scratch(
+                ok.iter()
+                    .filter(|p| !p.reused)
+                    .map(|p| p.record.clone())
+                    .collect(),
+            )
+            .await;
+            return notify(msg);
+        }
+        for p in ok {
+            scratch_env.extend(p.env);
+            scratch_records.push(p.record);
+        }
+    }
+
     // Session record: deterministic id, resume if we've launched this before.
     let (session_id, resume, snapshot) = {
         let Ok(mut store) = task.store.lock() else {
@@ -614,6 +726,16 @@ async fn supervise(task: &AgentTask) {
             }
         }
         store.set_repos(&task.issue, durable);
+        // Record the scratch resources (ENG-561), unioned with any prior record whose
+        // spec was removed from the registry — so discard still tears that resource
+        // down rather than orphaning it (same retention discipline as repos).
+        let mut durable_scratch = scratch_records;
+        for prior in existing_scratch {
+            if !durable_scratch.iter().any(|r| r.name == prior.name) {
+                durable_scratch.push(prior);
+            }
+        }
+        store.set_scratch(&task.issue, durable_scratch);
         // Snapshot (+ ordering seq) under the lock; persist after dropping it so
         // blocking fs I/O never runs under the store mutex (a hook waiting on the
         // same lock must not block behind a disk rename).
@@ -708,6 +830,13 @@ async fn supervise(task: &AgentTask) {
         spawn_cfg
             .env
             .push(("LINDEP_ISSUE".to_string(), task.issue.clone()));
+        // Inject each scratch resource's resolved env (ENG-561) so the agent's app /
+        // tests reach their isolated DB / ports with no app changes. Re-pushed every
+        // attempt (the spawn consumes `spawn_cfg`), and re-resolved every launch — the
+        // stale-port-trap rule, the same reason the hook port/token are re-pushed here.
+        for (key, value) in &scratch_env {
+            spawn_cfg.env.push((key.clone(), value.clone()));
+        }
 
         let backend = match (task.spawn)(spawn_cfg, task.events.clone()) {
             Ok(backend) => backend,
@@ -969,6 +1098,7 @@ mod tests {
                 branch_prefix: "test".to_string(),
                 primary: "test".to_string(),
                 candidates: StdHashMap::new(),
+                scratch: Vec::new(),
             },
             store: Arc::new(Mutex::new(
                 SessionStore::load(dir.join(".lindep").join("state.json")).unwrap(),

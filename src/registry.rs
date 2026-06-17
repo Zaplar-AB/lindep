@@ -123,6 +123,32 @@ impl RepoEntry {
     }
 }
 
+/// One declared scratch datastore for a project (ENG-561). lindep runs `provision`
+/// at launch and `teardown` at discard, injecting `env` into the agent — staying
+/// engine-agnostic (the project owns the commands, exactly as lindep shells `git`
+/// rather than embedding it). Placeholders `{issue}/{slug}/{project}/{workspace}/{port}`
+/// are substituted into `provision`/`teardown`/`env`; see [`crate::scratch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchSpec {
+    /// Identifier within the project (path-safe) — used in the session record + footers.
+    pub name: String,
+    /// Shell command run at launch to create the resource. Must be idempotent
+    /// (resume re-runs it). May print `KEY=VALUE` lines on stdout to inject extra env.
+    pub provision: String,
+    /// Shell command run at discard/sweep to drop it. May be empty (nothing to undo).
+    pub teardown: String,
+    /// Environment handed to the agent (values substituted). A sorted map for
+    /// deterministic injection order.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Mint a free TCP port and expose it as `{port}`.
+    pub needs_port: bool,
+    /// A provision failure aborts the launch; otherwise it's footered and the agent
+    /// still runs (default).
+    pub required: bool,
+    /// Keep the resource across cancel/resume (a container); else recreate each launch.
+    pub persist: bool,
+}
+
 /// One Linear project's binding to a set of repos. The `handle` names its isolated
 /// on-disk world under `~/.lindep/projects/<handle>/`; `candidates` is the fixed
 /// trust boundary the up-front select and the agent lazy-pull both draw from.
@@ -145,6 +171,9 @@ pub struct ProjectDescriptor {
     /// Optional per-project branch namespace; `None` uses the worktree manager's
     /// compiled-in default (the git user name).
     pub branch_prefix: Option<String>,
+    /// Declared scratch datastores (ENG-561), provisioned per issue at launch and
+    /// torn down at discard. Empty for a project with no `[[scratch]]` entries.
+    pub scratch: Vec<ScratchSpec>,
 }
 
 /// The `~/.lindep` on-disk layout. The **single** place the per-project directory
@@ -561,6 +590,26 @@ struct ProjectFile {
     primary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branch_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scratch: Vec<ScratchFile>,
+}
+
+/// On-disk shape of a `[[project.scratch]]` table (ENG-561).
+#[derive(Debug, Deserialize, Serialize)]
+struct ScratchFile {
+    name: String,
+    #[serde(default)]
+    provision: String,
+    #[serde(default)]
+    teardown: String,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    needs_port: bool,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    persist: bool,
 }
 
 impl ProjectFile {
@@ -609,6 +658,38 @@ impl ProjectFile {
             ));
             return None;
         }
+        // Resolve scratch specs (ENG-561): a malformed one (missing/unsafe name, or
+        // no provision command) is dropped with a warning rather than failing the
+        // whole project — the same warn-never-abort discipline as the rest of the loader.
+        let mut scratch: Vec<ScratchSpec> = Vec::new();
+        for sf in self.scratch {
+            if sf.name.trim().is_empty() || !is_safe_handle(&sf.name) {
+                warnings.push(format!(
+                    "registry {}: project `{}` has a [[scratch]] with a missing or unsafe `name`; skipping it",
+                    here(),
+                    self.id
+                ));
+                continue;
+            }
+            if sf.provision.trim().is_empty() {
+                warnings.push(format!(
+                    "registry {}: project `{}` scratch `{}` has no `provision` command; skipping it",
+                    here(),
+                    self.id,
+                    sf.name
+                ));
+                continue;
+            }
+            scratch.push(ScratchSpec {
+                name: sf.name,
+                provision: sf.provision,
+                teardown: sf.teardown,
+                env: sf.env,
+                needs_port: sf.needs_port,
+                required: sf.required,
+                persist: sf.persist,
+            });
+        }
         Some(ProjectDescriptor {
             project_id: self.id,
             handle: self.handle,
@@ -616,6 +697,7 @@ impl ProjectFile {
             candidates,
             primary: self.primary,
             branch_prefix: self.branch_prefix.filter(|s| !s.trim().is_empty()),
+            scratch,
         })
     }
 }
@@ -691,6 +773,52 @@ mod tests {
         assert_eq!(proj.candidates, vec!["lindep", "shared-proto"]);
         assert_eq!(proj.branch_prefix.as_deref(), Some("felix"));
         assert_eq!(reg.candidate_repos("p1").len(), 2);
+    }
+
+    #[test]
+    fn parses_a_project_scratch_spec_and_drops_malformed_ones() {
+        let root = temp_root("scratch");
+        let layout = write_registry(
+            &root,
+            r#"
+            [[repo]]
+            handle = "api"
+            local = "/tmp/api"
+
+            [[project]]
+            id = "p1"
+            handle = "proj"
+            primary = "api"
+
+              [[project.scratch]]
+              name = "db"
+              provision = "createdb scratch_{slug}"
+              teardown = "dropdb scratch_{slug}"
+              env = { DATABASE_URL = "postgres:///scratch_{slug}" }
+              required = true
+
+              [[project.scratch]]
+              name = "noprov"
+
+              [[project.scratch]]
+              name = "../evil"
+              provision = "x"
+            "#,
+        );
+        let (reg, warnings) = Registry::load_at(layout);
+        let proj = reg.project("p1").unwrap();
+        assert_eq!(proj.scratch.len(), 1, "only the valid scratch resolves");
+        let db = &proj.scratch[0];
+        assert_eq!(db.name, "db");
+        assert_eq!(db.provision, "createdb scratch_{slug}");
+        assert!(db.required);
+        assert!(!db.needs_port);
+        assert_eq!(
+            db.env.get("DATABASE_URL").map(String::as_str),
+            Some("postgres:///scratch_{slug}")
+        );
+        // The provision-less and unsafe-name entries are each dropped with a warning.
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
 
     #[test]

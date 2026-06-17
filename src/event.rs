@@ -109,6 +109,23 @@ pub enum AppEvent {
         opening: bool,
         note: Option<String>,
     },
+    /// First-materialisation clone progress for `project_id` — a slow
+    /// `git clone --mirror` (hundreds of MB) is streaming, so the footer shows
+    /// e.g. "materialising core · Receiving objects 45%" instead of looking frozen
+    /// (the v1.6 "surface progress" gap). `phase` is git's phase label and
+    /// `percent` its 0–100 reading. Project-scoped so switching away while a
+    /// backgrounded project still clones drops its ticks (the cross-project guard).
+    MaterializeProgress {
+        project_id: String,
+        phase: String,
+        percent: u8,
+    },
+    /// First materialisation of `project_id` finished cloning — sent only when a
+    /// progress meter was actually drawn (a real clone, not the mirror-already-there
+    /// fast path). Lets the footer replace the lingering "materialising … 100%" tick
+    /// with a terminal "materialised …" line, so it doesn't read as still-running.
+    /// Project-scoped, like [`AppEvent::MaterializeProgress`].
+    MaterializeDone { project_id: String },
     /// A project switch's graph finished loading off the render thread (see
     /// `App::request_switch`). A pure wake signal: the loaded `(ProjectRef, Graph)`
     /// rides a side mailbox because `Graph` isn't `Clone`/`Debug` and so can't live
@@ -135,6 +152,8 @@ impl AppEvent {
             | AppEvent::AgentAction { project_id, .. }
             | AppEvent::AgentReaped { project_id, .. }
             | AppEvent::AgentCommitted { project_id, .. }
+            | AppEvent::MaterializeProgress { project_id, .. }
+            | AppEvent::MaterializeDone { project_id, .. }
             | AppEvent::RepoRequested { project_id, .. } => Some(project_id),
         }
     }

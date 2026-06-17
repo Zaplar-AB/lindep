@@ -119,6 +119,20 @@ impl AgentStatus {
     }
 }
 
+/// What one `[[scratch]]` resource (ENG-561) materialised for an issue — enough to
+/// tear it down later without re-reading the registry, so a config edit can never
+/// strand a live resource. `teardown` is the already-substituted command; `port` is
+/// kept only for a `persist`ed resource so a resume reconnects to the same instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchRecord {
+    pub name: String,
+    pub teardown: String,
+    #[serde(default)]
+    pub env_keys: Vec<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
 /// One persisted agent session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -141,6 +155,11 @@ pub struct Session {
     /// path and the agent lazy-pull as repos are checked out.
     #[serde(default)]
     pub repos: Vec<String>,
+    /// The scratch datastores this issue provisioned (ENG-561) — recorded so
+    /// teardown/sweep can drop them without re-reading the registry. `#[serde(default)]`
+    /// so a pre-`STATE_VERSION 4` file loads with none.
+    #[serde(default)]
+    pub scratch: Vec<ScratchRecord>,
     /// `claude`'s session id (a UUID string), passed as `--session-id` /
     /// `--resume`.
     pub session_id: String,
@@ -204,14 +223,15 @@ struct Persisted {
 
 /// v1 → v2 (lindep v1.5): added `Session::project_id` and folded the project into
 /// the deterministic `session_id`. v2 → v3 (lindep v1.6): added `Session::repos`,
-/// the per-issue repo handle set under managed workspaces. Both bumps are purely
-/// additive — the new fields ride a `#[serde(default)]`, so every version
+/// the per-issue repo handle set under managed workspaces. v3 → v4 (v1.6): added
+/// `Session::scratch`, the per-issue scratch-datastore records (ENG-561). All bumps
+/// are purely additive — the new fields ride a `#[serde(default)]`, so every version
 /// deserializes as-is; the only migration is stamping the owning `project_id` onto
 /// unstamped records (done in [`SessionStore::for_project`], which preserves the
 /// stored `session_id`). v1.6 abandons the in-repo `.lindep` location wholesale
 /// (state now lives under `~/.lindep/projects/<handle>/`), so there is no legacy
 /// adoption: a fresh per-project store stands in where none exists.
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 4;
 
 /// Serde default for a version-less file: the first format that carried a tag.
 fn default_state_version() -> u32 {
@@ -332,6 +352,7 @@ impl SessionStore {
                 worktree_path,
                 branch,
                 repos: Vec::new(),
+                scratch: Vec::new(),
                 status: AgentStatus::Spawning,
                 transcript_path: None,
                 created_at: now,
@@ -375,6 +396,20 @@ impl SessionStore {
     pub fn set_repos(&mut self, issue: &str, repos: Vec<String>) -> bool {
         if let Some(s) = self.sessions.get_mut(issue) {
             s.repos = repos;
+            s.updated_at = crate::ledger::now_unix();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record the scratch resources provisioned for `issue` (ENG-561, `STATE_VERSION 4`).
+    /// Like [`set_repos`](Self::set_repos), written once the resources are up so a crash
+    /// never claims a resource that wasn't created. No-op if the issue has no record;
+    /// returns whether one was found and changed.
+    pub fn set_scratch(&mut self, issue: &str, scratch: Vec<ScratchRecord>) -> bool {
+        if let Some(s) = self.sessions.get_mut(issue) {
+            s.scratch = scratch;
             s.updated_at = crate::ledger::now_unix();
             true
         } else {

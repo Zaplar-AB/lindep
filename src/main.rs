@@ -21,6 +21,7 @@ mod backend;
 mod mirror;
 mod notify;
 mod registry;
+mod scratch;
 mod session;
 mod supervisor;
 mod workspace;
@@ -592,6 +593,10 @@ fn start_control_plane(
         &registry,
         &active.id,
         &stores,
+        // We're on the synchronous main thread before the TUI starts — no render
+        // loop to take footer events — so a slow first clone streams its meter
+        // straight to stderr (where "Loading {name}…" already printed).
+        workspace::CloneProgressOut::Stderr,
     ))?;
     let mut planes = std::collections::HashMap::new();
     planes.insert(active.id.clone(), plane);
