@@ -28,13 +28,24 @@ degrades cleanly to the read-only graph viewer.
 
 | Layer | Module(s) | Responsibility |
 |-------|-----------|----------------|
-| 1. Cockpit (TUI) | `app`, `ui`, `theme`, `keymap` | State, input (via a remappable keymap), rendering — incl. the whole-row fleet tints, the agents roster, the tileable chat wall, the composer and the attach pane |
+| 1. Cockpit (TUI) | `app`, `ui`, `theme`, `keymap` | State, input (via a remappable keymap), rendering — incl. `App::readiness` (v1.7), the readiness-banded spine + dispatch gate, the whole-row fleet tints, the tileable chat wall, the composer and the attach pane |
 | 2. Linear client | `linear` | Blocking `ureq` GraphQL read (personal key); write-back is v2 |
 | 3. Control plane | `backend` | `AgentBackend` trait + `PtyAgent` (PTY host); Codex/Aider slot in here |
 | 4. Pipeline engine | *(v3)* | Generic stage machine over `.lindep/pipeline.toml` — not in v1 |
 | 5. Notification bus | `notify` | Claude hooks → loopback endpoint → `AppEvent` |
 | 6. Worktree manager | `worktree` | One git worktree + branch per issue, crash-safe |
 | (glue) | `event`, `supervisor`, `session` | Async backbone, fleet owner, durable state |
+
+**The readiness model (v1.7).** The cockpit's one noun is the Issue; its one
+*state* is `App::readiness` — a fusion of the **graph truth** (`model`: blocked /
+done / in-cycle) and the **agent truth** (`session`: running / needs-you) into a
+single band: **NEEDS-YOU · RUNNING · READY · BLOCKED · DONE**. A live agent
+outranks the graph; a terminal agent reverts to graph truth. It lives in `app`
+(not the pure, agent-free `model` layer) and is the *single* source for the
+spine's banded schedule (ENG-558), the dispatch gate `button()` (ENG-559), and
+the Fleet overview's node tints (ENG-560) — so "what state is an issue in" has
+one answer instead of the five partial re-derivations v1.7 deleted (the
+`Sort::Blocked`/`Filter::Blocked` duplicates and the standalone agents roster).
 
 ## Concurrency model — where work runs
 
