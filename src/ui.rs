@@ -57,12 +57,99 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     // The project switcher floats above everything else while it's open.
     if app.project_switcher.is_some() {
         let area = frame.area();
-        // Snapshot the cross-project needs-you set before the mutable picker borrow.
+        // Snapshot the cross-project needs-you set + per-project counts before the
+        // mutable picker borrow.
         let needs_you = app.projects_needing_you();
+        let counts = app.project_agent_counts();
         if let Some(picker) = app.project_switcher.as_mut() {
-            crate::picker::render_overlay(picker, frame, area, &needs_you);
+            crate::picker::render_overlay(picker, frame, area, &needs_you, &counts);
         }
     }
+    // The up-front repo multi-select (ENG-536) floats above everything too.
+    if let Some(select) = app.repo_select.as_mut() {
+        let area = frame.area();
+        crate::picker::render_repo_overlay(&mut select.picker, frame, area);
+    }
+    // The disk-reclaim prompt (ENG-540) likewise.
+    if let Some(prompt) = app.reclaim.as_mut() {
+        let area = frame.area();
+        crate::picker::render_reclaim_overlay(prompt, frame, area);
+    }
+    // The global all-agents screen (ENG-406) — a third top-level surface.
+    if app.global_view.is_some() {
+        // Snapshot project names before the mutable view borrow.
+        let names: std::collections::HashMap<String, String> = app
+            .project_list
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect();
+        let area = frame.area();
+        if let Some(view) = app.global_view.as_mut() {
+            render_global_overlay(view, &names, frame, area);
+        }
+    }
+}
+
+/// Render the global all-agents screen (ENG-406): a centered modal listing every
+/// agent across the workspace as `<glyph> project · ISSUE`, reusing the same status
+/// glyph the spine gutter shows (steady — the modal doesn't drive the animation tick).
+fn render_global_overlay(
+    view: &mut crate::app::GlobalView,
+    names: &std::collections::HashMap<String, String>,
+    frame: &mut Frame,
+    full: Rect,
+) {
+    let width = (u32::from(full.width) * 7 / 10)
+        .clamp(u32::from(50.min(full.width)), u32::from(full.width)) as u16;
+    let height = (u32::from(full.height) * 7 / 10)
+        .clamp(u32::from(8.min(full.height)), u32::from(full.height)) as u16;
+    let area = Rect {
+        x: full.x + (full.width.saturating_sub(width)) / 2,
+        y: full.y + (full.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(GREEN_500))
+        .title(Line::from(Span::styled(
+            " ALL AGENTS ",
+            Style::new().fg(GREEN_100).bold(),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [body, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+
+    let items: Vec<ListItem> = view
+        .rows
+        .iter()
+        .map(|(pid, issue, status)| {
+            let (glyph, gstyle) = theme::agent_marker(*status, 0);
+            let name = names.get(pid).cloned().unwrap_or_else(|| pid.clone());
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{glyph} "), gstyle),
+                Span::styled(name, Style::new().fg(MUTED)),
+                Span::styled(format!(" · {issue}"), Style::new().fg(INK)),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_symbol("▸ ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .highlight_style(theme::cursor_active());
+    frame.render_stateful_widget(list, body, &mut view.state);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑↓ move · ⏎ go · esc back",
+            Style::new().fg(MUTED),
+        ))),
+        hint,
+    );
 }
 
 // ── Header ────────────────────────────────────────────────────────────────
@@ -85,7 +172,10 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
             Style::new().fg(AMBER_400),
         ));
     }
-    let (agents, needs_you) = app.fleet_summary();
+    // Workspace roll-up (ENG-406): live agents + needs-you across EVERY project, not
+    // just the active one, rendered on every screen — the locked workspace-level
+    // indicator. The "elsewhere" badge below then breaks out the backgrounded subset.
+    let (agents, needs_you) = app.workspace_summary();
     if agents > 0 {
         spans.push(Span::styled(" · ", Style::new().fg(BORDER)));
         spans.push(Span::styled(
@@ -99,9 +189,9 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
             ));
         }
     }
-    // Agents needing you in projects you've switched away from — surfaced even when
-    // the current project has no agents at all, so a backgrounded prompt is never
-    // invisible (Ctrl-a s to reach it; the switcher flags which project).
+    // Of the needs-you above, how many are in projects you've switched away from —
+    // so a backgrounded prompt is never invisible (Ctrl-a s to reach it, or the
+    // global screen / cross-project `n` jump; the switcher flags which project).
     let elsewhere = app.elsewhere_needs_you();
     if elsewhere > 0 {
         spans.push(Span::styled(" · ", Style::new().fg(BORDER)));

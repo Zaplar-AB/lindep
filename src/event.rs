@@ -76,6 +76,56 @@ pub enum AppEvent {
     /// map. The cockpit drops it from the fleet view too, so the overview stays
     /// bounded and mirrors the supervisor instead of accreting dead agents.
     AgentReaped { project_id: String, issue: String },
+    /// An agent committed in `repo_handle`'s worktree (from a `post-commit` hook).
+    /// Drives v1.6 auto-push: the work is pushed to the repo's true remote off the
+    /// status machinery (a commit is never "needs you"), and surfaces a passive
+    /// per-issue push indicator. `branch` is the committed branch.
+    AgentCommitted {
+        project_id: String,
+        issue: String,
+        repo_handle: String,
+        branch: String,
+    },
+    /// The agent on `(project_id, issue)` requested an extra repo be pulled into its
+    /// workspace (from `lindep request-repo <handle>` over the hook endpoint, ENG-542).
+    /// Already fenced to the project's candidate set by the CLI; the cockpit raises a
+    /// confirmation modal and, on confirm, materialises it (L1→L2→L3). `repo_handle`
+    /// is the requested repo.
+    RepoRequested {
+        project_id: String,
+        issue: String,
+        repo_handle: String,
+    },
+    /// A background disk-reclaim scan finished (`Ctrl-a m`, ENG-540). Carries the
+    /// unreferenced mirrors safe to offer, whether this scan should *open* the
+    /// prompt (the initial scan) or merely *refresh* an already-open one (the
+    /// post-delete rescan), and an optional footer note (a delete's outcome). Both
+    /// the scan (`reclaimable_mirrors`, a recursive object-DB walk) and the delete
+    /// (`delete_mirror`, which takes a blocking cross-process flock) run on the
+    /// blocking pool so they can't freeze the render loop; this event carries the
+    /// result back. NOT agent-scoped — `project_id()` is `None`.
+    ReclaimScanned {
+        mirrors: Vec<crate::mirror::ReclaimableMirror>,
+        opening: bool,
+        note: Option<String>,
+    },
+    /// First-materialisation clone progress for `project_id` — a slow
+    /// `git clone --mirror` (hundreds of MB) is streaming, so the footer shows
+    /// e.g. "materialising core · Receiving objects 45%" instead of looking frozen
+    /// (the v1.6 "surface progress" gap). `phase` is git's phase label and
+    /// `percent` its 0–100 reading. Project-scoped so switching away while a
+    /// backgrounded project still clones drops its ticks (the cross-project guard).
+    MaterializeProgress {
+        project_id: String,
+        phase: String,
+        percent: u8,
+    },
+    /// First materialisation of `project_id` finished cloning — sent only when a
+    /// progress meter was actually drawn (a real clone, not the mirror-already-there
+    /// fast path). Lets the footer replace the lingering "materialising … 100%" tick
+    /// with a terminal "materialised …" line, so it doesn't read as still-running.
+    /// Project-scoped, like [`AppEvent::MaterializeProgress`].
+    MaterializeDone { project_id: String },
     /// A project switch's graph finished loading off the render thread (see
     /// `App::request_switch`). A pure wake signal: the loaded `(ProjectRef, Graph)`
     /// rides a side mailbox because `Graph` isn't `Clone`/`Debug` and so can't live
@@ -91,14 +141,20 @@ impl AppEvent {
     /// render loop uses this to file each event under the right project's fleet.
     pub fn project_id(&self) -> Option<&str> {
         match self {
-            AppEvent::Notification(_) | AppEvent::ProjectActivated => None,
+            AppEvent::Notification(_)
+            | AppEvent::ReclaimScanned { .. }
+            | AppEvent::ProjectActivated => None,
             AppEvent::AgentSpawned { project_id, .. }
             | AppEvent::AgentOutput { project_id, .. }
             | AppEvent::AgentExited { project_id, .. }
             | AppEvent::AgentNeedsYou { project_id, .. }
             | AppEvent::AgentStatusChanged { project_id, .. }
             | AppEvent::AgentAction { project_id, .. }
-            | AppEvent::AgentReaped { project_id, .. } => Some(project_id),
+            | AppEvent::AgentReaped { project_id, .. }
+            | AppEvent::AgentCommitted { project_id, .. }
+            | AppEvent::MaterializeProgress { project_id, .. }
+            | AppEvent::MaterializeDone { project_id, .. }
+            | AppEvent::RepoRequested { project_id, .. } => Some(project_id),
         }
     }
 }

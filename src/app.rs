@@ -25,12 +25,44 @@ use crate::layout;
 use crate::ledger::Ledger;
 use crate::linear::{Client, ProjectRef};
 use crate::model::{Direction, Graph, Issue};
-use crate::picker::Picker;
+use crate::picker::{Picker, ReclaimPrompt, RepoChoice, RepoPicker};
 use crate::session::{AgentStatus, CockpitState, PersistedKind, PersistedWindow};
 use crate::window::{
     CoinMode, DepsCursor, GraduateOutcome, LayoutMode, WindowId, WindowKind, WindowSet, move_state,
 };
 use crate::workspace::WorkspaceHandle;
+
+/// An open up-front repo multi-select (ENG-536), stashing the launch it gates.
+/// While `Some` it is a full modal: keys toggle/move/confirm/cancel and never reach
+/// the cockpit or a focused PTY. On confirm it fires the stashed launch with the
+/// checked repo set; on cancel the launch is abandoned (nothing was sent yet).
+pub(crate) struct RepoSelect {
+    pub picker: RepoPicker,
+    pub issue: String,
+    pub title: String,
+    pub size: Option<(u16, u16)>,
+}
+
+/// The open global all-agents screen (ENG-406): every live agent across the whole
+/// workspace as `project · ISSUE · status`, with a cursor. A third top-level surface
+/// (toggled from any graph or the project list); a snapshot taken when opened. Full
+/// modal while `Some` — ↑↓ move, Enter re-roots onto the row (switching projects if
+/// needed) attach-ready, Esc backs out.
+pub(crate) struct GlobalView {
+    pub rows: Vec<(String, String, AgentStatus)>,
+    pub state: ListState,
+}
+
+/// A pending fenced-lazy-pull confirmation (ENG-542): a running agent asked for an
+/// extra (in-candidate) repo, and the human must confirm before it's materialised.
+/// While `Some`, the next key resolves it (`y`/Enter pulls, anything else denies) —
+/// captured below the kill-confirm band but above the focused agent's PTY, so a
+/// mid-turn agent's keystrokes don't leak into the answer and a kill's `y` still wins.
+pub(crate) struct RepoConfirm {
+    pub project_id: String,
+    pub issue: String,
+    pub handle: String,
+}
 
 /// How many animation frames a node flash lasts (~400 ms at the 100 ms tick).
 const FLASH_FRAMES: u64 = 4;
@@ -195,6 +227,14 @@ pub struct App {
     /// `Some`, the next key confirms (`y`/Enter) or cancels — kill is destructive,
     /// so it's never a single keystroke.
     pub kill_confirm: Option<String>,
+    /// The issue whose workspace a `Ctrl-a d` discard (push branches + remove
+    /// worktrees, ENG-541) is awaiting confirmation for. Like `kill_confirm`, the
+    /// next key confirms (`y`/Enter) or cancels — it reclaims checkout disk, so it's
+    /// never a single keystroke.
+    pub discard_confirm: Option<String>,
+    /// A pending fenced-lazy-pull confirmation (ENG-542) raised by an agent's
+    /// `request-repo`. While `Some`, the next key pulls (`y`/Enter) or denies.
+    pub repo_confirm: Option<RepoConfirm>,
     /// Docked agents still pending an auto-resume (Phase 6), each mapped to the
     /// frame at which a wedged resume (one that never reports `AgentSpawned`) is
     /// force-dropped. Per-issue — not a bare count + one shared deadline — so a
@@ -229,6 +269,24 @@ pub struct App {
     /// The open project-switcher overlay (`Ctrl-a s`), if any. While `Some` it is a
     /// full modal: it captures every key (typing filters; Esc cancels).
     pub project_switcher: Option<Picker>,
+    /// The up-front repo multi-select modal (ENG-536), if open. Full modal: while
+    /// `Some` it captures every key (space toggles, ↑↓ move, ⏎ launches, Esc cancels).
+    pub repo_select: Option<RepoSelect>,
+    /// Per-project candidate repo choices for the up-front select, surfaced from the
+    /// registry when the control plane arms (the registry itself lives off-`App`, in
+    /// the workspace). Keyed by `project_id`. A project with ≤1 candidate launches
+    /// straight away (no modal); >1 opens the select.
+    pub project_candidates: HashMap<String, Vec<RepoChoice>>,
+    /// The open disk-reclaim prompt (ENG-540, `Ctrl-a m`), if any. Full modal.
+    pub reclaim: Option<ReclaimPrompt>,
+    /// True while a reclaim scan/delete is running on the blocking pool, so a
+    /// second Enter can't fire a duplicate delete before the rescan lands and
+    /// clears it. Set only on the off-thread path; the inline fallback never arms.
+    pub reclaim_busy: bool,
+    /// The `~/.lindep` layout, surfaced when the control plane arms so the reclaim
+    /// prompt can scan mirrors/clones (a quick filesystem walk) on a deliberate user
+    /// action. `None` with the control plane off (`--demo`, snapshots, tests).
+    pub layout: Option<crate::registry::Layout>,
     /// Live agent backends for projects you've switched *away* from, keyed by
     /// `project_id` then issue. Stashed on switch (the `Arc`s stay valid while
     /// their agents run) so switching back re-attaches to the real PTYs; the
@@ -241,6 +299,24 @@ pub struct App {
     /// into the project). Drives the header's "⚑N elsewhere" badge, the switcher's
     /// per-project flag, and a one-time toast. Never holds the active project.
     other_needs_you: HashMap<String, HashSet<String>>,
+    /// Cross-project agent status, fed by EVERY agent event (before the scoping
+    /// guard) so backgrounded projects' agents are visible too — the source for the
+    /// workspace roll-up header, the global all-agents screen, and the cross-project
+    /// `n` jump (ENG-406). Keyed `project_id` → `issue` → status. The active project's
+    /// authoritative view stays in [`fleet`](Self::fleet); the roll-up reads `fleet`
+    /// for the active project and `world` for the rest, so a late post-reap hook in
+    /// the active project can't double-count a just-removed agent.
+    pub world: HashMap<String, HashMap<String, AgentStatus>>,
+    /// The open global all-agents screen (ENG-406, `Ctrl-a a`), if any. Full modal.
+    pub global_view: Option<GlobalView>,
+    /// A pending cross-project landing (ENG-406): `(project_id, issue, attach, gen)`.
+    /// After a switch completes, re-root onto `issue` and (when `attach`) attach to its
+    /// agent. Stamped with the target project AND the switch generation it belongs to,
+    /// so a superseded/raced switch (the user fires another switch before this one's
+    /// graph lands) DROPS the land in [`activate_project`](Self::activate_project)
+    /// instead of mis-applying it to the wrong project (issue keys collide across
+    /// projects). Set by the global screen's Enter and the cross-project needs-you jump.
+    pending_land: Option<(String, String, bool, u64)>,
     /// Hand-off slot for a switch's freshly-loaded graph: the off-thread fetch
     /// drops `(gen, target, graph)` here and wakes the loop with
     /// [`AppEvent::ProjectActivated`] (`Graph` is neither `Clone` nor `Debug`, so
@@ -342,6 +418,8 @@ impl App {
             prefix_armed: false,
             command_mode: false,
             kill_confirm: None,
+            discard_confirm: None,
+            repo_confirm: None,
             resuming: HashMap::new(),
             resume_cap: 0,
             auto_resume: false,
@@ -350,8 +428,16 @@ impl App {
             project_list: Vec::new(),
             mapped_projects: HashSet::new(),
             project_switcher: None,
+            repo_select: None,
+            project_candidates: HashMap::new(),
+            reclaim: None,
+            reclaim_busy: false,
+            layout: None,
             stashed_backends: HashMap::new(),
             other_needs_you: HashMap::new(),
+            world: HashMap::new(),
+            global_view: None,
+            pending_land: None,
             switch_inbox: Arc::new(Mutex::new(None)),
             switch_seq: 0,
             pending_switch: None,
@@ -499,11 +585,48 @@ impl App {
             return;
         }
 
+        // 1c. The global all-agents screen (ENG-406) — a third top-level surface — is
+        //     a full modal: ↑↓ move, Enter re-roots onto the row, Esc backs out.
+        if self.global_view.is_some() {
+            self.on_global_key(key);
+            return;
+        }
+
+        // 1d. The up-front repo multi-select (ENG-536) is a full modal too: while
+        //     open it owns the keyboard (space toggles, ↑↓ move, ⏎ launches, Esc
+        //     cancels), above the prefix and all window routing — like the switcher.
+        if self.repo_select.is_some() {
+            self.on_repo_select_key(key);
+            return;
+        }
+
+        // 1e. The disk-reclaim prompt (ENG-540) is a full modal too.
+        if self.reclaim.is_some() {
+            self.on_reclaim_key(key);
+            return;
+        }
+
         // 2. A pending kill confirmation captures the keyboard: y/Enter confirms,
         //    anything else cancels. Checked before the prefix so the destructive
         //    gesture can't be half-completed by a stray prefix.
         if self.kill_confirm.is_some() {
             self.on_kill_confirm_key(key);
+            return;
+        }
+
+        // 2b. A pending discard confirmation (ENG-541) likewise captures the
+        //     keyboard: y/Enter confirms, anything else cancels.
+        if self.discard_confirm.is_some() {
+            self.on_discard_confirm_key(key);
+            return;
+        }
+
+        // 2c. A pending lazy-pull confirmation (ENG-542) — raised by an agent's
+        //     `request-repo`. Captured here: below kill/discard (so those win), but
+        //     ABOVE the focused agent's PTY (band 6), so a mid-turn agent's keystrokes
+        //     can't answer the prompt for you.
+        if self.repo_confirm.is_some() {
+            self.on_repo_confirm_key(key);
             return;
         }
 
@@ -675,8 +798,44 @@ impl App {
             }
             Action::JumpNeedsYou => self.jump_to_needs_you(),
             Action::SwitchProject => self.open_project_switcher(),
+            Action::OpenInEditor => self.open_in_editor(),
+            Action::ReclaimMirrors => self.open_reclaim(),
+            Action::DiscardWorkspace => self.arm_discard(),
+            Action::GlobalView => self.open_global(),
             // The rest are direct (Spine/Deps) actions, never prefix verbs.
             _ => {}
+        }
+    }
+
+    /// Open the focused agent's workspace directory in an external editor (v1.6,
+    /// `Ctrl-a e`). Detached and env-inheriting (the user's own handoff tool), so
+    /// it survives cockpit teardown. A no-op with a footer when the focused issue
+    /// has no agent on disk yet — there's nothing to open until an agent has run.
+    fn open_in_editor(&mut self) {
+        let issue = self
+            .windows
+            .focused()
+            .issue()
+            .map(str::to_string)
+            .or_else(|| (!self.root.is_empty()).then(|| self.root.clone()));
+        let Some(issue) = issue else {
+            self.set_footer("no agent selected to open".into());
+            return;
+        };
+        let Some(backend) = self.backends.get(&issue) else {
+            self.set_footer(format!(
+                "{issue}: open an agent first — no workspace on disk yet"
+            ));
+            return;
+        };
+        let dir = backend.cwd().to_path_buf();
+        if dir.as_os_str().is_empty() || !dir.exists() {
+            self.set_footer(format!("{issue}: workspace not on disk yet"));
+            return;
+        }
+        match crate::backend::open_in_editor(&dir) {
+            Ok(editor) => self.set_footer(format!("opened {issue} in {editor}")),
+            Err(e) => self.set_footer(format!("couldn't open editor: {e}")),
         }
     }
 
@@ -865,6 +1024,23 @@ impl App {
             self.windows.focus = 0;
         }
         self.rebuild_order();
+
+        // Apply a pending cross-project land (ENG-406): the global screen's Enter or
+        // the cross-project needs-you jump asked to land on a specific issue here.
+        // Apply it ONLY when it's for THIS project and THIS switch generation (a
+        // superseded land — the user fired a later switch — is taken and discarded, so
+        // a same-keyed issue in the wrong project is never landed on). Re-root onto it
+        // (overriding most_connected_root) and, if requested, attach to its agent.
+        if let Some((pid, issue, attach, land_gen)) = self.pending_land.take()
+            && pid == project.id
+            && land_gen == self.switch_seq
+            && self.graph.get(&issue).is_some()
+        {
+            self.aim_spine(issue.clone());
+            if attach {
+                self.open_agent_window(&issue);
+            }
+        }
 
         // The saved cockpit layout belongs to the project we booted into; once you
         // switch, stop persisting so we don't overwrite it with another project's
@@ -1143,6 +1319,27 @@ impl App {
                 // Spawn the PTY at the tile we'll render it in, so claude's first
                 // paint already fits (no full-width reflow flash beside a pin).
                 let size = self.agent_spawn_size();
+                // Up-front repo select (ENG-536): a project with more than one
+                // candidate repo lets the user pick which the issue needs before
+                // launch. One candidate (the common single-repo case) launches
+                // straight away — no modal — so the default path is unchanged.
+                let choices = self
+                    .project_candidates
+                    .get(&self.active_project)
+                    .cloned()
+                    .unwrap_or_default();
+                if choices.len() > 1 {
+                    self.repo_select = Some(RepoSelect {
+                        picker: RepoPicker::new(choices),
+                        issue: key.clone(),
+                        title,
+                        size,
+                    });
+                    self.set_footer(format!(
+                        "select repos for {key} · space toggles · ⏎ launch · esc cancel"
+                    ));
+                    return;
+                }
                 workspace.launch(self.active_project.clone(), key.clone(), title, size);
                 self.pending_launch.insert(key.clone());
                 self.pending_attach = Some(key.clone());
@@ -1150,6 +1347,171 @@ impl App {
                 self.set_footer(format!("opening agent on {key}…"));
             }
             None => self.status_msg = Some("agent control plane unavailable".into()),
+        }
+    }
+
+    /// Drive the open repo multi-select (ENG-536): space toggles the cursor's repo,
+    /// ↑↓ move, Enter launches with the checked set, Esc/Ctrl-C cancels (no launch
+    /// was sent yet, so cancelling is clean).
+    fn on_repo_select_key(&mut self, key: KeyEvent) {
+        let Some(select) = self.repo_select.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                let issue = self.repo_select.take().map(|s| s.issue).unwrap_or_default();
+                self.set_footer(format!("launch cancelled for {issue}"));
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.repo_select = None;
+                self.set_footer("launch cancelled".into());
+            }
+            KeyCode::Char(' ') => select.picker.toggle(),
+            KeyCode::Down => select.picker.move_by(1),
+            KeyCode::Up => select.picker.move_by(-1),
+            KeyCode::Enter => {
+                let RepoSelect {
+                    picker,
+                    issue,
+                    title,
+                    size,
+                } = self.repo_select.take().expect("repo_select is Some here");
+                let repos = picker.selected_handles();
+                let Some(workspace) = self.workspace.clone() else {
+                    self.status_msg = Some("agent control plane unavailable".into());
+                    return;
+                };
+                workspace.launch_with_repos(
+                    self.active_project.clone(),
+                    issue.clone(),
+                    title,
+                    size,
+                    repos,
+                );
+                self.pending_launch.insert(issue.clone());
+                self.pending_attach = Some(issue.clone());
+                self.open_agent_window(&issue);
+                self.set_footer(format!("opening agent on {issue}…"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the disk-reclaim prompt (ENG-540, `Ctrl-a m`): scan for unreferenced
+    /// mirrors so their object DBs can be freed. The scan recurses each bare
+    /// object DB to size it (GB-scale on a large repo), so it runs on the blocking
+    /// pool and the result rides back as a [`AppEvent::ReclaimScanned`] — never on
+    /// the synchronous render loop. A footer no-op when the control plane is off
+    /// (no layout); falls back to an inline scan only when there's no runtime to
+    /// offload to (headless tests), which is identical to the pre-offload path.
+    fn open_reclaim(&mut self) {
+        let Some(layout) = self.layout.clone() else {
+            self.set_footer("disk reclaim needs the agent control plane".into());
+            return;
+        };
+        match (self.runtime.clone(), self.events.clone()) {
+            (Some(rt), Some(tx)) => {
+                self.set_footer("scanning mirrors…".into());
+                rt.spawn_blocking(move || {
+                    let mirrors = crate::mirror::reclaimable_mirrors(&layout);
+                    let _ = tx.send(AppEvent::ReclaimScanned {
+                        mirrors,
+                        opening: true,
+                        note: None,
+                    });
+                });
+            }
+            _ => {
+                let mirrors = crate::mirror::reclaimable_mirrors(&layout);
+                self.apply_reclaim_scan(mirrors, true, None);
+            }
+        }
+    }
+
+    /// Fold a (possibly off-thread) reclaim scan result into the prompt. `opening`
+    /// distinguishes the initial `Ctrl-a m` scan — which opens the modal, or
+    /// footers when nothing is reclaimable — from a post-delete rescan, which
+    /// reports `note` (the delete outcome) and then refreshes the modal *only if
+    /// it's still open* (the user may have pressed Esc while the rescan was in
+    /// flight, and a late result must not resurrect a closed prompt). Clears the
+    /// busy latch either way.
+    fn apply_reclaim_scan(
+        &mut self,
+        mirrors: Vec<crate::mirror::ReclaimableMirror>,
+        opening: bool,
+        note: Option<String>,
+    ) {
+        self.reclaim_busy = false;
+        if let Some(note) = note {
+            self.set_footer(note);
+        }
+        if opening {
+            if mirrors.is_empty() {
+                self.set_footer("nothing to reclaim — every mirror is in use".into());
+                self.reclaim = None;
+            } else {
+                self.reclaim = Some(ReclaimPrompt::new(mirrors));
+            }
+        } else if self.reclaim.is_some() {
+            self.reclaim = (!mirrors.is_empty()).then(|| ReclaimPrompt::new(mirrors));
+        }
+    }
+
+    /// Drive the disk-reclaim prompt: ↑↓ move, Enter / `d` reclaims the selected
+    /// mirror (refused with a footer if it's somehow become referenced since the
+    /// scan — the alternates guard), Esc closes. The delete (`delete_mirror` takes a
+    /// blocking cross-process flock and `remove_dir_all`s a GB-scale object DB) runs
+    /// on the blocking pool; the prompt rescans and closes from the resulting
+    /// [`AppEvent::ReclaimScanned`]. A `reclaim_busy` latch swallows a second Enter
+    /// until that result lands so one keypress can't fire two deletes.
+    fn on_reclaim_key(&mut self, key: KeyEvent) {
+        let Some(prompt) = self.reclaim.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.reclaim = None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.reclaim = None;
+            }
+            KeyCode::Down => prompt.move_by(1),
+            KeyCode::Up => prompt.move_by(-1),
+            KeyCode::Enter | KeyCode::Char('d') => {
+                if self.reclaim_busy {
+                    return;
+                }
+                let target = prompt.selected();
+                // Drop the modal borrow before touching other fields / rescanning.
+                let (Some(layout), Some(target)) = (self.layout.clone(), target) else {
+                    self.reclaim = None;
+                    return;
+                };
+                let handle = target.handle;
+                match (self.runtime.clone(), self.events.clone()) {
+                    (Some(rt), Some(tx)) => {
+                        self.reclaim_busy = true;
+                        self.set_footer(format!("reclaiming mirror {handle}…"));
+                        rt.spawn_blocking(move || {
+                            let note = reclaim_note(
+                                crate::mirror::delete_mirror(&layout, &handle),
+                                &handle,
+                            );
+                            let mirrors = crate::mirror::reclaimable_mirrors(&layout);
+                            let _ = tx.send(AppEvent::ReclaimScanned {
+                                mirrors,
+                                opening: false,
+                                note: Some(note),
+                            });
+                        });
+                    }
+                    _ => {
+                        let note =
+                            reclaim_note(crate::mirror::delete_mirror(&layout, &handle), &handle);
+                        let mirrors = crate::mirror::reclaimable_mirrors(&layout);
+                        self.apply_reclaim_scan(mirrors, false, Some(note));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1284,6 +1646,85 @@ impl App {
             "kill agent on {issue}? y to confirm, any key to cancel"
         ));
         self.kill_confirm = Some(issue);
+    }
+
+    /// Arm a confirmed discard of the selected issue's workspace (`Ctrl-a d`,
+    /// ENG-541): push each repo's branch then remove its worktrees. Refused while the
+    /// agent is still live — its checkout is in use, so stop it first.
+    fn arm_discard(&mut self) {
+        let issue = self
+            .windows
+            .focused()
+            .issue()
+            .map(str::to_string)
+            .or_else(|| (!self.root.is_empty()).then(|| self.root.clone()));
+        let Some(issue) = issue else {
+            self.status_msg = Some("no issue selected to discard".into());
+            return;
+        };
+        if self.fleet.get(&issue).is_some_and(AgentStatus::is_live) {
+            self.status_msg = Some(format!(
+                "{issue} is still running — stop it (Ctrl-a x) before discarding"
+            ));
+            return;
+        }
+        self.status_msg = Some(format!(
+            "discard {issue}'s workspace — push branches + remove worktrees? y to confirm, any key to cancel"
+        ));
+        self.discard_confirm = Some(issue);
+    }
+
+    fn on_discard_confirm_key(&mut self, key: KeyEvent) {
+        let Some(issue) = self.discard_confirm.take() else {
+            return;
+        };
+        let confirm = matches!(
+            key.code,
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+        );
+        if !confirm {
+            self.status_msg = Some("discard cancelled".into());
+            return;
+        }
+        match self.workspace.clone() {
+            Some(workspace) => {
+                workspace.teardown(self.active_project.clone(), issue.clone());
+                // The agent is gone (gated non-live), so drop its fleet entry and
+                // undock its window — the worktrees are reclaimed in the background.
+                // Tombstone it (like the reap path) so any late hook for the discarded
+                // issue is dropped by the resurrection guards rather than re-inserting it.
+                self.fleet.remove(&issue);
+                self.reaped.insert(issue.clone());
+                self.undock_issue(&issue);
+                self.set_footer(format!("discarding {issue}'s workspace…"));
+            }
+            None => self.status_msg = Some("agent control plane unavailable".into()),
+        }
+    }
+
+    /// Resolve a pending lazy-pull confirmation (ENG-542): `y`/Enter materialises the
+    /// requested repo (off the render thread, via the workspace); anything else denies
+    /// it. The agent's `request-repo` already returned, so a deny just means the repo
+    /// isn't added — the agent isn't blocked.
+    fn on_repo_confirm_key(&mut self, key: KeyEvent) {
+        let Some(req) = self.repo_confirm.take() else {
+            return;
+        };
+        let confirm = matches!(
+            key.code,
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+        );
+        if !confirm {
+            self.set_footer(format!("denied repo pull: {}", req.handle));
+            return;
+        }
+        match self.workspace.clone() {
+            Some(workspace) => {
+                workspace.materialize_repo(req.project_id, req.issue.clone(), req.handle.clone());
+                self.set_footer(format!("pulling {} into {}…", req.handle, req.issue));
+            }
+            None => self.status_msg = Some("agent control plane unavailable".into()),
+        }
     }
 
     fn on_kill_confirm_key(&mut self, key: KeyEvent) {
@@ -1723,6 +2164,11 @@ impl App {
         // on-screen fleet — so an agent's run history is captured no matter which
         // project you're inside when it runs.
         self.record_ledger(&ev);
+        // Fold the event into the cross-project `world` map (ENG-406) for EVERY
+        // project — before the scoping guard below drops a backgrounded project's
+        // events — so the workspace roll-up, the global screen and the cross-project
+        // jump see agents in projects you aren't currently inside.
+        self.update_world(&ev);
         // While the cockpit is inside one project, an agent event from another
         // (backgrounded) project isn't for the fleet on screen — drop it. ENG-401
         // shards the fleet by project and files these instead of dropping. An
@@ -1799,6 +2245,23 @@ impl App {
                 } => {
                     repaint = self.forget_elsewhere_needs_you(&project_id, &issue);
                 }
+                // A repo-pull request from a backgrounded project can't raise the modal
+                // (you're not looking at it), but it must not vanish silently — surface
+                // a footer so you know to switch in and confirm. The agent isn't blocked
+                // (request-repo returns immediately), so it can re-request on its own.
+                AppEvent::RepoRequested {
+                    project_id,
+                    issue,
+                    repo_handle,
+                } => {
+                    if !self.needs_you_alert {
+                        let name = self.project_name(&project_id);
+                        self.status_msg = Some(format!(
+                            "agent on {issue} in {name} requests repo `{repo_handle}` — switch in to confirm"
+                        ));
+                    }
+                    repaint = true;
+                }
                 _ => {}
             }
             return repaint;
@@ -1807,6 +2270,38 @@ impl App {
             AppEvent::Notification(text) => {
                 self.pending_launch.clear();
                 self.set_footer(text);
+                true
+            }
+            // First-materialisation clone progress for the project being entered (the
+            // scope guard above already dropped a backgrounded clone's ticks). Set the
+            // footer directly — unlike a `Notification` this is a high-frequency tick,
+            // so it must NOT clear `pending_launch` or disturb a needs-you alert.
+            AppEvent::MaterializeProgress {
+                project_id,
+                phase,
+                percent,
+            } => {
+                let name = self.project_name(&project_id);
+                self.status_msg = Some(format!("materialising {name} · {phase} {percent}%"));
+                true
+            }
+            // The first clone finished — replace the terminal "… 100%" tick with a
+            // settled line. Like the progress arm, this must NOT clear `pending_launch`
+            // (a launch queued during the clone stays pending) or touch a needs-you
+            // alert, so it sets the footer directly rather than via `set_footer`.
+            AppEvent::MaterializeDone { project_id } => {
+                let name = self.project_name(&project_id);
+                self.status_msg = Some(format!("materialised {name}"));
+                true
+            }
+            // A disk-reclaim scan/delete finished on the blocking pool: open,
+            // refresh, or close the prompt off the result (see `apply_reclaim_scan`).
+            AppEvent::ReclaimScanned {
+                mirrors,
+                opening,
+                note,
+            } => {
+                self.apply_reclaim_scan(mirrors, opening, note);
                 true
             }
             // A switch's graph finished loading off-thread: take it from the inbox
@@ -1937,6 +2432,64 @@ impl App {
                 // sticky alert (unless another agent still needs you). Without this
                 // a kill/exit of the flagged agent left the footer yelling forever.
                 self.clear_needs_you_alert_if_resolved();
+                true
+            }
+            // v1.6 auto-push: an agent committed and its branch was pushed (or the
+            // push is pending). A passive footer only — a commit is never "needs
+            // you", and it never buries a standing alert. The repo handle scopes
+            // the line for a multi-repo issue (where several repos can push).
+            AppEvent::AgentCommitted {
+                issue,
+                repo_handle,
+                branch,
+                ..
+            } => {
+                if !self.needs_you_alert {
+                    let where_ = if repo_handle.is_empty() {
+                        issue
+                    } else {
+                        format!("{issue}/{repo_handle}")
+                    };
+                    self.status_msg = Some(if branch.is_empty() {
+                        format!("{where_}: pushed")
+                    } else {
+                        format!("{where_}: pushed {branch}")
+                    });
+                }
+                true
+            }
+            // A running agent (in the active project — the scoping guard already
+            // filtered a backgrounded one) asked for an in-candidate repo. Raise the
+            // confirmation modal; the human's `y` materialises it (ENG-542).
+            AppEvent::RepoRequested {
+                project_id,
+                issue,
+                repo_handle,
+            } => {
+                // Never raise the repo-pull prompt over a *destructive* confirmation
+                // whose `y` it doesn't own: the on_key band resolves kill/discard
+                // before repo_confirm, so a "y to pull" footer shadowing a pending
+                // kill would make `y` destroy the agent under a misleading message.
+                // Likewise don't clobber an already-pending repo_confirm. The agent's
+                // `request-repo` returns immediately, so a dropped request can be
+                // re-issued — surface a passive footer and bail.
+                if self.kill_confirm.is_some()
+                    || self.discard_confirm.is_some()
+                    || self.repo_confirm.is_some()
+                {
+                    self.set_footer(format!(
+                        "agent on {issue} requests repo `{repo_handle}` — finish the current prompt first"
+                    ));
+                    return true;
+                }
+                self.set_footer(format!(
+                    "agent on {issue} requests repo `{repo_handle}` — y to pull, any key to deny"
+                ));
+                self.repo_confirm = Some(RepoConfirm {
+                    project_id,
+                    issue,
+                    handle: repo_handle,
+                });
                 true
             }
         }
@@ -2070,10 +2623,150 @@ impl App {
     /// only *live* nodes, not the terminal Stopped/Done/Failed entries that
     /// linger in `fleet` until reaped — so the number drops the instant you stop
     /// or finish one.
-    pub fn fleet_summary(&self) -> (usize, usize) {
-        let agents = self.fleet.values().filter(|s| s.is_live()).count();
-        let needs_you = self.fleet.values().filter(|s| s.needs_you()).count();
-        (agents, needs_you)
+    /// Fold an agent event into the cross-project [`world`](Self::world) map (ENG-406),
+    /// mirroring the same status transitions [`apply_event`](Self::apply_event) applies
+    /// to the active [`fleet`](Self::fleet) — but for ALL projects, so a backgrounded
+    /// project's agents stay visible to the workspace roll-up / global screen / jump.
+    fn update_world(&mut self, ev: &AppEvent) {
+        // Mirror apply_event's resurrection guards for the active project: a late hook
+        // (a `NeedsYou`/`Running` POST that lands after the agent was reaped, or for an
+        // issue already terminal in the fleet) must NOT re-insert a live status, or it
+        // leaks a phantom live/needs-you agent into world[active] that the roll-up only
+        // surfaces — inflating the count — once you switch away. A genuine relaunch
+        // arrives as AgentSpawned (which clears the reaped tombstone in the main match),
+        // so that variant is never blocked.
+        let blocked = |this: &Self, pid: &str, issue: &str| -> bool {
+            pid == this.active_project && (this.reaped.contains(issue) || this.is_terminal(issue))
+        };
+        match ev {
+            AppEvent::AgentSpawned {
+                project_id, issue, ..
+            } => {
+                self.world
+                    .entry(project_id.clone())
+                    .or_default()
+                    .insert(issue.clone(), AgentStatus::Spawning);
+            }
+            AppEvent::AgentNeedsYou {
+                project_id, issue, ..
+            } => {
+                if blocked(self, project_id, issue) {
+                    return;
+                }
+                self.world
+                    .entry(project_id.clone())
+                    .or_default()
+                    .insert(issue.clone(), AgentStatus::NeedsYou);
+            }
+            AppEvent::AgentStatusChanged {
+                project_id,
+                issue,
+                status,
+            } => {
+                if status.is_live() && blocked(self, project_id, issue) {
+                    return;
+                }
+                self.world
+                    .entry(project_id.clone())
+                    .or_default()
+                    .insert(issue.clone(), *status);
+            }
+            AppEvent::AgentAction {
+                project_id,
+                issue,
+                working: true,
+                ..
+            } => {
+                if blocked(self, project_id, issue) {
+                    return;
+                }
+                self.world
+                    .entry(project_id.clone())
+                    .or_default()
+                    .insert(issue.clone(), AgentStatus::Running);
+            }
+            AppEvent::AgentReaped { project_id, issue } => {
+                if let Some(m) = self.world.get_mut(project_id) {
+                    m.remove(issue);
+                    if m.is_empty() {
+                        self.world.remove(project_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Live-agent + needs-you counts across the WHOLE workspace (ENG-406): the active
+    /// project from the authoritative [`fleet`](Self::fleet), every other project from
+    /// the event-fed [`world`](Self::world). The header roll-up renders this on every
+    /// screen — the locked workspace-level needs-you indicator.
+    pub fn workspace_summary(&self) -> (usize, usize) {
+        let (mut live, mut needs) = (0, 0);
+        let mut tally = |s: &AgentStatus| {
+            if s.is_live() {
+                live += 1;
+            }
+            if s.needs_you() {
+                needs += 1;
+            }
+        };
+        for s in self.fleet.values() {
+            tally(s);
+        }
+        for (pid, issues) in &self.world {
+            if *pid == self.active_project {
+                continue;
+            }
+            for s in issues.values() {
+                tally(s);
+            }
+        }
+        (live, needs)
+    }
+
+    /// Per-project `(live, needs-you)` counts for the switcher rows (ENG-406): active
+    /// from `fleet`, the rest from `world`.
+    pub fn project_agent_counts(&self) -> HashMap<String, (usize, usize)> {
+        let count = |issues: &HashMap<String, AgentStatus>| {
+            (
+                issues.values().filter(|s| s.is_live()).count(),
+                issues.values().filter(|s| s.needs_you()).count(),
+            )
+        };
+        let mut out: HashMap<String, (usize, usize)> = self
+            .world
+            .iter()
+            .filter(|(pid, _)| **pid != self.active_project)
+            .map(|(pid, issues)| (pid.clone(), count(issues)))
+            .collect();
+        if !self.active_project.is_empty() {
+            out.insert(self.active_project.clone(), count(&self.fleet));
+        }
+        out
+    }
+
+    /// Every agent across the workspace as `(project_id, issue, status)` rows — the
+    /// global all-agents screen's source (ENG-406). Active project from `fleet`, the
+    /// rest from `world`; sorted by project then natural issue id.
+    pub fn all_agents(&self) -> Vec<(String, String, AgentStatus)> {
+        let mut rows: Vec<(String, String, AgentStatus)> = self
+            .fleet
+            .iter()
+            .map(|(issue, status)| (self.active_project.clone(), issue.clone(), *status))
+            .collect();
+        for (pid, issues) in &self.world {
+            if *pid == self.active_project {
+                continue;
+            }
+            rows.extend(
+                issues
+                    .iter()
+                    .map(|(issue, status)| (pid.clone(), issue.clone(), *status)),
+            );
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| natural_key_cmp(&a.1, &b.1)));
+        rows
     }
 
     /// Whether `issue`'s agent has reached a terminal state (the process is gone).
@@ -2236,8 +2929,9 @@ impl App {
             .collect();
         members.sort_by(|a, b| natural_key_cmp(a, b));
         if members.is_empty() {
-            self.status_msg = Some("no agents need you right now".into());
-            return;
+            // Nothing needs you here — but a backgrounded project might (ENG-406).
+            // Jump cross-project: switch to it, land on the needy issue, and attach.
+            return self.jump_to_needs_you_elsewhere();
         }
         let next = match members.iter().position(|k| *k == self.root) {
             Some(i) => (i + 1) % members.len(),
@@ -2249,6 +2943,104 @@ impl App {
         // face) so you can respond; otherwise the preview follows the selection.
         // Runs after `set_jump_status` (which aims the spine) so this focus wins.
         self.focus_pinned_chat(&key);
+    }
+
+    /// Cross-project leg of the needs-you jump (ENG-406): when no agent in the active
+    /// project needs you, reach the next one in ANY backgrounded project — switching
+    /// to it and (on arrival) attaching to its PTY (the user's chosen jump behaviour).
+    /// Sources the backgrounded needs-you tally (`other_needs_you`), in stable order.
+    fn jump_to_needs_you_elsewhere(&mut self) {
+        let mut targets: Vec<(String, String)> = self
+            .other_needs_you
+            .iter()
+            .flat_map(|(pid, issues)| issues.iter().map(move |i| (pid.clone(), i.clone())))
+            .collect();
+        targets.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| natural_key_cmp(&a.1, &b.1)));
+        let Some((project_id, issue)) = targets.into_iter().next() else {
+            self.status_msg = Some("no agents need you right now".into());
+            return;
+        };
+        let name = self.project_name(&project_id);
+        self.set_footer(format!("→ {issue} in {name} needs you"));
+        self.land_on(&project_id, &issue, true);
+    }
+
+    /// Open the global all-agents screen (ENG-406, `Ctrl-a a`): a snapshot of every
+    /// agent across the workspace. A footer no-op when nothing is running anywhere.
+    fn open_global(&mut self) {
+        let rows = self.all_agents();
+        if rows.is_empty() {
+            self.set_footer("no agents anywhere — open one with the button".into());
+            return;
+        }
+        let mut state = ListState::default();
+        state.select(Some(0));
+        self.global_view = Some(GlobalView { rows, state });
+    }
+
+    /// Drive the global all-agents screen: ↑↓ move, Enter re-roots onto the selected
+    /// `(project, issue)` (attach-ready — switching projects if it's elsewhere), Esc
+    /// backs out.
+    fn on_global_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.global_view.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.global_view = None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.global_view = None;
+            }
+            KeyCode::Down => move_state(&mut view.state, view.rows.len(), 1),
+            KeyCode::Up => move_state(&mut view.state, view.rows.len(), -1),
+            KeyCode::Enter => {
+                let target = view
+                    .state
+                    .selected()
+                    .and_then(|i| view.rows.get(i))
+                    .map(|(p, i, _)| (p.clone(), i.clone()));
+                self.global_view = None;
+                if let Some((project_id, issue)) = target {
+                    // Attach-ready (re-root + select), not auto-attached — Enter on a
+                    // row lands you on the issue; press the button / `t` to take over.
+                    self.land_on(&project_id, &issue, false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Re-root onto `(project_id, issue)`, switching projects first if it's elsewhere
+    /// (ENG-406). `attach` opens + focuses the agent's chat (the cross-project `n`
+    /// jump's auto-attach); otherwise it just aims the spine at the issue
+    /// (attach-ready). A cross-project land stashes the target in `pending_land` and
+    /// applies it in [`activate_project`](Self::activate_project) once the graph is live.
+    fn land_on(&mut self, project_id: &str, issue: &str, attach: bool) {
+        if project_id == self.active_project || self.active_project.is_empty() {
+            self.aim_spine(issue.to_string());
+            if attach {
+                self.open_agent_window(issue);
+            }
+            return;
+        }
+        let Some(target) = self
+            .project_list
+            .iter()
+            .find(|p| p.id == project_id)
+            .cloned()
+        else {
+            self.set_footer(format!("can't switch to the project for {issue}"));
+            return;
+        };
+        self.request_switch(target);
+        // Stamp the land with the switch generation request_switch just used, so a
+        // later switch that supersedes this one drops the land instead of applying it
+        // to the wrong project.
+        self.pending_land = Some((
+            project_id.to_string(),
+            issue.to_string(),
+            attach,
+            self.switch_seq,
+        ));
     }
 
     /// Aim the spine at `key` and set the footer to "<prefix> n/total — key",
@@ -2297,6 +3089,16 @@ impl App {
 
 /// Map a window to its persistable identity, or `None` for the Spine (never
 /// persisted — it's recreated by `WindowSet::new`).
+/// Render a `delete_mirror` outcome as the reclaim prompt's footer line — a
+/// success names the freed handle, a refusal surfaces the error (e.g. a clone
+/// raced in and re-referenced the mirror, the alternates guard).
+fn reclaim_note(res: Result<(), crate::mirror::MirrorError>, handle: &str) -> String {
+    match res {
+        Ok(()) => format!("reclaimed mirror {handle}"),
+        Err(e) => format!("reclaim refused: {e}"),
+    }
+}
+
 /// The most-connected non-external node — the cockpit's default root/selection
 /// for a freshly-loaded graph (mirrors the same pick in [`App::new`]; reused when
 /// switching projects).
@@ -2419,6 +3221,409 @@ mod tests {
             id: id.into(),
             name: name.into(),
         }
+    }
+
+    // ── Up-front repo multi-select (ENG-536) ─────────────────────────────────
+
+    fn repo(handle: &str, primary: bool) -> RepoChoice {
+        RepoChoice {
+            handle: handle.into(),
+            local: false,
+            primary,
+        }
+    }
+
+    #[test]
+    fn launching_a_multi_repo_project_opens_the_repo_select_first() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        let key = a.root.clone();
+        a.project_candidates
+            .insert("proj".into(), vec![repo("api", true), repo("web", false)]);
+
+        a.button();
+        assert!(
+            a.repo_select.is_some(),
+            "more than one candidate opens the select"
+        );
+        assert!(
+            a.pending_launch.is_empty(),
+            "nothing launched yet — the selection pends"
+        );
+
+        // Confirm with Enter: the launch fires (pending) and the modal closes.
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.repo_select.is_none(), "confirming closes the modal");
+        assert!(
+            a.pending_launch.contains(&key),
+            "the agent launch is now in flight"
+        );
+    }
+
+    #[test]
+    fn launching_a_single_repo_project_skips_the_select() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        let key = a.root.clone();
+        a.project_candidates
+            .insert("proj".into(), vec![repo("only", true)]);
+
+        a.button();
+        assert!(
+            a.repo_select.is_none(),
+            "a single candidate launches straight away — no modal"
+        );
+        assert!(a.pending_launch.contains(&key));
+    }
+
+    #[test]
+    fn cancelling_the_repo_select_launches_nothing() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.project_candidates
+            .insert("proj".into(), vec![repo("api", true), repo("web", false)]);
+
+        a.button();
+        assert!(a.repo_select.is_some());
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.repo_select.is_none(), "Esc closes the modal");
+        assert!(a.pending_launch.is_empty(), "cancel launches nothing");
+    }
+
+    // ── Disk reclaim (ENG-540, Ctrl-a m) ─────────────────────────────────────
+
+    /// A temp `~/.lindep` with one unreferenced mirror (no project clones it).
+    fn layout_with_unreferenced_mirror(tag: &str) -> (crate::registry::Layout, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("lindep-app-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mirror = root.join("mirrors").join("core.git");
+        std::fs::create_dir_all(&mirror).unwrap();
+        std::fs::write(mirror.join("data"), b"objects").unwrap();
+        (crate::registry::Layout::new(&root), mirror)
+    }
+
+    #[test]
+    fn the_reclaim_prompt_surfaces_unreferenced_mirrors_and_closes_on_esc() {
+        let (layout, _mirror) = layout_with_unreferenced_mirror("reclaim-esc");
+        let mut a = app();
+        a.layout = Some(layout);
+        a.open_reclaim();
+        assert!(a.reclaim.is_some(), "an unreferenced mirror is surfaced");
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.reclaim.is_none(), "Esc closes the prompt");
+    }
+
+    #[test]
+    fn reclaiming_the_last_mirror_deletes_it_and_closes() {
+        let (layout, mirror) = layout_with_unreferenced_mirror("reclaim-del");
+        let mut a = app();
+        a.layout = Some(layout);
+        a.open_reclaim();
+        assert!(a.reclaim.is_some());
+        // Enter reclaims the only mirror → it's deleted and the prompt closes.
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!mirror.exists(), "the mirror was reclaimed from disk");
+        assert!(
+            a.reclaim.is_none(),
+            "the prompt closes when nothing remains"
+        );
+        let _ = std::fs::remove_dir_all(mirror.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn reclaim_with_no_control_plane_is_a_footer_no_op() {
+        let mut a = app(); // layout is None (no control plane)
+        a.open_reclaim();
+        assert!(a.reclaim.is_none());
+    }
+
+    #[test]
+    fn an_initial_reclaim_scan_opens_the_prompt_when_a_mirror_is_free() {
+        let mut a = app();
+        a.apply_reclaim_scan(
+            vec![crate::mirror::ReclaimableMirror {
+                handle: "core".into(),
+                size_bytes: 1,
+            }],
+            true,
+            None,
+        );
+        assert!(a.reclaim.is_some(), "a free mirror opens the prompt");
+    }
+
+    #[test]
+    fn a_late_reclaim_rescan_never_reopens_a_closed_prompt() {
+        // The user pressed Esc (reclaim is None) while a post-delete rescan was
+        // still in flight; the late result must not resurrect the modal, and it
+        // must clear the busy latch.
+        let mut a = app();
+        a.reclaim_busy = true;
+        a.apply_reclaim_scan(
+            vec![crate::mirror::ReclaimableMirror {
+                handle: "core".into(),
+                size_bytes: 1,
+            }],
+            false,
+            Some("reclaimed mirror web".into()),
+        );
+        assert!(
+            a.reclaim.is_none(),
+            "a rescan never reopens a closed prompt"
+        );
+        assert!(!a.reclaim_busy, "the busy latch is cleared by the rescan");
+    }
+
+    // ── Discard workspace (ENG-541, Ctrl-a d) ────────────────────────────────
+
+    #[test]
+    fn discard_confirms_and_drops_a_finished_issue() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        let key = a.root.clone();
+        a.fleet.insert(key.clone(), AgentStatus::Done); // terminal — not live
+        a.arm_discard();
+        assert_eq!(a.discard_confirm.as_deref(), Some(key.as_str()));
+        a.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(a.discard_confirm.is_none(), "the confirm resolves");
+        assert!(
+            !a.fleet.contains_key(&key),
+            "the discarded issue's fleet entry is dropped"
+        );
+    }
+
+    #[test]
+    fn discard_is_refused_while_the_agent_is_live() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        let key = a.root.clone();
+        a.fleet.insert(key.clone(), AgentStatus::Running); // live — checkout in use
+        a.arm_discard();
+        assert!(
+            a.discard_confirm.is_none(),
+            "a live agent's workspace can't be discarded"
+        );
+    }
+
+    // ── Fenced lazy-pull confirm (ENG-542) ───────────────────────────────────
+
+    #[test]
+    fn a_repo_request_raises_the_confirm_and_y_pulls() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::RepoRequested {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            repo_handle: "web".into(),
+        });
+        assert!(
+            a.repo_confirm.is_some(),
+            "a request raises the confirm modal"
+        );
+        // y confirms → fires the (detached) materialize command and closes.
+        a.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(a.repo_confirm.is_none(), "confirming resolves the modal");
+    }
+
+    #[test]
+    fn a_repo_request_is_denied_by_any_other_key() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::RepoRequested {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            repo_handle: "web".into(),
+        });
+        a.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(a.repo_confirm.is_none(), "any non-y key denies the pull");
+    }
+
+    #[test]
+    fn a_pending_kill_confirm_blocks_a_repo_request_from_raising_its_prompt() {
+        // A repo-pull request landing while a kill confirmation is armed must NOT
+        // raise repo_confirm: the on_key band resolves kill before repo, so a
+        // "y to pull" footer over a pending kill would let `y` destroy the agent.
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.kill_confirm = Some("ENG-1".into());
+        a.apply_event(AppEvent::RepoRequested {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            repo_handle: "web".into(),
+        });
+        assert!(
+            a.repo_confirm.is_none(),
+            "a repo request can't shadow a pending kill confirmation"
+        );
+        assert!(
+            a.kill_confirm.is_some(),
+            "the kill confirmation is untouched"
+        );
+    }
+
+    #[test]
+    fn a_second_repo_request_does_not_clobber_a_pending_one() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::RepoRequested {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            repo_handle: "web".into(),
+        });
+        a.apply_event(AppEvent::RepoRequested {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            repo_handle: "docs".into(),
+        });
+        let rc = a
+            .repo_confirm
+            .as_ref()
+            .expect("the first request still stands");
+        assert_eq!(rc.handle, "web", "the first pending request is preserved");
+    }
+
+    // ── Global fleet view + cross-project state (ENG-406) ────────────────────
+
+    #[test]
+    fn the_workspace_summary_sums_agents_across_projects() {
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        // Active project (from the authoritative fleet): 2 live, 1 needing you.
+        a.fleet.insert("ENG-1".into(), AgentStatus::Running);
+        a.fleet.insert("ENG-2".into(), AgentStatus::NeedsYou);
+        // A backgrounded project (from the event-fed world map): 1 live, 1 terminal.
+        let bg = a.world.entry("proj-b".into()).or_default();
+        bg.insert("ENG-9".into(), AgentStatus::Idle);
+        bg.insert("ENG-8".into(), AgentStatus::Done);
+
+        assert_eq!(
+            a.workspace_summary(),
+            (3, 1),
+            "2 active + 1 background live; one needs you"
+        );
+        let counts = a.project_agent_counts();
+        assert_eq!(counts.get("proj-a"), Some(&(2, 1)));
+        assert_eq!(counts.get("proj-b"), Some(&(1, 0)));
+        let rows = a.all_agents();
+        assert_eq!(rows.len(), 4, "every agent across both projects: {rows:?}");
+    }
+
+    #[test]
+    fn apply_event_tracks_a_backgrounded_projects_agents_in_world() {
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        // A backgrounded project's status event updates `world` even though the
+        // scoping guard drops it from the on-screen fleet.
+        a.apply_event(AppEvent::AgentStatusChanged {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            status: AgentStatus::Running,
+        });
+        assert_eq!(
+            a.world.get("proj-b").and_then(|m| m.get("ENG-9")),
+            Some(&AgentStatus::Running)
+        );
+        assert!(
+            !a.fleet.contains_key("ENG-9"),
+            "the backgrounded agent isn't in the active fleet"
+        );
+        a.apply_event(AppEvent::AgentReaped {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+        });
+        assert!(
+            !a.world.contains_key("proj-b"),
+            "reaping the last agent drops the project from world"
+        );
+    }
+
+    #[test]
+    fn the_global_view_opens_and_enter_re_roots_within_the_project() {
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        let target = a
+            .order
+            .iter()
+            .find(|k| **k != a.root)
+            .cloned()
+            .expect("the demo graph has more than one issue");
+        a.fleet.insert(target.clone(), AgentStatus::Running);
+
+        a.open_global();
+        assert!(a.global_view.is_some(), "the global screen opens");
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.global_view.is_none(), "Enter closes the screen");
+        assert_eq!(a.root, target, "it re-rooted onto the selected agent");
+    }
+
+    #[test]
+    fn a_late_hook_after_reap_does_not_leak_a_phantom_into_the_cross_project_roll_up() {
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        a.reaped.insert("ENG-1".into()); // ENG-1 was reaped in the active project
+        // A late NeedsYou hook for the reaped issue must NOT re-enter the world map…
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj-a".into(),
+            issue: "ENG-1".into(),
+            reason: "late".into(),
+        });
+        assert!(
+            !a.world
+                .get("proj-a")
+                .is_some_and(|m| m.contains_key("ENG-1")),
+            "no phantom in world[active]"
+        );
+        // …so it can't inflate the workspace roll-up once you switch away (the bug).
+        a.activate_project(project("proj-b", "Beta"), demo::graph());
+        assert_eq!(
+            a.workspace_summary(),
+            (0, 0),
+            "no phantom agent inflates the cross-project roll-up after a switch"
+        );
+    }
+
+    #[test]
+    fn the_needs_you_jump_reaches_a_backgrounded_project() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj-a".into();
+        a.project_list = vec![project("proj-a", "Alpha"), project("proj-b", "Beta")];
+        // Nothing needs you here, but proj-b does.
+        a.other_needs_you
+            .entry("proj-b".into())
+            .or_default()
+            .insert("ENG-9".into());
+
+        a.jump_to_needs_you();
+        // A cross-project landing is stashed (project + issue + attach=true) for the
+        // switch to apply; the switch itself no-ops here (no Linear client wired).
+        let pl = a.pending_land.clone().expect("a land was stashed");
+        assert_eq!(
+            (pl.0.as_str(), pl.1.as_str(), pl.2),
+            ("proj-b", "ENG-9", true)
+        );
+    }
+
+    #[test]
+    fn a_kill_confirm_outranks_a_repo_confirm_for_the_y_key() {
+        // The repo-confirm band sits BELOW kill-confirm, so when both are somehow
+        // pending a `y` resolves the kill first (its band is checked earlier).
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.kill_confirm = Some("ENG-1".into());
+        a.repo_confirm = Some(RepoConfirm {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            handle: "web".into(),
+        });
+        a.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(a.kill_confirm.is_none(), "the kill confirm consumed the y");
+        assert!(a.repo_confirm.is_some(), "the repo confirm is untouched");
     }
 
     #[test]
@@ -3240,14 +4445,14 @@ mod tests {
     // ── Fleet summary + the preserved late-hook / tombstone invariants ───────
 
     #[test]
-    fn fleet_summary_counts_only_live_agents() {
+    fn workspace_summary_counts_only_live_agents() {
         let mut app = app();
         app.fleet.insert("ZAP-201".into(), AgentStatus::Running);
         app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
         app.fleet.insert("ZAP-205".into(), AgentStatus::Done);
         app.fleet.insert("ZAP-210".into(), AgentStatus::Failed);
         app.fleet.insert("ZAP-240".into(), AgentStatus::NeedsYou);
-        assert_eq!(app.fleet_summary(), (3, 1));
+        assert_eq!(app.workspace_summary(), (3, 1));
     }
 
     #[test]
@@ -3344,7 +4549,7 @@ mod tests {
             status: AgentStatus::Idle,
         }));
         assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Done));
-        assert_eq!(app.fleet_summary(), (0, 0));
+        assert_eq!(app.workspace_summary(), (0, 0));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 # lindep architecture — the v1 multi-agent spine
 
-> **Status (2026-06): partly stale — full rewrite deferred to v1.6.**
-> This file describes the **v1 spine + the Cockpit-v2 "chat wall" UI**. Two things have since changed and are only partly reflected below:
-> - **v1.5 multi-project**: the session store, supervisor, and notification bus are now keyed by `(project_id, issue)` (not `issue`); `STATE_VERSION` is `2`; per-project state lives at `.lindep/state.<project_id>.json`; there are new `projects`, `workspace`, `picker`, and `ledger` modules; hooks now carry an `x-lindep-token` and route via a workspace-wide registry.
+> **Status (2026-06): partly stale — the v1.6 substrate has landed; full rewrite still pending.**
+> This file describes the **v1 spine + the Cockpit-v2 "chat wall" UI**. Several things have since changed and are only partly reflected below:
+> - **v1.6 managed workspaces (substrate landed)**: lindep is now a **repo-independent workspace manager run from anywhere** (`git_toplevel` anchoring is gone). A global `~/.lindep/registry.toml` (`registry` module) names repos + projects; opening a project materialises its isolated `~/.lindep/projects/<handle>/` world via a 3-layer git model (`mirror` module: bare mirror → reference clone → per-issue worktree, the re-rooted `worktree` manager). `STATE_VERSION` is `3` (`Session` gains a per-issue repo handle set); `reject_repo_root_collisions` and the `projects.toml` mapping are **deleted** (per-project ref namespaces make collisions structurally impossible). Every agent commit **auto-pushes** (`post-commit` hook → `--post-commit` forwarder → `AgentCommitted` → per-handle push); `Ctrl-a e` opens the workspace in an editor. *Still pending (additive, on this substrate): up-front multi-repo select, fenced agent lazy-pull, mirror staleness/refcount teardown, the global all-agents view.*
+> - **v1.5 multi-project**: the session store, supervisor, and notification bus are keyed by `(project_id, issue)`; there are `workspace`, `picker`, and `ledger` modules; hooks carry an `x-lindep-token` and route via a workspace-wide registry.
 > - **Cockpit v3.2**: the live UI is a `Ctrl-a`-prefixed tiling window manager (Spine / Coin / Fleet, auto mosaic/rail) — **not** the chat-wall / composer model the Operating Guide below still describes. `i` = issue summary and `t` = ledger (there is no composer). For current keybindings, trust the **README** and the in-app `?` overlay, not this file.
 
 This is the connective-tissue doc: how the pieces fit, where work runs, how data

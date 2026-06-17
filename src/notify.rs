@@ -94,6 +94,12 @@ struct HookPayload {
     notification_type: Option<String>,
     message: Option<String>,
     tool_name: Option<String>,
+    /// v1.6 auto-push / lazy-pull: which repo in the per-issue workspace a
+    /// `post-commit` or `request-repo` event concerns (the post-commit hook and
+    /// the `request-repo` forwarder set it; Claude's own hooks don't).
+    repo_handle: Option<String>,
+    /// v1.6 auto-push: the committed branch carried by an `AgentCommitted` event.
+    branch: Option<String>,
 }
 
 /// What [`serve`] hands back: the ephemeral loopback `port` agents POST to, and
@@ -354,6 +360,41 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
 
     if let Some((path, bytes, seq)) = snapshot {
         crate::session::persist_snapshot(events, path, bytes, seq).await;
+    }
+
+    // v1.6 auto-push: a `post-commit` git hook fires `AgentCommitted`. Push the
+    // committed branch to the repo's true remote OFF the status machinery (a commit
+    // is never "needs you"), serialized per repo handle, on the runtime — so the
+    // render loop never runs git. The commit's own `cwd` is the specific repo
+    // worktree to push from (correct for a multi-repo issue).
+    if event_name == "AgentCommitted" {
+        if let (Some(issue), Some(cwd)) = (issue.clone(), payload.cwd.clone()) {
+            spawn_auto_push(
+                events.clone(),
+                project_id.clone(),
+                issue,
+                payload.repo_handle.clone().unwrap_or_default(),
+                payload.branch.clone().unwrap_or_default(),
+                PathBuf::from(cwd),
+            );
+        }
+        return;
+    }
+
+    // v1.6 fenced lazy-pull (ENG-542): the agent ran `lindep request-repo <handle>`.
+    // The handle was already fenced to the project's candidate set by the CLI (which
+    // exits non-zero out-of-set); the cockpit raises a confirmation modal and, on
+    // confirm, re-fences and materialises it. Bypasses the status machinery (a repo
+    // request is never "needs you"), exactly like AgentCommitted above.
+    if event_name == "RepoRequested" {
+        if let (Some(issue), Some(handle)) = (issue.clone(), payload.repo_handle.clone()) {
+            let _ = events.send(AppEvent::RepoRequested {
+                project_id,
+                issue,
+                repo_handle: handle,
+            });
+        }
+        return;
     }
 
     let event = match (issue, event_name) {
@@ -688,6 +729,178 @@ pub fn forward(port: u16, token: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+// ── v1.6 auto-push (`--post-commit`) ─────────────────────────────────────────
+
+/// One-shot **post-commit** forwarder (the `--post-commit` mode). git gives a
+/// post-commit hook no stdin, so synthesize the `AgentCommitted` payload from the
+/// worktree (the hook's cwd) and its current branch, and POST it presenting the
+/// per-run bearer `token`. Always `Ok` — a git hook must never block the commit.
+pub fn forward_post_commit(port: u16, token: &str, repo_handle: &str) -> std::io::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let branch = current_branch(&cwd).unwrap_or_default();
+    let payload = json!({
+        "cwd": cwd.to_string_lossy(),
+        "hook_event_name": "AgentCommitted",
+        "repo_handle": repo_handle,
+        "branch": branch,
+    });
+    if let Ok(body) = serde_json::to_vec(&payload) {
+        let _ = post_hook(port, token, &body);
+    }
+    Ok(())
+}
+
+/// One-shot **request-repo** forwarder (the `--request-repo` mode, ENG-542). The
+/// agent runs `lindep request-repo <handle>` inside its workspace; this synthesizes
+/// a `RepoRequested` payload (the `cwd` resolves the issue, even from a repo subdir)
+/// and POSTs it presenting the per-run bearer `token`. Always `Ok` — like every
+/// forwarder, it must never block the agent; the candidate fence + non-zero exit for
+/// an out-of-set handle happen in the CLI front (`run_request_repo`) *before* this.
+pub fn forward_request_repo(port: u16, token: &str, repo_handle: &str) -> std::io::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let payload = json!({
+        "cwd": cwd.to_string_lossy(),
+        "hook_event_name": "RepoRequested",
+        "repo_handle": repo_handle,
+    });
+    if let Ok(body) = serde_json::to_vec(&payload) {
+        let _ = post_hook(port, token, &body);
+    }
+    Ok(())
+}
+
+/// The worktree's current branch (`git rev-parse --abbrev-ref HEAD`), or `None`.
+fn current_branch(cwd: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Install (or refresh) the per-(project, repo) `post-commit` git hook in an L2
+/// clone's shared hooks dir, so every agent commit auto-pushes. **Rewritten on
+/// every plane build** with the CURRENT run's port + token — the stale-port trap:
+/// `serve` mints a fresh ephemeral port each run, so a hook left by a prior run
+/// would POST to a dead endpoint and be silently dropped. The forwarder runs
+/// detached (`&`) so the commit never waits on the network.
+pub fn write_post_commit_hook(
+    clone_root: &Path,
+    exe: &str,
+    port: u16,
+    token: &str,
+    repo_handle: &str,
+) -> std::io::Result<()> {
+    let hooks = clone_root.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks)?;
+    let path = hooks.join("post-commit");
+    let script = format!(
+        "#!/bin/sh\n# lindep v1.6 auto-push — best-effort, non-blocking; refreshed each run.\n\
+         {} --post-commit {port} --hook-token {} --repo-handle {} >/dev/null 2>&1 &\n",
+        sh_quote(exe),
+        sh_quote(token),
+        sh_quote(repo_handle),
+    );
+    write_executable(&path, script.as_bytes())
+}
+
+/// POSIX single-quote a string for safe embedding in the hook shell script,
+/// escaping an embedded `'` the standard `'\''` way.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Write `contents` to `path` (truncating) executable (`0o755`) on Unix — unlike
+/// the owner-only settings file, a git hook must be executable to run.
+fn write_executable(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o755);
+    }
+    let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    file.write_all(contents)
+}
+
+/// Per-repo-handle push serialization. Two commits in different worktrees of one
+/// repo push different branches (no ref conflict), but a **dedicated** per-handle
+/// mutex keeps git's index/ref locks from contending and honours the design's
+/// "don't couple push latency to worktree-create" rule (it is *not* the worktree
+/// `git_lock`).
+fn push_mutex(handle: &str) -> Arc<Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let mut locks = LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(locks.entry(handle.to_string()).or_default())
+}
+
+/// Push a worktree's branch to its true remote while holding the **same**
+/// per-handle [`push_mutex`] the background auto-push uses, so a deliberate push
+/// (ENG-541 teardown) can't race an in-flight auto-push of the same handle and
+/// spuriously fail on git's local ref lock — surfacing as a phantom "push
+/// rejected". Blocking; call from a blocking context (e.g. `spawn_blocking`).
+pub fn push_head_serialized(
+    handle: &str,
+    worktree: &std::path::Path,
+) -> Result<(), crate::mirror::MirrorError> {
+    let lock = push_mutex(handle);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::mirror::push_head(worktree)
+}
+
+/// Push a committed branch to its true remote in the background, then emit the
+/// passive [`AppEvent::AgentCommitted`] indicator — and, on a reject, a footer.
+/// Never force-pushes; never blocks the hook or the render loop.
+fn spawn_auto_push(
+    events: AppEventTx,
+    project_id: String,
+    issue: String,
+    repo_handle: String,
+    branch: String,
+    worktree: PathBuf,
+) {
+    tokio::spawn(async move {
+        let lock = push_mutex(&repo_handle);
+        let push = tokio::task::spawn_blocking(move || {
+            let _guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::mirror::push_head(&worktree)
+        })
+        .await;
+        // The commit happened regardless of the push outcome: always show the
+        // passive indicator; add a footer only when the push itself was rejected.
+        if let Ok(Err(e)) = &push {
+            let _ = events.send(AppEvent::Notification(format!(
+                "{issue}: auto-push failed: {}",
+                clamp_display(&e.to_string())
+            )));
+        }
+        let _ = events.send(AppEvent::AgentCommitted {
+            project_id,
+            issue,
+            repo_handle,
+            branch,
+        });
+    });
+}
+
 /// Synchronous loopback POST of `body` to the endpoint, with the bearer `token`.
 /// Used by the forwarder and the tests; short timeouts keep a hook from ever
 /// hanging.
@@ -793,6 +1006,31 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_repo_hook_emits_repo_requested_for_the_resolved_issue() {
+        // ENG-542: `lindep request-repo web` POSTs a RepoRequested payload whose cwd
+        // resolves the issue; route() emits AppEvent::RepoRequested carrying the handle.
+        let store = seeded_store();
+        let registry = registry_of(store);
+        let (tx, mut rx) = crate::event::channel();
+        let payload = HookPayload {
+            cwd: Some("/wt/ENG-1".into()),
+            hook_event_name: Some("RepoRequested".into()),
+            repo_handle: Some("web".into()),
+            ..Default::default()
+        };
+        route(&payload, &registry, &tx).await;
+        let events = drain(&mut rx).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AppEvent::RepoRequested { issue, repo_handle, .. }
+                    if issue == "ENG-1" && repo_handle == "web"
+            )),
+            "a request-repo hook emits RepoRequested for the resolved issue: {events:?}"
+        );
+    }
+
     /// Drain every queued event into a vec, polling briefly so the off-thread
     /// handler has a chance to route before we look.
     async fn drain(rx: &mut crate::event::AppEventRx) -> Vec<AppEvent> {
@@ -838,6 +1076,41 @@ mod tests {
         assert!(
             json.contains("Notification") && json.contains("Stop") && json.contains("PostToolUse")
         );
+    }
+
+    #[test]
+    fn the_post_commit_hook_is_an_executable_forwarder_invocation() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let clone = std::env::temp_dir().join(format!("lindep-pch-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&clone);
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+
+        write_post_commit_hook(&clone, "/opt/o'brien/lindep", 8765, "tok'en", "api").unwrap();
+        let hook = clone.join(".git").join("hooks").join("post-commit");
+        let body = std::fs::read_to_string(&hook).unwrap();
+        // The forwarder is invoked with this run's port/token/handle, single-quoted
+        // (note the escaped quote in the path/token), and detached so it never
+        // blocks the commit.
+        assert!(body.contains("--post-commit 8765"), "{body}");
+        assert!(body.contains("--repo-handle 'api'"), "{body}");
+        assert!(
+            body.contains(r"'/opt/o'\''brien/lindep'"),
+            "exe is shell-escaped: {body}"
+        );
+        assert!(
+            body.contains(r"--hook-token 'tok'\''en'"),
+            "token is shell-escaped: {body}"
+        );
+        assert!(body.trim_end().ends_with('&'), "runs detached: {body}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&hook).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "the hook is executable");
+        }
+        let _ = std::fs::remove_dir_all(&clone);
     }
 
     #[test]

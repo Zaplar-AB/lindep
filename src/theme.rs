@@ -186,6 +186,18 @@ pub fn agent_row_bg(status: AgentStatus, frame: u64) -> Color {
     }
 }
 
+/// Glyph + style for a repo multi-select checkbox (ENG-536's up-front select): a
+/// checked repo reads in racing green (the house colour for the active selection),
+/// an unchecked one in muted graphite. The two glyph *shapes* differ (filled vs
+/// empty ring) so the state survives a monochrome terminal, like every marker here.
+pub fn repo_check(checked: bool) -> (&'static str, Style) {
+    if checked {
+        ("◉", Style::new().fg(GREEN_500).add_modifier(Modifier::BOLD))
+    } else {
+        ("○", Style::new().fg(MUTED))
+    }
+}
+
 /// Glyph + colour for priority. A leading space keeps the column aligned when a
 /// priority marker is absent.
 pub fn priority_marker(priority: Priority) -> (&'static str, Color) {
@@ -242,6 +254,12 @@ mod tests {
             agent_row_bg(AgentStatus::Running, 6),
             "non-needs-you row tints must not flicker"
         );
+    }
+
+    #[test]
+    fn a_repo_checkbox_reads_in_monochrome() {
+        // Checked vs unchecked must differ by glyph shape, not only colour.
+        assert_ne!(repo_check(true).0, repo_check(false).0);
     }
 
     #[test]

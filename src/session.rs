@@ -1,18 +1,21 @@
 //! Session state store — the durable map from a Linear issue to its agent.
 //!
 //! The *process* hosting an agent is disposable; the *conversation* is not. We
-//! persist, per issue, the worktree + branch it runs in and the `claude`
-//! `session_id` that names its conversation, so a cockpit restart can
-//! `claude --resume` straight back into every live agent. State is one
-//! atomically-written `serde_json` file (`.lindep/state.json`); full transcripts
-//! are **not** inlined — a session only references its NDJSON log by path.
+//! persist, per issue, the worktree + branch it runs in, the repo handles it
+//! materialised, and the `claude` `session_id` that names its conversation, so a
+//! cockpit restart can `claude --resume` straight back into every live agent.
+//! State is one atomically-written `serde_json` file per project, under v1.6's
+//! managed layout at `~/.lindep/projects/<handle>/state.json` (see
+//! [`crate::registry::Layout`]); full transcripts are **not** inlined — a session
+//! only references its NDJSON log by path.
 //!
 //! The `session_id` is a deterministic UUIDv5 of `"{project_id}:{issue}"` under
 //! a fixed namespace, so even if the state file is lost the same id regenerates
 //! and `--resume` still finds the conversation — and the same issue key in two
 //! projects gets two distinct conversations. (Sessions persisted before v1.5
 //! were keyed on the bare issue; their stored id is preserved verbatim on the
-//! v1→v2 migration so `--resume` continuity survives the rekey.)
+//! v1→v2 migration so `--resume` continuity survives the rekey.) `STATE_VERSION`
+//! is `3` as of v1.6, which added the per-issue repo handle set additively.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -116,6 +119,20 @@ impl AgentStatus {
     }
 }
 
+/// What one `[[scratch]]` resource (ENG-561) materialised for an issue — enough to
+/// tear it down later without re-reading the registry, so a config edit can never
+/// strand a live resource. `teardown` is the already-substituted command; `port` is
+/// kept only for a `persist`ed resource so a resume reconnects to the same instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchRecord {
+    pub name: String,
+    pub teardown: String,
+    #[serde(default)]
+    pub env_keys: Vec<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
 /// One persisted agent session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -127,8 +144,22 @@ pub struct Session {
     /// [`SessionStore::for_project`], preserving the stored `session_id`.
     #[serde(default)]
     pub project_id: String,
+    /// The agent's working directory: the single worktree for a one-repo issue,
+    /// or the per-issue **workspace** parent (with each repo a sibling subdir) for
+    /// a multi-repo issue.
     pub worktree_path: PathBuf,
     pub branch: String,
+    /// The repo handles this issue has materialised — the per-issue repo set
+    /// (v1.6, `STATE_VERSION 3`). Empty on a fresh single-repo record and on a
+    /// migrated v2 file (carried by `#[serde(default)]`); populated by the launch
+    /// path and the agent lazy-pull as repos are checked out.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// The scratch datastores this issue provisioned (ENG-561) — recorded so
+    /// teardown/sweep can drop them without re-reading the registry. `#[serde(default)]`
+    /// so a pre-`STATE_VERSION 4` file loads with none.
+    #[serde(default)]
+    pub scratch: Vec<ScratchRecord>,
     /// `claude`'s session id (a UUID string), passed as `--session-id` /
     /// `--resume`.
     pub session_id: String,
@@ -190,14 +221,17 @@ struct Persisted {
     sessions: Vec<Session>,
 }
 
-/// v1 → v2 (lindep v1.5): added `Session::project_id` and folded the project
-/// into the deterministic `session_id`. v2 is a purely additive shape change
-/// (the new field rides a `#[serde(default)]`), so the migration is "stamp the
-/// owning project_id onto records that lack one" — done in
-/// [`SessionStore::for_project`], not a structural transform here. Later
-/// milestones add their own fields (`last_synced_status`, `PipelineState`,
-/// `backend`) as further `#[serde(default)]` on top of v2.
-const STATE_VERSION: u32 = 2;
+/// v1 → v2 (lindep v1.5): added `Session::project_id` and folded the project into
+/// the deterministic `session_id`. v2 → v3 (lindep v1.6): added `Session::repos`,
+/// the per-issue repo handle set under managed workspaces. v3 → v4 (v1.6): added
+/// `Session::scratch`, the per-issue scratch-datastore records (ENG-561). All bumps
+/// are purely additive — the new fields ride a `#[serde(default)]`, so every version
+/// deserializes as-is; the only migration is stamping the owning `project_id` onto
+/// unstamped records (done in [`SessionStore::for_project`], which preserves the
+/// stored `session_id`). v1.6 abandons the in-repo `.lindep` location wholesale
+/// (state now lives under `~/.lindep/projects/<handle>/`), so there is no legacy
+/// adoption: a fresh per-project store stands in where none exists.
+const STATE_VERSION: u32 = 4;
 
 /// Serde default for a version-less file: the first format that carried a tag.
 fn default_state_version() -> u32 {
@@ -217,11 +251,6 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    /// `.lindep/state.json` under a repo root.
-    pub fn state_path(repo_root: impl AsRef<Path>) -> PathBuf {
-        repo_root.as_ref().join(".lindep").join("state.json")
-    }
-
     /// Load the store from `path`, or start empty if the file doesn't exist yet.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, StateError> {
         let path = path.into();
@@ -241,9 +270,10 @@ impl SessionStore {
                         supported: STATE_VERSION,
                     });
                 }
-                // v1 and v2 share the `Session` shape: v2 only adds `project_id`,
-                // carried by `#[serde(default)]` and stamped onto unstamped records
-                // later by [`SessionStore::for_project`] (which preserves the stored
+                // v1, v2 and v3 share the `Session` shape: v2 added `project_id`
+                // and v3 added `repos`, each carried by `#[serde(default)]` and (for
+                // `project_id`) stamped onto unstamped records later by
+                // [`SessionStore::for_project`] (which preserves the stored
                 // `session_id`, so `--resume` survives). So every loadable version
                 // deserializes as-is here — there is no per-version transform yet.
                 // A future *structural* bump would branch on `persisted.version`
@@ -286,25 +316,12 @@ impl SessionStore {
         self
     }
 
-    /// Open project `project_id`'s store at its per-project `state_path`,
-    /// adopting a legacy single-project `state.json` (`legacy_path`) when that's
-    /// the only file present — the v1→v1.5 upgrade. The adopted store is
-    /// redirected to persist forward to `state_path` (the legacy file is left in
-    /// place for rollback); every stored `session_id` is preserved. Pass
-    /// `legacy_path: None` (or for a project that doesn't own the repo's legacy
-    /// file) to skip adoption.
-    pub fn open_project(
-        project_id: &str,
-        state_path: PathBuf,
-        legacy_path: Option<PathBuf>,
-    ) -> Result<Self, StateError> {
-        if !state_path.exists()
-            && let Some(legacy) = legacy_path.filter(|p| p.exists())
-        {
-            let mut store = SessionStore::load(&legacy)?.for_project(project_id);
-            store.path = state_path;
-            return Ok(store);
-        }
+    /// Open project `project_id`'s store at its per-project `state_path` under
+    /// `~/.lindep/projects/<handle>/`. v1.6 abandons the pre-v1.6 in-repo
+    /// `.lindep/state*.json` location outright — there is no legacy adoption — so a
+    /// never-opened project simply starts empty. Stored `session_id`s are
+    /// preserved verbatim by [`for_project`](Self::for_project).
+    pub fn open_project(project_id: &str, state_path: PathBuf) -> Result<Self, StateError> {
         Ok(SessionStore::load(state_path)?.for_project(project_id))
     }
 
@@ -334,6 +351,8 @@ impl SessionStore {
                 project_id,
                 worktree_path,
                 branch,
+                repos: Vec::new(),
+                scratch: Vec::new(),
                 status: AgentStatus::Spawning,
                 transcript_path: None,
                 created_at: now,
@@ -369,6 +388,35 @@ impl SessionStore {
         }
     }
 
+    /// Record the per-issue materialised repo handle set (v1.6 `STATE_VERSION 3`).
+    /// Written by the launch path once the chosen repos are checked out and, for a
+    /// mid-session lazy-pull, only **after** the new clone lands — so a crash never
+    /// leaves the set claiming a repo that isn't on disk. No-op if the issue has no
+    /// record; returns whether one was found and changed.
+    pub fn set_repos(&mut self, issue: &str, repos: Vec<String>) -> bool {
+        if let Some(s) = self.sessions.get_mut(issue) {
+            s.repos = repos;
+            s.updated_at = crate::ledger::now_unix();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record the scratch resources provisioned for `issue` (ENG-561, `STATE_VERSION 4`).
+    /// Like [`set_repos`](Self::set_repos), written once the resources are up so a crash
+    /// never claims a resource that wasn't created. No-op if the issue has no record;
+    /// returns whether one was found and changed.
+    pub fn set_scratch(&mut self, issue: &str, scratch: Vec<ScratchRecord>) -> bool {
+        if let Some(s) = self.sessions.get_mut(issue) {
+            s.scratch = scratch;
+            s.updated_at = crate::ledger::now_unix();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Reverse lookups for the notification bus, which only knows a hook's
     /// `session_id` and `cwd`.
     pub fn issue_for_session_id(&self, session_id: &str) -> Option<&str> {
@@ -378,12 +426,26 @@ impl SessionStore {
             .map(|s| s.issue.as_str())
     }
 
-    /// Map a hook's `cwd` back to an issue by matching the worktree path.
+    /// Map a hook's `cwd` back to an issue by matching the worktree path. An exact
+    /// match wins; otherwise the session whose `worktree_path` is the closest
+    /// ancestor of `cwd`. A multi-repo issue's agent runs in the per-issue
+    /// **workspace** parent (`worktrees/<ISSUE>`) with each repo a sibling subdir,
+    /// so a hook fired from inside a repo subdir (`cwd = <workspace>/<repo>`, e.g. a
+    /// post-commit hook) still resolves to its issue. Distinct issues' worktree
+    /// paths are siblings, never nested, so the longest-prefix match is unambiguous.
     pub fn issue_for_cwd(&self, cwd: &Path) -> Option<&str> {
         self.sessions
             .values()
-            .find(|s| s.worktree_path == cwd)
+            .filter(|s| cwd == s.worktree_path || cwd.starts_with(&s.worktree_path))
+            .max_by_key(|s| s.worktree_path.as_os_str().len())
             .map(|s| s.issue.as_str())
+    }
+
+    /// Drop the record for `issue` — e.g. after its workspace is torn down
+    /// (ENG-541). Returns whether a record was removed. The caller persists the
+    /// store afterwards (via [`mutate_and_persist`]).
+    pub fn forget(&mut self, issue: &str) -> bool {
+        self.sessions.remove(issue).is_some()
     }
 
     /// Drop records whose worktree is no longer live, given the set of issues
@@ -708,11 +770,6 @@ impl Default for CockpitState {
 static COCKPIT_SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl CockpitState {
-    /// `.lindep/cockpit.json` under a repo root.
-    pub fn path(repo_root: impl AsRef<Path>) -> PathBuf {
-        repo_root.as_ref().join(".lindep").join("cockpit.json")
-    }
-
     /// Load the layout, or the empty default if the file is absent. A file from a
     /// newer format is refused (so an older build can't clobber it); a corrupt
     /// file surfaces as `Parse` so the caller can degrade to the default.
@@ -880,57 +937,59 @@ mod tests {
     }
 
     #[test]
-    fn open_project_adopts_a_legacy_state_json_then_persists_per_project() {
-        let dir = temp_state_path(); // .../<unique>/.lindep/state.json
-        let legacy = dir.clone();
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        // A pre-v1.5 single-project store on disk.
-        {
-            let mut old = SessionStore::load(&legacy).unwrap();
-            old.ensure("ENG-1", "/wt/ENG-1".into(), "b".into());
-            old.save().unwrap();
-        }
-        let per_project = legacy.with_file_name("state.proj-x.json");
-        assert!(!per_project.exists());
+    fn open_project_loads_its_per_project_file_and_starts_empty_when_absent() {
+        // v1.6: state lives under ~/.lindep/projects/<handle>/state.json; a
+        // never-opened project simply starts empty (no legacy in-repo adoption).
+        let path = temp_state_path();
+        let absent = SessionStore::open_project("proj-x", path.clone()).unwrap();
+        assert!(
+            absent.get("ENG-1").is_none(),
+            "a fresh project starts empty"
+        );
 
-        let mut store =
-            SessionStore::open_project("proj-x", per_project.clone(), Some(legacy.clone()))
-                .unwrap();
-        // The legacy session was adopted and stamped…
-        assert_eq!(store.get("ENG-1").unwrap().project_id, "proj-x");
-        // …and future saves land in the per-project file, leaving the legacy one.
+        // What it persists, it reloads — stamped with the owning project.
+        let mut store = SessionStore::open_project("proj-x", path.clone()).unwrap();
+        store.ensure("ENG-1", "/wt/ENG-1".into(), "b".into());
         store.set_status("ENG-1", AgentStatus::Done);
         store.save().unwrap();
-        assert!(per_project.exists(), "saved to the per-project path");
-        assert!(
-            legacy.exists(),
-            "legacy state.json is left in place for rollback"
-        );
-        let reloaded = SessionStore::load(&per_project).unwrap();
+        let reloaded = SessionStore::open_project("proj-x", path).unwrap();
+        assert_eq!(reloaded.get("ENG-1").unwrap().project_id, "proj-x");
         assert_eq!(reloaded.get("ENG-1").unwrap().status, AgentStatus::Done);
     }
 
     #[test]
-    fn open_project_prefers_the_per_project_file_over_legacy() {
-        let legacy = temp_state_path();
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        {
-            let mut old = SessionStore::load(&legacy).unwrap();
-            old.ensure("ENG-1", "/wt/legacy".into(), "legacy".into());
-            old.save().unwrap();
+    fn a_v2_state_file_loads_as_v3_with_an_empty_repo_set() {
+        // v3 adds `repos`; a v2 file (no `repos`) must load with it defaulted to
+        // empty, never rejected — the additive-field migration.
+        let path = temp_state_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":2,"sessions":[{"issue":"ENG-7","project_id":"p","worktree_path":"/wt/ENG-7","branch":"felix/eng-7","session_id":"sid","status":"idle","created_at":0,"updated_at":0}]}"#,
+        )
+        .unwrap();
+        let store = SessionStore::load(&path).unwrap();
+        assert!(
+            store.get("ENG-7").unwrap().repos.is_empty(),
+            "the absent repo set defaults to empty"
+        );
+    }
+
+    #[test]
+    fn the_repo_set_round_trips_through_the_state_file() {
+        let path = temp_state_path();
+        let mut store = SessionStore::load(&path).unwrap().for_project("p");
+        store.ensure("ENG-1", "/wt/ENG-1".into(), "b".into());
+        // Stamp a multi-repo set onto the record, then persist + reload.
+        if let Some(s) = store.sessions.get_mut("ENG-1") {
+            s.repos = vec!["lindep".into(), "shared-proto".into()];
         }
-        let per_project = legacy.with_file_name("state.proj-x.json");
-        {
-            let mut new = SessionStore::load(&per_project)
-                .unwrap()
-                .for_project("proj-x");
-            new.ensure("ENG-9", "/wt/new".into(), "new".into());
-            new.save().unwrap();
-        }
-        let store = SessionStore::open_project("proj-x", per_project, Some(legacy)).unwrap();
-        // The per-project file wins; the legacy file is ignored once it exists.
-        assert!(store.get("ENG-9").is_some(), "per-project file was loaded");
-        assert!(store.get("ENG-1").is_none(), "legacy was not adopted");
+        store.save().unwrap();
+        let reloaded = SessionStore::load(&path).unwrap();
+        assert_eq!(
+            reloaded.get("ENG-1").unwrap().repos,
+            vec!["lindep".to_string(), "shared-proto".to_string()]
+        );
     }
 
     #[test]
@@ -1069,6 +1128,41 @@ mod tests {
         assert_eq!(store.issue_for_session_id(&sid), Some("ENG-2"));
         assert_eq!(store.issue_for_cwd(Path::new("/wt/ENG-1")), Some("ENG-1"));
         assert_eq!(store.issue_for_cwd(Path::new("/nope")), None);
+    }
+
+    #[test]
+    fn set_repos_records_the_per_issue_materialised_set() {
+        let path = temp_state_path();
+        let mut store = seeded(&path);
+        assert!(
+            store.get("ENG-1").unwrap().repos.is_empty(),
+            "a fresh record has no repos"
+        );
+        assert!(store.set_repos("ENG-1", vec!["api".into(), "web".into()]));
+        assert_eq!(store.get("ENG-1").unwrap().repos, vec!["api", "web"]);
+        // Latest selection wins; an unknown issue is a no-op.
+        assert!(store.set_repos("ENG-1", vec!["api".into()]));
+        assert_eq!(store.get("ENG-1").unwrap().repos, vec!["api"]);
+        assert!(!store.set_repos("ENG-404", vec!["x".into()]));
+    }
+
+    #[test]
+    fn issue_for_cwd_resolves_a_multi_repo_repo_subdir_to_its_issue() {
+        // A multi-repo agent runs in worktrees/<ISSUE>/ with each repo a sibling
+        // subdir, so a hook fired from inside a repo subdir (e.g. a post-commit
+        // hook, cwd = <workspace>/<repo>) must still resolve to its issue.
+        let path = temp_state_path();
+        let store = seeded(&path);
+        assert_eq!(
+            store.issue_for_cwd(Path::new("/wt/ENG-1/api")),
+            Some("ENG-1")
+        );
+        assert_eq!(
+            store.issue_for_cwd(Path::new("/wt/ENG-2/web/src")),
+            Some("ENG-2")
+        );
+        // An unrelated path still resolves to nothing.
+        assert_eq!(store.issue_for_cwd(Path::new("/wt-other/x")), None);
     }
 
     #[test]

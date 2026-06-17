@@ -185,6 +185,10 @@ pub trait AgentBackend: Send + Sync + std::fmt::Debug {
     /// Forcibly kill the process group (SIGKILL) — the escalation when an agent
     /// ignores the graceful `shutdown`.
     fn force_kill(&self);
+    /// The agent's working directory — the per-issue workspace (the single worktree
+    /// for a one-repo issue, or the parent dir with each repo a sibling subdir).
+    /// What the v1.6 `OpenInEditor` action opens in an external editor.
+    fn cwd(&self) -> &std::path::Path;
 }
 
 /// How the supervisor (and tests) construct backends. Injecting this is what
@@ -192,6 +196,58 @@ pub trait AgentBackend: Send + Sync + std::fmt::Debug {
 /// real `claude`.
 pub type SpawnFn =
     dyn Fn(SpawnConfig, AppEventTx) -> Result<Arc<dyn AgentBackend>, AgentError> + Send + Sync;
+
+/// Open `dir` in an external editor (v1.6 `OpenInEditor`), **detached** and
+/// **inheriting** the cockpit's environment — the deliberate inverse of the agent
+/// spawn's `env_clear`: the editor is the user's own handoff tool, not a sandboxed
+/// agent. Resolves the editor from `$VISUAL`, then `$EDITOR`, then `code`. The
+/// child gets its own session (`setsid`) with stdio nulled and its handle dropped,
+/// so it never touches the TUI's terminal and survives cockpit teardown. Returns
+/// the editor command that was launched, or an error string for a footer.
+pub fn open_in_editor(dir: &std::path::Path) -> Result<String, String> {
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "code".to_string());
+    // Allow a multi-word command (e.g. `code -n`): the first word is the program,
+    // the rest fixed arguments, then the directory to open.
+    let mut parts = editor.split_whitespace();
+    let program = parts
+        .next()
+        .ok_or_else(|| "empty editor command".to_string())?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(parts);
+    cmd.arg(dir);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid` in the forked child before `exec` — async-signal-safe,
+        // no allocation. Detaches the editor from the cockpit's controlling
+        // terminal so it survives teardown and never steals the TUI's input.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    match cmd.spawn() {
+        // Detached: drop the handle, never wait on it.
+        Ok(child) => {
+            drop(child);
+            Ok(editor)
+        }
+        Err(e) => Err(format!("{program}: {e}")),
+    }
+}
 
 /// The production spawn function: host the configured command on a real PTY.
 pub fn pty_spawn() -> Arc<SpawnFn> {
@@ -203,6 +259,8 @@ pub fn pty_spawn() -> Arc<SpawnFn> {
 /// Hosts one interactive CLI on a pseudo-terminal.
 pub struct PtyAgent {
     issue: String,
+    /// The working directory the agent was spawned in — its per-issue workspace.
+    cwd: PathBuf,
     parser: Arc<RwLock<Parser>>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -348,6 +406,7 @@ impl PtyAgent {
 
         Ok(Arc::new(PtyAgent {
             issue: cfg.issue,
+            cwd: cfg.cwd,
             parser,
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
@@ -421,6 +480,10 @@ impl AgentBackend for PtyAgent {
         #[cfg(unix)]
         self.signal_group(libc::SIGKILL);
         self.kill_child();
+    }
+
+    fn cwd(&self) -> &std::path::Path {
+        &self.cwd
     }
 }
 
@@ -771,6 +834,10 @@ pub(crate) mod fake {
             self.shutdowns.fetch_add(1, Ordering::SeqCst);
             self.force_kills.fetch_add(1, Ordering::SeqCst);
             *self.lifecycle.lock().unwrap() = Lifecycle::Exited(None);
+        }
+        fn cwd(&self) -> &std::path::Path {
+            // The fake has no real working tree; the supervisor never opens it.
+            std::path::Path::new("")
         }
     }
 }

@@ -104,10 +104,14 @@ Window management (focus, zoom, pin, close, layout) lives behind the
 
 ## Multi-agent cockpit
 
-Inside a git repo, lindep doubles as a **cockpit that launches and supervises
-real `claude` (Claude Code) agents** — one per issue, each in its own git
-worktree + branch. Linear stays the source of truth; lindep is the visibility +
-orchestration layer (it spawns the real `claude`, it does not reimplement it).
+When the active Linear project is registered in `~/.lindep/registry.toml` (see
+[Managed workspaces](#managed-workspaces-v16) below), lindep doubles as a
+**cockpit that launches and supervises real `claude` (Claude Code) agents** — one
+per issue, each in its own git worktree + branch, in a workspace lindep clones and
+owns (you can run it from anywhere, not just inside a checkout). Linear stays the
+source of truth; lindep is the visibility + orchestration layer (it spawns the
+real `claude`, it does not reimplement it). With `--demo`, or for an unregistered
+project, lindep is just the read-only graph viewer.
 
 The cockpit is a **tiling window manager**: a horizontal strip of focusable
 columns — the permanent **spine** (issue list / agents roster), live **agent**
@@ -145,34 +149,59 @@ nudging an agent is just focusing its column and typing. They tile automatically
 by count — a **mosaic** for a few, a scrolling **rail** beyond that — or pin a
 layout yourself (<kbd>Ctrl-A</kbd> <code>&#124;</code>); zoom one
 full-screen (<kbd>Ctrl-A</kbd> <kbd>z</kbd>); **pin** the ones worth keeping
-(<kbd>Ctrl-A</kbd> <kbd>p</kbd>) — pinned windows and the layout persist to
-`.lindep/cockpit.json` and **auto-resume** on the next launch (`--no-resume`
-opts out).
+(<kbd>Ctrl-A</kbd> <kbd>p</kbd>) — pinned windows and the layout persist to the
+project's `~/.lindep/projects/<handle>/cockpit.json` and **auto-resume** on the
+next launch (`--no-resume` opts out).
 
 Agents that raise a permission prompt or go idle light up live via Claude
 **hooks** posted to a loopback endpoint — no polling. Sessions are durable:
 lindep persists each agent's `session_id` and `--resume`s it on relaunch, so the
-*process* is disposable but the *conversation* is not. All cockpit state lives
-under `.lindep/` (gitignored); outside a git repo (or with `--demo`) lindep is
-just the graph viewer.
+*process* is disposable but the *conversation* is not. Every agent commit
+**auto-pushes** to its branch's remote (post-commit hook → non-blocking push), so
+work is never invisible. Press <kbd>Ctrl-A</kbd> <kbd>e</kbd> to open the focused
+agent's workspace in your editor (`$VISUAL`/`$EDITOR`, else `code`). With `--demo`
+lindep is just the graph viewer.
 
-### Multiple projects
+### Managed workspaces (v1.6)
 
-lindep is multi-project. Map each Linear project to a repo in
-`<repo>/.lindep/projects.toml`, then switch between them in-cockpit with
-<kbd>Ctrl-A</kbd> <kbd>s</kbd>. Backing out of a project never stops its agents —
-each project keeps its own supervised fleet running while you work in another.
-A backgrounded project with an agent waiting on you shows a `⚑N elsewhere` badge
-in the header (and a `⚑` beside it in the switcher), so a prompt is never lost no
-matter which project is open.
+lindep is a **repo-independent workspace manager**: run it from anywhere — it owns
+the on-disk location rather than living inside one checkout. A global
+`~/.lindep/registry.toml` names every repo you own once (by `handle`) and binds
+each Linear project to a set of them:
+
+```toml
+[[repo]]                                  # every repo, named once
+handle = "lindep"
+remote = "git@github.com:zaplar/lindep"   # canonical fetch/push source
+local  = "/home/felix/code/lindep"        # OPTIONAL: a read-only --reference alternate
+
+[[project]]                               # a Linear project ↔ a set of repos
+id            = "323e926b-…"              # Linear project UUID
+handle        = "lindep-core"             # the per-project dir name
+candidates    = ["lindep", "shared-proto"] # the trust boundary
+primary       = "lindep"                  # always materialised at launch
+branch_prefix = "felix"
+```
+
+Opening a project **materialises its isolated workspace** under
+`~/.lindep/projects/<handle>/` via a 3-layer git model — a shared bare **mirror**
+(`~/.lindep/mirrors/<handle>.git`) → a per-(project,repo) **reference clone** that
+borrows the mirror's objects and pushes to the true remote → per-issue
+**worktrees**. Two projects can share a repo with no collision (each has its own
+ref namespace), and the in-cockpit switcher (<kbd>Ctrl-A</kbd> <kbd>s</kbd>) lists
+**every** registered project, cloning one the first time you open it. Backing out
+never stops a project's agents — each keeps its own supervised fleet running while
+you work in another; a backgrounded project waiting on you shows a `⚑N elsewhere`
+badge in the header (and a `⚑` in the switcher).
 
 ### Rebinding keys
 
-Every key is remappable from `<repo>/.lindep/config.toml` then
-`~/.config/lindep/config.toml` (personal wins) — the same two-location pattern as
-`.env`. Direct keys (the spine / dependency windows) go under `[keys]`; the
-window **verbs** reached behind the prefix go under `[verbs]`; the prefix chord
-itself is `prefix`:
+Every key is remappable from `./.lindep/config.toml` (relative to where you launch
+lindep) then `~/.config/lindep/config.toml` (personal wins) — the same
+two-location pattern as `.env`. Since lindep now runs from anywhere, the personal
+file is usually the one to edit. Direct keys (the spine / dependency windows) go
+under `[keys]`; the window **verbs** reached behind the prefix go under `[verbs]`;
+the prefix chord itself is `prefix`:
 
 ```toml
 prefix = "ctrl-a"                  # the escape to window commands (default)
@@ -186,6 +215,7 @@ sort = "s"
 kill = "k"                         # Ctrl-A k to kill the focused agent (default x)
 close = "ctrl-w"
 layout = "|"
+open-in-editor = "e"               # Ctrl-A e to open the agent's workspace (default e)
 ```
 
 Direct-key action names: `move-up` `move-down` `switch-side` `enter`
@@ -193,7 +223,7 @@ Direct-key action names: `move-up` `move-down` `switch-side` `enter`
 `filter` `sort` `search` `help` `summary` `ledger` `context`. Verb names:
 `focus-left` `focus-right` `focus-nav` `zoom` `pin` `close` `kill` `layout`
 `open` `quit` `search` `help` `roster` `jump-needs-you` `summary` `ledger`
-`context` `switch-project` `command-mode`.
+`context` `switch-project` `open-in-editor` `command-mode`.
 
 Keys: single chars (`a`, `/`), `f1`–`f12`, the named keys (`enter` `tab` `space`
 `up` `down` `left` `right` `home` `end` `pageup` `pagedown` `backspace` `delete`
@@ -250,6 +280,8 @@ per-`(project, issue)` session-id state), `backend` (the `AgentBackend` trait +
 PTY-hosted Claude backend), `notify` (Claude hooks → loopback endpoint → events),
 `supervisor` (launch / cancel / shutdown of the agent fleet), `keymap`
 (remappable bindings from `config.toml`), `window` + `layout` (the tiling window
-manager), `picker` (project picker / switcher), `projects` (project↔repo mapping
-in `.lindep/projects.toml`), `workspace` (one supervised fleet per project, kept
-alive across switches), `ledger` (durable per-issue agent run history).
+manager), `picker` (project picker / switcher), `registry` (the global
+`~/.lindep/registry.toml` + the `~/.lindep` layout), `mirror` (the 3-layer git
+clone substrate: bare mirror → reference clone), `workspace` (one supervised fleet
+per project, materialised from the registry and kept alive across switches),
+`ledger` (durable per-issue agent run history).

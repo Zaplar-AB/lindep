@@ -15,6 +15,7 @@
 //!   agent task so all process groups are killed before we restore the terminal.
 
 use std::collections::HashMap;
+use std::collections::HashMap as StdHashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,8 +29,49 @@ use tokio_util::task::TaskTracker;
 
 use crate::backend::{AgentBackend, Lifecycle, SpawnConfig, SpawnFn};
 use crate::event::{AppEvent, AppEventTx};
+use crate::registry::{Layout, RepoEntry, ScratchSpec};
 use crate::session::{AgentStatus, SessionStore};
 use crate::worktree::WorktreeManager;
+
+/// Everything `supervise()` needs to materialise a launch's **secondary** repos
+/// (the up-front multi-select beyond the primary, ENG-536) on the blocking pool:
+/// the `~/.lindep` [`Layout`], this project's handle + branch namespace, the always-
+/// materialised `primary`, and the resolved candidate [`RepoEntry`]s keyed by handle
+/// (the trust boundary — only a candidate can ever be checked out). The primary's
+/// own L2 clone + worktree manager already exist on [`SupervisorConfig::worktree`];
+/// this is what lets a per-issue launch clone the *rest* of its chosen set.
+#[derive(Clone)]
+pub struct RepoProvision {
+    pub layout: Layout,
+    pub project_handle: String,
+    pub branch_prefix: String,
+    pub primary: String,
+    pub candidates: StdHashMap<String, RepoEntry>,
+    /// The project's declared scratch datastores (ENG-561), provisioned per issue at
+    /// launch and recorded for teardown. Empty for a project with no `[[scratch]]`.
+    pub scratch: Vec<ScratchSpec>,
+}
+
+impl RepoProvision {
+    /// Normalise a launch's selected handle set: the `primary` is always first
+    /// (it's always materialised), declared order is otherwise preserved, duplicates
+    /// are dropped, and any handle that isn't a candidate is fenced out — so even a
+    /// stale or forged selection can only ever check out repos in the trust boundary.
+    /// An empty selection (every legacy / single-repo launch) collapses to just the
+    /// primary, so the single-repo path is unchanged.
+    fn normalize(&self, selected: &[String]) -> Vec<String> {
+        let mut out = vec![self.primary.clone()];
+        for handle in selected {
+            if handle != &self.primary
+                && self.candidates.contains_key(handle)
+                && !out.contains(handle)
+            {
+                out.push(handle.clone());
+            }
+        }
+        out
+    }
+}
 
 /// Everything the supervisor needs to launch and host agents.
 pub struct SupervisorConfig {
@@ -37,6 +79,8 @@ pub struct SupervisorConfig {
     /// it emits so the cockpit files them under the right project.
     pub project_id: String,
     pub worktree: WorktreeManager,
+    /// How to materialise a launch's secondary repos beyond the primary (ENG-536).
+    pub provision: RepoProvision,
     pub store: Arc<Mutex<SessionStore>>,
     pub events: AppEventTx,
     /// How to spawn a backend — injected so tests can use a fake.
@@ -90,6 +134,10 @@ enum Command {
         /// stale full-width frame that lingers until claude processes the SIGWINCH
         /// (worst when a chat is opened beside an already-pinned coin).
         size: Option<(u16, u16)>,
+        /// The up-front-selected repo handles to materialise for this issue beyond
+        /// the always-checked-out primary (ENG-536). Empty for a single-repo launch
+        /// (or any caller that doesn't multi-select), which collapses to the primary.
+        repos: Vec<String>,
     },
     Cancel {
         issue: String,
@@ -114,8 +162,35 @@ impl SupervisorHandle {
     /// = `(rows, cols)` is the tile the cockpit will render the agent in, so the
     /// PTY starts at its real size and claude's first paint already fits — no
     /// reflow flash. `None` falls back to the supervisor's configured size.
+    ///
+    /// Production launches always carry a repo selection (the workspace forwards
+    /// [`launch_with_repos`](Self::launch_with_repos)); this no-repos convenience is
+    /// the single-repo shorthand the supervisor's own tests drive it with.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "production goes through launch_with_repos; this is the tests' single-repo shorthand"
+        )
+    )]
     pub fn launch(&self, issue: String, title: String, size: Option<(u16, u16)>) {
-        let _ = self.cmd_tx.send(Command::Launch { issue, title, size });
+        self.launch_with_repos(issue, title, size, Vec::new());
+    }
+    /// Launch an agent with an explicit up-front repo selection (ENG-536). The
+    /// primary is always materialised; `repos` adds the rest of the chosen set.
+    pub fn launch_with_repos(
+        &self,
+        issue: String,
+        title: String,
+        size: Option<(u16, u16)>,
+        repos: Vec<String>,
+    ) {
+        let _ = self.cmd_tx.send(Command::Launch {
+            issue,
+            title,
+            size,
+            repos,
+        });
     }
     /// Stop a single agent, leaving the others running.
     pub fn cancel(&self, issue: String) {
@@ -149,6 +224,10 @@ struct AgentTask {
     generation: u64,
     token: CancellationToken,
     worktree: WorktreeManager,
+    /// The up-front-selected repo set for this launch (ENG-536). Empty → primary only.
+    repos: Vec<String>,
+    /// How to materialise the secondary repos beyond the primary.
+    provision: RepoProvision,
     store: Arc<Mutex<SessionStore>>,
     events: AppEventTx,
     spawn: Arc<SpawnFn>,
@@ -196,7 +275,12 @@ impl Supervisor {
     async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                Command::Launch { issue, title, size } => self.launch(issue, title, size),
+                Command::Launch {
+                    issue,
+                    title,
+                    size,
+                    repos,
+                } => self.launch(issue, title, size, repos),
                 Command::Cancel { issue } => self.cancel(&issue),
                 Command::Reaped { issue, generation } => self.reap(&issue, generation),
                 // Stop receiving and fall through to teardown. Reaping is
@@ -220,7 +304,13 @@ impl Supervisor {
     /// Record an agent and hand its whole lifecycle to a tracked task. This is
     /// synchronous: the blocking worktree/spawn work happens inside the task, so
     /// a slow `git` never stalls cancel/shutdown of other agents.
-    fn launch(&mut self, issue: String, title: String, size: Option<(u16, u16)>) {
+    fn launch(
+        &mut self,
+        issue: String,
+        title: String,
+        size: Option<(u16, u16)>,
+        repos: Vec<String>,
+    ) {
         if let Some(record) = self.agents.get(&issue) {
             // A cancelled record lingers until its task confirms teardown; tell
             // the user it's still stopping rather than the misleading "already
@@ -274,6 +364,8 @@ impl Supervisor {
             generation,
             token,
             worktree: self.cfg.worktree.clone(),
+            repos,
+            provision: self.cfg.provision.clone(),
             store: Arc::clone(&self.cfg.store),
             events: self.cfg.events.clone(),
             spawn: Arc::clone(&self.cfg.spawn),
@@ -342,35 +434,275 @@ async fn run_agent(task: AgentTask) {
     });
 }
 
+/// What the materialise pass returns: the worktrees that came up (handle → worktree),
+/// paired with per-secondary failure messages (skipped, not fatal — see the loop).
+type MaterializeOutcome = Result<(Vec<(String, crate::worktree::Worktree)>, Vec<String>), String>;
+
+/// Best-effort teardown of freshly-provisioned scratch records on the blocking pool —
+/// rolls back what a launch created when it then aborts (cancel, or a `required`
+/// failure), so an external resource isn't orphaned before it's ever recorded on the
+/// session. Reused (pre-existing persisted) resources are filtered out by the caller.
+async fn rollback_scratch(records: Vec<crate::session::ScratchRecord>) {
+    if records.is_empty() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        for record in &records {
+            let _ = crate::scratch::teardown(record);
+        }
+    })
+    .await;
+}
+
 async fn supervise(task: &AgentTask) {
     let notify = |msg: String| {
         let _ = task.events.send(AppEvent::Notification(msg));
     };
 
-    // git worktree creation blocks; run it on the blocking pool, not a worker.
-    let (mgr, issue, title, base) = (
-        task.worktree.clone(),
-        task.issue.clone(),
-        task.title.clone(),
-        task.base.clone(),
-    );
-    let create = tokio::task::spawn_blocking(move || mgr.create(&issue, &title, &base));
-    let worktree = tokio::select! {
+    // Materialise every selected repo (primary + the up-front multi-select,
+    // ENG-536) on the blocking pool: each repo's L2 reference clone is ensured
+    // (idempotent, fsck self-healing) and its per-issue worktree created, serially —
+    // which sidesteps the mirror-lock race entirely. The primary's clone + manager
+    // already exist (build_plane provisioned them); secondary repos are cloned and
+    // re-rooted here, each getting this run's post-commit hook. git is slow and
+    // un-abortable, so a cancel/shutdown mid-clone stops awaiting and returns (the
+    // detached thread finishes on its own) — keeping teardown responsive exactly as
+    // the single-repo path did.
+    // The issue's prior durable repo set, read once up front — unioned into the
+    // materialise selection (so a resume brings back lazily-pulled repos), and unioned
+    // again into the persisted set below (so a repo dropped from the candidate list by
+    // a registry edit is RETAINED in the record, never silently orphaned).
+    let existing_repos: Vec<String> = task
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.get(&task.issue).map(|sess| sess.repos.clone()))
+        .unwrap_or_default();
+    // The issue's prior scratch records (ENG-561), read once: lets a `persist`ed
+    // resource reuse its recorded port across a resume, and lets us retain a record
+    // whose spec was removed from the registry so discard still tears it down.
+    let existing_scratch: Vec<crate::session::ScratchRecord> = task
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.get(&task.issue).map(|sess| sess.scratch.clone()))
+        .unwrap_or_default();
+    let materialize = {
+        let provision = task.provision.clone();
+        let primary_mgr = task.worktree.clone();
+        // The set to materialise is the launch-time selection UNIONED with the issue's
+        // durable repo set — so a resume brings back every repo a mid-session lazy-pull
+        // (ENG-542) added, not just the original up-front pick. normalize() dedups,
+        // pins the primary first, and fences to candidates.
+        let selected = {
+            let mut requested = task.repos.clone();
+            requested.extend(existing_repos.iter().cloned());
+            provision.normalize(&requested)
+        };
+        let issue = task.issue.clone();
+        let title = task.title.clone();
+        let base = task.base.clone();
+        let exe = task.exe.to_string_lossy().into_owned();
+        let port = task.hook_port;
+        let token = task.hook_token.clone();
+        tokio::task::spawn_blocking(move || -> MaterializeOutcome {
+            let mut out = Vec::with_capacity(selected.len());
+            // Secondary-repo failures are collected, not fatal: a launch must not
+            // be lost because ONE secondary repo can't be materialised (offline,
+            // its mirror reclaimed, …). Only the primary is required — it anchors
+            // the agent's cwd and branch. A skipped repo stays in the durable set
+            // recorded below, so the next resume retries it.
+            let mut failures: Vec<String> = Vec::new();
+            for handle in &selected {
+                let is_primary = handle == &provision.primary;
+                let step = (|| -> Result<crate::worktree::Worktree, String> {
+                    let mgr = if is_primary {
+                        primary_mgr.clone()
+                    } else {
+                        let entry = provision.candidates.get(handle).ok_or_else(|| {
+                            format!("repo `{handle}` is not a candidate of this project")
+                        })?;
+                        // Best-effort, throttled mirror refresh so a (re)built clone
+                        // forks off current upstream rather than the mirror's state at
+                        // first create (the stale-base concern).
+                        let _ = crate::mirror::refresh_mirror(&provision.layout, entry);
+                        let clone = crate::mirror::ensure_clone(
+                            &provision.layout,
+                            &provision.project_handle,
+                            entry,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        // Install/refresh this repo's auto-push hook with THIS run's
+                        // port + token (the stale-port trap), like the primary's.
+                        let _ = crate::notify::write_post_commit_hook(
+                            &clone, &exe, port, &token, handle,
+                        );
+                        let worktrees_root =
+                            provision.layout.worktrees_dir(&provision.project_handle);
+                        WorktreeManager::with_layout(
+                            &clone,
+                            &provision.branch_prefix,
+                            &worktrees_root,
+                            handle,
+                        )
+                        .map_err(|e| e.to_string())?
+                    };
+                    mgr.create(&issue, &title, &base).map_err(|e| e.to_string())
+                })();
+                match step {
+                    Ok(wt) => out.push((handle.clone(), wt)),
+                    // The primary is required — propagate its failure as fatal.
+                    Err(e) if is_primary => return Err(e),
+                    Err(e) => failures.push(format!("repo `{handle}` skipped — {e}")),
+                }
+            }
+            Ok((out, failures))
+        })
+    };
+    let (materialized, repo_failures) = tokio::select! {
         // A cancel/shutdown during the (blocking, un-abortable) git op must not
         // pin teardown behind it: stop awaiting and return so `tracker.wait()`
         // stays responsive. The detached blocking thread finishes git on its own
         // and the runtime reclaims it — we just don't gate shutdown on it.
         () = task.token.cancelled() => return,
-        res = create => match res {
-            Ok(Ok(worktree)) => worktree,
-            Ok(Err(e)) => return notify(format!("worktree for {} failed: {e}", task.issue)),
-            Err(e) => return notify(format!("worktree task for {} panicked: {e}", task.issue)),
+        res = materialize => match res {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return notify(format!("workspace for {} failed: {e}", task.issue)),
+            Err(e) => return notify(format!("workspace task for {} panicked: {e}", task.issue)),
         },
     };
+    // A skipped secondary isn't fatal, but the human should know its tools won't be
+    // mounted until a later resume retries it.
+    for failure in &repo_failures {
+        notify(format!("{}: {failure}", task.issue));
+    }
 
     // Cancelled just as git finished? Bail before spawning a process.
     if task.token.is_cancelled() {
         return;
+    }
+
+    // The primary worktree anchors the session record (its branch, and — for a
+    // single-repo issue — its path as the agent cwd). A multi-repo issue runs in
+    // the shared per-issue workspace parent (`worktrees/<ISSUE>`) with each repo a
+    // sibling subdir, told apart by a generated `WORKSPACE.md` and reachable via one
+    // `--add-dir` per repo so claude has tool access to each.
+    let primary_wt = materialized
+        .iter()
+        .find(|(h, _)| h == &task.provision.primary)
+        .map(|(_, w)| w.clone())
+        .unwrap_or_else(|| materialized[0].1.clone());
+    let multi = materialized.len() > 1;
+    let workspace_dir = task
+        .provision
+        .layout
+        .issue_workspace_dir(&task.provision.project_handle, &task.issue);
+    let cwd = if multi {
+        workspace_dir.clone()
+    } else {
+        primary_wt.path.clone()
+    };
+    let materialized_handles: Vec<String> = materialized.iter().map(|(h, _)| h.clone()).collect();
+    let add_dirs: Vec<String> = if multi {
+        materialized
+            .iter()
+            .map(|(_, w)| w.path.to_string_lossy().into_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if multi {
+        let repos: Vec<(String, String)> = materialized
+            .iter()
+            .map(|(h, w)| (h.clone(), w.branch.clone()))
+            .collect();
+        if let Err(e) = crate::worktree::write_workspace_md(&workspace_dir, &task.issue, &repos) {
+            notify(format!("WORKSPACE.md for {} not written: {e}", task.issue));
+        }
+    }
+
+    // ── Scratch datastores (ENG-561) ──────────────────────────────────────────
+    // Provision the project's [[scratch]] resources for this issue on the blocking
+    // pool (they shell out) so the agent's app/tests get an isolated DB / ports. The
+    // resolved env is injected into the spawn below; the records are persisted so
+    // teardown/sweep can drop them. Best-effort per resource unless `required`; a
+    // `persist`ed resource reuses its recorded port across a resume.
+    let mut scratch_env: Vec<(String, String)> = Vec::new();
+    let mut scratch_records: Vec<crate::session::ScratchRecord> = Vec::new();
+    if !task.provision.scratch.is_empty() {
+        let specs = task.provision.scratch.clone();
+        let prior = existing_scratch.clone();
+        let ctx = crate::scratch::Context {
+            issue: task.issue.clone(),
+            project: task.provision.project_handle.clone(),
+            workspace: workspace_dir.clone(),
+        };
+        // Await the provision to completion rather than racing the cancel token: a
+        // scratch resource is EXTERNAL (a DB/container/port), not on-disk under the
+        // worktree, so unlike the git materialize there's no reconcile sweep to mop it
+        // up — abandoning a mid-flight provision would orphan whatever the detached
+        // thread then creates. The wait is bounded by one provision; on cancel we roll
+        // back what THIS pass freshly created (a reused persisted resource pre-dates the
+        // launch and is left alone) and bail before spawning.
+        let provisioned = match tokio::task::spawn_blocking(move || {
+            crate::scratch::provision_all(&specs, &ctx, &prior)
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return notify(format!("scratch task for {} panicked: {e}", task.issue)),
+        };
+        if task.token.is_cancelled() {
+            rollback_scratch(
+                provisioned
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|p| !p.reused)
+                    .map(|p| p.record)
+                    .collect(),
+            )
+            .await;
+            return;
+        }
+        let mut ok: Vec<crate::scratch::Provisioned> = Vec::new();
+        let mut fatal: Option<String> = None;
+        for outcome in provisioned {
+            match outcome {
+                Ok(p) => ok.push(p),
+                // `required` → the agent can't run without it; abort the launch.
+                Err(e) if e.required => {
+                    if fatal.is_none() {
+                        fatal = Some(format!(
+                            "{}: scratch `{}` failed: {}",
+                            task.issue, e.name, e.message
+                        ));
+                    }
+                }
+                // Best-effort: footer it and launch anyway.
+                Err(e) => notify(format!(
+                    "{}: scratch `{}` skipped — {}",
+                    task.issue, e.name, e.message
+                )),
+            }
+        }
+        if let Some(msg) = fatal {
+            // Roll back only what this pass freshly CREATED — a reused persisted
+            // resource pre-dates the launch (the resume reconnected to it) and the
+            // persist contract keeps it across an abort. Freshly-created records aren't
+            // persisted yet, so without this they'd orphan.
+            rollback_scratch(
+                ok.iter()
+                    .filter(|p| !p.reused)
+                    .map(|p| p.record.clone())
+                    .collect(),
+            )
+            .await;
+            return notify(msg);
+        }
+        for p in ok {
+            scratch_env.extend(p.env);
+            scratch_records.push(p.record);
+        }
     }
 
     // Session record: deterministic id, resume if we've launched this before.
@@ -379,9 +711,31 @@ async fn supervise(task: &AgentTask) {
             return notify("session store lock poisoned".to_string());
         };
         let resume = store.get(&task.issue).is_some();
-        let session = store.ensure(&task.issue, worktree.path.clone(), worktree.branch.clone());
+        let session = store.ensure(&task.issue, cwd.clone(), primary_wt.branch.clone());
         let session_id = session.session_id.clone();
         store.set_status(&task.issue, AgentStatus::Spawning);
+        // Record the materialised repo set (ENG-536) so a restart rehydrates exactly
+        // these repos (ENG-540) and the lazy-pull (ENG-542) extends a known set. Union
+        // with the prior durable set so a repo that fell out of the candidate list
+        // (a registry edit) keeps its place in the record (its worktree stays tracked
+        // for teardown) rather than being silently dropped.
+        let mut durable = existing_repos; // last use — move, don't clone
+        for h in &materialized_handles {
+            if !durable.contains(h) {
+                durable.push(h.clone());
+            }
+        }
+        store.set_repos(&task.issue, durable);
+        // Record the scratch resources (ENG-561), unioned with any prior record whose
+        // spec was removed from the registry — so discard still tears that resource
+        // down rather than orphaning it (same retention discipline as repos).
+        let mut durable_scratch = scratch_records;
+        for prior in existing_scratch {
+            if !durable_scratch.iter().any(|r| r.name == prior.name) {
+                durable_scratch.push(prior);
+            }
+        }
+        store.set_scratch(&task.issue, durable_scratch);
         // Snapshot (+ ordering seq) under the lock; persist after dropping it so
         // blocking fs I/O never runs under the store mutex (a hook waiting on the
         // same lock must not block behind a disk rename).
@@ -442,7 +796,7 @@ async fn supervise(task: &AgentTask) {
         let mut spawn_cfg = SpawnConfig::claude(
             &task.project_id,
             &task.issue,
-            worktree.path.clone(),
+            cwd.clone(),
             &session_id,
             resume,
             task.rows,
@@ -450,8 +804,38 @@ async fn supervise(task: &AgentTask) {
         )
         .arg("--settings")
         .arg(settings.to_string_lossy().to_string());
+        // One `--add-dir` per repo so a multi-repo agent has full tool access to
+        // each sibling worktree, not just its cwd (the workspace parent). Argv-baked,
+        // so a repo added mid-session needs a resume for full access (ENG-542).
+        for dir in &add_dirs {
+            spawn_cfg = spawn_cfg.arg("--add-dir").arg(dir);
+        }
         for guardrail in &task.guardrails {
             spawn_cfg = spawn_cfg.arg(guardrail);
+        }
+        // Hand the agent the cockpit's hook endpoint + its own identity so it can run
+        // `lindep request-repo <handle>` (ENG-542 fenced lazy-pull) from inside its
+        // workspace. These ride the agent's env (the spawn `env_clear`s, so they reach
+        // the child only because we add them); the token only authorises loopback hook
+        // POSTs the agent can already make, so exposing it here is no new capability.
+        spawn_cfg
+            .env
+            .push(("LINDEP_HOOK_PORT".to_string(), task.hook_port.to_string()));
+        spawn_cfg
+            .env
+            .push(("LINDEP_HOOK_TOKEN".to_string(), task.hook_token.clone()));
+        spawn_cfg
+            .env
+            .push(("LINDEP_PROJECT".to_string(), task.project_id.clone()));
+        spawn_cfg
+            .env
+            .push(("LINDEP_ISSUE".to_string(), task.issue.clone()));
+        // Inject each scratch resource's resolved env (ENG-561) so the agent's app /
+        // tests reach their isolated DB / ports with no app changes. Re-pushed every
+        // attempt (the spawn consumes `spawn_cfg`), and re-resolved every launch — the
+        // stale-port-trap rule, the same reason the hook port/token are re-pushed here.
+        for (key, value) in &scratch_env {
+            spawn_cfg.env.push((key.clone(), value.clone()));
         }
 
         let backend = match (task.spawn)(spawn_cfg, task.events.clone()) {
@@ -705,6 +1089,17 @@ mod tests {
         SupervisorConfig {
             project_id: String::new(),
             worktree: wt,
+            // Single-repo provisioning: `normalize` collapses an empty selection to
+            // just the primary, which reuses `worktree` above — so the candidates
+            // map is never consulted and the layout/handle only matter for multi-repo.
+            provision: RepoProvision {
+                layout: Layout::new(dir),
+                project_handle: "test".to_string(),
+                branch_prefix: "test".to_string(),
+                primary: "test".to_string(),
+                candidates: StdHashMap::new(),
+                scratch: Vec::new(),
+            },
             store: Arc::new(Mutex::new(
                 SessionStore::load(dir.join(".lindep").join("state.json")).unwrap(),
             )),
