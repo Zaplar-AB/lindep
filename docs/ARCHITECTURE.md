@@ -1,10 +1,12 @@
 # lindep architecture — the v1 multi-agent spine
 
-> **Status (2026-06): partly stale — the v1.6 substrate has landed; full rewrite still pending.**
-> This file describes the **v1 spine + the Cockpit-v2 "chat wall" UI**. Several things have since changed and are only partly reflected below:
+> **Status (2026-06): current through v1.7.** The connective-tissue architecture
+> (layers, concurrency, data flow, lifecycle, state, hooks) and the Operating
+> guide reflect the shipped product; the bullets below trace how it got here from
+> the original v1 spine.
 > - **v1.6 managed workspaces (substrate landed)**: lindep is now a **repo-independent workspace manager run from anywhere** (`git_toplevel` anchoring is gone). A global `~/.lindep/registry.toml` (`registry` module) names repos + projects; opening a project materialises its isolated `~/.lindep/projects/<handle>/` world via a 3-layer git model (`mirror` module: bare mirror → reference clone → per-issue worktree, the re-rooted `worktree` manager). `STATE_VERSION` is `3` (`Session` gains a per-issue repo handle set); `reject_repo_root_collisions` and the `projects.toml` mapping are **deleted** (per-project ref namespaces make collisions structurally impossible). Every agent commit **auto-pushes** (`post-commit` hook → `--post-commit` forwarder → `AgentCommitted` → per-handle push); `Ctrl-a e` opens the workspace in an editor. *Still pending (additive, on this substrate): up-front multi-repo select, fenced agent lazy-pull, mirror staleness/refcount teardown, the global all-agents view.*
 > - **v1.5 multi-project**: the session store, supervisor, and notification bus are keyed by `(project_id, issue)`; there are `workspace`, `picker`, and `ledger` modules; hooks carry an `x-lindep-token` and route via a workspace-wide registry.
-> - **Cockpit v3.2**: the live UI is a `Ctrl-a`-prefixed tiling window manager (Spine / Coin / Fleet, auto mosaic/rail) — **not** the chat-wall / composer model the Operating Guide below still describes. `i` = issue summary and `t` = ledger (there is no composer). For current keybindings, trust the **README** and the in-app `?` overlay, not this file.
+> - **Cockpit v3.2 + v1.7 readiness UX**: the live UI is a `Ctrl-a`-prefixed tiling window manager (Spine / Coin / Fleet, auto mosaic/rail); the Spine is a readiness-banded schedule (`App::readiness`) and `Enter` dispatches a READY issue. `i` = issue summary, `t` = ledger — no composer, no chat-wall, no agents-roster tab. The Operating guide below reflects this; for the exhaustive, remappable keymap trust the **README** and the in-app `?` overlay.
 
 This is the connective-tissue doc: how the pieces fit, where work runs, how data
 flows, and how to operate the cockpit. Per-module and per-item details live in
@@ -28,7 +30,7 @@ degrades cleanly to the read-only graph viewer.
 
 | Layer | Module(s) | Responsibility |
 |-------|-----------|----------------|
-| 1. Cockpit (TUI) | `app`, `ui`, `theme`, `keymap` | State, input (via a remappable keymap), rendering — incl. `App::readiness` (v1.7), the readiness-banded spine + dispatch gate, the whole-row fleet tints, the tileable chat wall, the composer and the attach pane |
+| 1. Cockpit (TUI) | `app`, `ui`, `theme`, `keymap` | State, input (via a remappable keymap), rendering — incl. `App::readiness` (v1.7), the readiness-banded spine + dispatch gate, the whole-row fleet tints, and the tiled agent-PTY + dependency windows |
 | 2. Linear client | `linear` | Blocking `ureq` GraphQL read (personal key); write-back is v2 |
 | 3. Control plane | `backend` | `AgentBackend` trait + `PtyAgent` (PTY host); Codex/Aider slot in here |
 | 4. Pipeline engine | *(v3)* | Generic stage machine over `.lindep/pipeline.toml` — not in v1 |
@@ -95,11 +97,14 @@ Everything else is messages: `AppEvent` (off-thread → loop) and `Command`
 
 ## Data flow
 
-**Input.** A keypress hits `App::on_key`. While **attached**, the agent owns the
-keyboard: the key is encoded by `backend::key_to_bytes` and written to the PTY via
-`AgentBackend::send_input` — only the `F10` detach key is intercepted. While
-on the **dashboard**, keys drive the cockpit (`a` launch, `t` attach, `x` stop,
-`n` next-needs-you, plus all the graph navigation).
+**Input.** A keypress hits `App::on_key`. The **focused window** owns the
+keyboard: when it's an **agent** pane the key is encoded by
+`backend::key_to_bytes` and written to the PTY via `AgentBackend::send_input` —
+the `Ctrl-a` prefix is the sole escape (pressed twice it forwards a literal
+`Ctrl-a`). When the **Spine** or a **Deps** window is focused the key drives the
+cockpit directly (move, `Enter` to dispatch a ready issue, sort/filter, the
+needs-you/cycle jumps, graph navigation); `Ctrl-a` then reaches the window verbs
+(focus, zoom, pin, close, kill, …) from any focus.
 
 **Output + notifications (everything that changes the screen off-thread):**
 
@@ -201,58 +206,40 @@ connection with a timeout, and survives transient `accept()` errors.
 
 ## Operating guide
 
-> ⚠️ This UI section predates Cockpit v3.2 and is obsolete — see the README for current keybindings.
-
 ```sh
-cargo run                    # cockpit, in a git repo (or: cargo run -- "Project")
-cargo run -- --demo          # graph viewer only, no agents, no key needed
+cargo run                    # the cockpit (a registered project; or: cargo run -- "Project")
+cargo run -- --demo          # graph viewer only — no agents, no API key
 ```
 
-| Key | Action |
-|-----|--------|
-| `a` | Open an agent on the focused issue (resumes if it ran before). One agent per issue — a live one is never duplicated |
-| `v` | Toggle the right pane between the dependency trees and the live agent chats |
-| `r` | Toggle the left pane between the issue list and the agents roster |
-| `p` | Pin / unpin the focused issue's chat to the chat wall (stays while you browse) |
-| `i` | Open the composer — type one line to the selected/pinned agent's PTY without a full attach |
-| <code>&#124;</code> | Cycle the chat wall's split: stacked rows → side-by-side columns → grid |
-| `]` / `[` | Switch the lens to the next / previous agent's chat |
-| `t` | Attach to its live terminal (all keys go to the agent) |
-| `F10` | Detach (agent keeps running) |
-| `x` | Stop the focused issue's agent |
-| `n` | Jump to the next issue whose agent needs you |
-| `?` | Full keymap (graph navigation keys unchanged) |
+The cockpit is a **tiling window manager**: a horizontal strip of focusable
+columns — the permanent **Spine** (the issue list), live **agent** PTYs (one per
+issue), and **dependency** windows — auto-tiled as a **mosaic** for a few or a
+scrolling **rail** beyond that (pin a layout with `Ctrl-a |`). The focused window
+takes every keystroke; **`Ctrl-a` is the prefix** that escapes to window commands
+(focus, zoom, pin, close, kill, layout, switch-project, the global all-agents
+screen, …), pressed twice to send a literal `Ctrl-a` to the agent. Direct keys
+(movement, sort/filter, search, the `i` summary / `t` ledger overlays) apply when
+the Spine or a Deps window is focused; an Agent pane forwards every direct key to
+its PTY. The full, *remappable* binding list lives in the README and the in-app
+`?` overlay — the source of truth is the `keymap` module's `Action` enum +
+defaults, not a table here (re-listing keys is exactly how this section went stale).
 
-**Two-step flow + visibility.** `a` *opens* an agent (the first step); `t`
-*attaches* once it's up (the second). The two are deliberately distinct so you
-don't accidentally spin up a duplicate, and the cockpit enforces one agent per
-issue. The **chat wall** (`v`) shows several agents' live screens at once —
-read-only previews, reflowed to fit — with pinned chats kept on screen while the
-selection's chat follows wherever you browse. Its panes tile three ways (`|`):
-stacked rows, side-by-side columns, or a near-square grid.
+**The Spine is a readiness schedule (v1.7).** Issues are banded top→bottom
+**NEEDS-YOU · RUNNING · READY · BLOCKED · DONE** from `App::readiness` (the fused
+per-issue state — see [the readiness model](#the-six-layers--modules) above), so
+the work needing you sits at the top and the dispatchable **READY** lane (a `▸`
+rail) reads at a glance. **Dispatch** is `Enter` on a READY row — it launches an
+agent in the issue's own worktree + branch; a BLOCKED row is refused with its
+blocker named, so you never launch work that can't progress. There is no separate
+agents-roster tab any more: live agents *are* the NEEDS-YOU and RUNNING bands.
 
-Three lighter-weight affordances sit between "glance" and "take over":
-
-- The **agents roster** (`r`) is the left pane's second tab — every issue with an
-  agent, salience-sorted (needs-you → working → idle → terminal) and stepped with
-  the same cursor that drives the chat wall, so it's a triage list, not just a
-  count.
-- The **composer** (`i`) writes one line straight to the selected (or first
-  pinned) live agent's PTY — answer a permission prompt, nudge an idle agent —
-  without the full-screen attach takeover. It captures the keyboard the way
-  search does; Enter sends, Esc closes. For anything richer (arrow keys, Ctrl
-  chords) you still `t` to attach.
-- The **split** (`|`) is per-wall, so you choose left/right vs above/below to suit
-  the terminal's shape.
-
-Agent state reads several ways at once — a whole-row **colour tint** (the entire
-issue/roster row, not just an edge; needs-you breathes), a left-edge **gutter
-bar** (`▎`, so it survives the selection highlight), a trailing **marker**, and
-(on the chat wall) the pane **border**:
+Agent state reads two ways at once — a whole-row **colour tint** (the entire issue
+row, not just an edge; needs-you breathes) and a **marker** in a fixed left gutter
+(a ready, agent-less row shows the `▸` dispatch rail there instead):
 
 | State | Glyph | Colour | Animated |
 |-------|-------|--------|----------|
-| spawning | spinner `⠋…` | green | spins |
+| spawning | `◌` | green | — |
 | working | spinner `⠋…` | **orange** | spins |
 | needs you | `⚑` | **amber** | pulses |
 | idle (alive) | `◦` | teal | — |
@@ -266,23 +253,16 @@ one, while the node still records that an agent ran there. Animation is gated:
 the loop only advances frames while something is actually live or flashing, so a
 cockpit of resting/terminal agents (or none) still never busy-repaints.
 
-Every binding is remappable via a `[keys]` table in `config.toml`
-(`<repo>/.lindep/config.toml`, then `~/.config/lindep/config.toml` — personal
-wins; same two-location pattern as `.env`). The `keymap` module owns the
-`Action` enum, the binding parser, the defaults, conflict detection, and loading;
-`App` dispatches keys through it. `Esc` and the search/help overlays are fixed.
-The attach pane and the `?` help render the *live* bindings, so a rebind (e.g.
-`detach = "f8"` when a keyboard lacks F10) is always shown correctly — you can't
-strand yourself attached. Bad config warns on stderr at startup and falls back to
-defaults rather than aborting.
-
-`detach` may also be a **tmux-style leader sequence** (`detach = "ctrl-a d"`) —
-the only action that can, because a reserved-key gesture is needed solely while
-attached (the dashboard has free single keys). The leader (`Ctrl-A`) arms a
-pending state in `App`; the next key completes the detach, a repeat of the leader
-passes one leader chord through to the agent, and anything else cancels and
-forwards. `Ctrl-<letter>` leaders work on every keyboard/terminal, which a lone
-function key does not.
+Every binding is remappable via a `[keys]` table (direct keys) and a `[verbs]`
+table (the `Ctrl-a` prefix verbs) in `config.toml` (`<cwd>/.lindep/config.toml`,
+then `~/.config/lindep/config.toml` — personal wins; same two-location pattern as
+`.env`). The `keymap` module owns the `Action` enum, the binding parser, the
+defaults, conflict detection, and loading; `App` dispatches keys through it. `Esc`
+and the search/help overlays are fixed; the prefix itself is configurable
+(`prefix`, default `Ctrl-a`) and, pressed twice, passes one literal prefix chord
+through to the focused agent so it's never wholly unreachable. The `?` overlay
+renders the *live* bindings. Bad config warns on stderr at startup and falls back
+to defaults rather than aborting.
 
 ## Key decisions (and what we learned building it)
 
