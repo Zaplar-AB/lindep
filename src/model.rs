@@ -116,6 +116,13 @@ pub struct Graph {
     cycles: Vec<Vec<String>>,
     in_cycle: HashSet<String>,
     back_edges: HashSet<(String, String)>,
+    /// Per-node transitive closure sizes `(upstream, downstream)`, precomputed in
+    /// [`finalize`](Self::finalize). The detail bar calls [`transitive`](Self::transitive)
+    /// for the focused issue on every repaint; without this each call re-runs a BFS
+    /// that allocates a set + work-stack and clones every visited key. The graph is
+    /// read-only after `finalize`, so the cache never goes stale; `transitive` falls
+    /// back to computing when it's absent (a not-yet-finalized graph, e.g. in tests).
+    transitive_counts: HashMap<String, (usize, usize)>,
 }
 
 impl Graph {
@@ -130,6 +137,7 @@ impl Graph {
             cycles: Vec::new(),
             in_cycle: HashSet::new(),
             back_edges: HashSet::new(),
+            transitive_counts: HashMap::new(),
         }
     }
 
@@ -199,6 +207,18 @@ impl Graph {
         }
         self.detect_cycles();
         self.mark_cycle_members();
+        // Precompute transitive closure sizes so the render hot path reads them O(1).
+        // Computed into a local first (immutable borrows of `self`), then stored.
+        let counts: HashMap<String, (usize, usize)> = self
+            .order
+            .iter()
+            .map(|k| {
+                let up = self.compute_transitive(k, Direction::Upstream);
+                let down = self.compute_transitive(k, Direction::Downstream);
+                (k.clone(), (up, down))
+            })
+            .collect();
+        self.transitive_counts = counts;
     }
 
     /// Classic three-colour DFS over downstream edges, recording back-edges and
@@ -418,7 +438,21 @@ impl Graph {
     }
 
     /// Distinct issues reachable in `dir` (transitive closure, excluding self).
+    /// O(1) after [`finalize`](Self::finalize) (reads the precomputed cache); falls
+    /// back to a live BFS for a not-yet-finalized graph.
     pub fn transitive(&self, key: &str, dir: Direction) -> usize {
+        if let Some(&(up, down)) = self.transitive_counts.get(key) {
+            return match dir {
+                Direction::Upstream => up,
+                Direction::Downstream => down,
+            };
+        }
+        self.compute_transitive(key, dir)
+    }
+
+    /// The BFS behind [`transitive`](Self::transitive), run live (the cache is built
+    /// by calling this for every node in `finalize`).
+    fn compute_transitive(&self, key: &str, dir: Direction) -> usize {
         // Seed with `key` so a cycle that walks back to it isn't counted; the
         // seed is subtracted at the end to honour the "excluding self" contract.
         let mut seen = HashSet::new();

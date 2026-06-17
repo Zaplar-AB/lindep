@@ -586,10 +586,21 @@ impl SessionStore {
                 source,
             }
         })?;
+        // Advance the gate the instant the rename publishes our content — NOT after
+        // the parent fsync below. `*highest` tracks "newest content visible at this
+        // path", established by the rename; visibility to a concurrent writer doesn't
+        // wait on the durability fsync. If we deferred this past a failing parent
+        // fsync, a later-arriving OLDER write would see `seq < *highest` as false (the
+        // mark never advanced) and clobber the newer file we just published — the very
+        // revert the gate exists to prevent. The rename-failure branch above must NOT
+        // advance it: nothing was published there.
+        *highest = seq;
 
         // fsync the parent directory so the rename itself is durable — otherwise a
         // power loss after the data flush can still roll the rename back, silently
-        // reverting a committed status change.
+        // reverting a committed status change. A failure here still surfaces as Err
+        // (the caller footers it), but the gate is already advanced so an out-of-order
+        // older write can't revert the published state.
         if let Some(parent) = parent {
             File::open(parent)
                 .and_then(|d| d.sync_all())
@@ -598,7 +609,6 @@ impl SessionStore {
                     source,
                 })?;
         }
-        *highest = seq;
         Ok(())
     }
 }

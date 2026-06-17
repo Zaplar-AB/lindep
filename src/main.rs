@@ -409,13 +409,17 @@ fn run_tui(
 
     // Close any still-open ledger runs (with each agent's last-known terminal
     // status, if it has one) and persist — so a clean quit leaves no dangling
-    // "running" run for the next launch to read as interrupted. The fleet is
-    // disposable now, so move it out to feed the closer without a borrow clash.
+    // "running" run for the next launch to read as interrupted. The ledger is
+    // keyed by (project_id, issue) and spans EVERY project, so close over the
+    // project-keyed `world` and honour the `project_id` the closer passes — NOT
+    // the active-only, issue-keyed `fleet`, which would stamp a backgrounded
+    // project's open run with the active project's status for a shared issue id.
     if let Some(path) = app.ledger_path.clone() {
         let now = ledger::now_unix();
-        let fleet = std::mem::take(&mut app.fleet);
-        app.ledger
-            .close_open(now, |_, issue| fleet.get(issue).copied());
+        let world = std::mem::take(&mut app.world);
+        app.ledger.close_open(now, |project_id, issue| {
+            world.get(project_id).and_then(|m| m.get(issue)).copied()
+        });
         let _ = app.ledger.save(&path);
     }
 

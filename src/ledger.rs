@@ -270,7 +270,10 @@ pub fn now_unix() -> u64 {
 /// reads `just now`).
 pub fn ago(now: u64, then: u64) -> String {
     let secs = now.saturating_sub(then);
-    if secs < 45 {
+    // `< 60`, not `< 45`: with a 45s cutoff, 45–59s would hit the minutes branch and
+    // render the degenerate "0m ago" (`secs / 60 == 0`). Keeping "just now" until a
+    // full minute means the minutes branch only ever prints `>= 1m`.
+    if secs < 60 {
         "just now".to_string()
     } else if secs < 3600 {
         format!("{}m ago", secs / 60)
@@ -426,6 +429,9 @@ mod tests {
     #[test]
     fn ago_and_duration_labels_are_compact() {
         assert_eq!(ago(1000, 990), "just now");
+        // 45–59s ago stays "just now" rather than the degenerate "0m ago".
+        assert_eq!(ago(1000, 950), "just now");
+        assert_eq!(ago(1000, 939), "1m ago");
         assert_eq!(ago(1000, 700), "5m ago");
         assert_eq!(ago(10_000, 2800), "2h ago");
         assert_eq!(ago(200_000, 100_000), "1d ago");

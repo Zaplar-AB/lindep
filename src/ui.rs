@@ -636,8 +636,14 @@ fn render_agent_window(
     // final screen. Keyed by WindowId so zoom's two geometries don't collide.
     let size = (pane.height, pane.width);
     if !exited && app.preview_size.get(&id) != Some(&size) {
-        let _ = backend.resize(pane.height, pane.width);
-        app.preview_size.insert(id, size);
+        // Only record the size once the resize actually took. Recording it on a
+        // failed resize would make the `!= size` guard skip every retry, leaving our
+        // render half at the new geometry while claude's PTY stays at the old one —
+        // the exact divergence backend::resize warns about. A failure here leaves
+        // preview_size stale so the next frame retries at the correct geometry.
+        if backend.resize(pane.height, pane.width).is_ok() {
+            app.preview_size.insert(id, size);
+        }
     }
     if let Ok(parser) = backend.parser().read() {
         frame.render_widget(PseudoTerminal::new(parser.screen()), pane);

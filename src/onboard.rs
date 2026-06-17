@@ -298,12 +298,22 @@ impl Wizard {
             let label = remote
                 .clone()
                 .unwrap_or_else(|| "local-only (no origin remote)".to_string());
+            // Store an ABSOLUTE path: `is_dir()` resolved a relative input (`./core`,
+            // `../sibling`) against the wizard's cwd, but the loader and `git clone`
+            // run later from a different cwd, so a verbatim relative `local` would
+            // resolve elsewhere or vanish. `canonicalize` can't fail here (the dir
+            // just existed); fall back to the expanded path if it somehow does.
+            let local = expanded
+                .canonicalize()
+                .unwrap_or(expanded)
+                .to_string_lossy()
+                .into_owned();
             return Ok(RepoRow {
                 handle: handle.clone(),
                 draft: Some(RepoDraft {
                     handle,
                     remote,
-                    local: Some(input.to_string()),
+                    local: Some(local),
                 }),
                 label,
             });
@@ -332,7 +342,7 @@ impl Wizard {
         if self.input.trim().is_empty() {
             return;
         }
-        match self.resolve(&self.input.clone()) {
+        match self.resolve(&self.input) {
             Ok(row) => {
                 if self.repos.iter().any(|r| r.handle == row.handle) {
                     self.error = Some(format!("'{}' is already added", row.handle));
@@ -364,6 +374,25 @@ impl Wizard {
 
     fn primary_move(&mut self, delta: i32) {
         move_state(&mut self.primary, self.repos.len(), delta);
+    }
+
+    /// Leave the branch-prefix step. An empty prefix is fine — it falls back to
+    /// `$USER`/`lindep` at launch (see [`crate::worktree::default_branch_prefix`]) —
+    /// but a non-empty one must be a valid git ref segment, or `git worktree add -b
+    /// <prefix>/<issue>` would reject every launch in this project. Catch a bad prefix
+    /// here, in the wizard, rather than silently bricking the project at first launch.
+    fn advance_from_branch_prefix(&mut self) {
+        let prefix = self.branch_prefix.trim();
+        if !prefix.is_empty() && !crate::worktree::is_valid_branch_prefix(prefix) {
+            self.error = Some(
+                "branch prefix isn't a valid git ref — no spaces or ~^:?*[\\, \
+                 no leading/trailing '/' or '.'"
+                    .into(),
+            );
+            return;
+        }
+        self.error = None;
+        self.step = Step::Scratch;
     }
 
     /// Add the in-progress scratch entry to the list (validated), then reset the form;
@@ -517,7 +546,7 @@ fn run_loop(terminal: &mut DefaultTerminal, wizard: &mut Wizard) -> io::Result<b
                         Step::Repos
                     }
                 }
-                KeyCode::Enter => wizard.step = Step::Scratch,
+                KeyCode::Enter => wizard.advance_from_branch_prefix(),
                 KeyCode::Backspace => {
                     wizard.branch_prefix.pop();
                 }
