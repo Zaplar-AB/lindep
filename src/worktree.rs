@@ -97,14 +97,15 @@ pub struct WorktreeManager {
     repo_handle: Option<String>,
     /// Branch namespace, e.g. `felix`. Defaults to `$USER`, then `lindep`.
     branch_prefix: String,
-    /// Serializes repo-mutating `git worktree add`/`prune`/`remove` across all
-    /// clones of this manager. `git worktree` mutates shared repo state (the
-    /// `worktrees/` admin dir, the ref store, the common index lock), so two
-    /// concurrent `create`/`remove` calls — one per agent, each in its own
-    /// `spawn_blocking` — can otherwise collide on git's locks and fail with
-    /// `could not lock` / `File exists`. The guarded sections are brief and
-    /// purely synchronous (no `.await` is ever held across this lock), so a
-    /// single global git lock costs little and removes the race.
+    /// Serializes repo-mutating `git worktree add`/`prune`/`remove` for one L2 clone.
+    /// `git worktree` mutates shared repo state (the `worktrees/` admin dir, the ref
+    /// store, the common index lock), so two concurrent `create`/`remove` calls — one
+    /// per agent, each in its own `spawn_blocking` — can otherwise collide on git's
+    /// locks and fail with `could not lock` / `File exists`. Keyed by the canonical
+    /// clone path via [`git_lock_for`], so EVERY manager over the same clone shares
+    /// this lock (not just clones of one instance) — different issues selecting the
+    /// same secondary repo, or a launch racing a teardown, all serialize. The guarded
+    /// sections are brief and purely synchronous (no `.await` is ever held across it).
     git_lock: Arc<Mutex<()>>,
 }
 
@@ -142,12 +143,13 @@ impl WorktreeManager {
             source: e,
         })?;
         let worktrees_root = canonical.join(".lindep").join("worktrees");
+        let git_lock = git_lock_for(&canonical);
         Ok(WorktreeManager {
             repo_root: canonical,
             worktrees_root,
             repo_handle: None,
             branch_prefix: branch_prefix.into(),
-            git_lock: Arc::new(Mutex::new(())),
+            git_lock,
         })
     }
 
@@ -178,12 +180,13 @@ impl WorktreeManager {
                 path: worktrees_root.to_path_buf(),
                 source: e,
             })?;
+        let git_lock = git_lock_for(&canonical);
         Ok(WorktreeManager {
             repo_root: canonical,
             worktrees_root,
             repo_handle: Some(handle.into()),
             branch_prefix: branch_prefix.into(),
-            git_lock: Arc::new(Mutex::new(())),
+            git_lock,
         })
     }
 
@@ -333,6 +336,23 @@ impl WorktreeManager {
                 path,
                 branch,
             })
+        } else if let Some(branch) = self.existing_remote_issue_branch(issue)? {
+            // No LOCAL head, but the agent's pushed work survives as a remote-tracking
+            // ref — the case after an L2 clone rebuild (fsck self-heal nuked + re-cloned
+            // the clone, destroying local heads but re-fetching `origin/*`). Re-create
+            // the local branch FROM `origin/<branch>` so the agent resumes its committed
+            // work, never an empty branch off `base`. Without this, a rebuilt clone
+            // silently strands every commit not yet merged to the default branch.
+            if let Some(holder) = self.branch_holder(&branch)? {
+                return Err(WorktreeError::BranchInUse { branch, holder });
+            }
+            let start = format!("origin/{branch}");
+            self.git(&["worktree", "add", "-b", &branch, path_str.as_ref(), &start])?;
+            Ok(Worktree {
+                issue: issue.to_string(),
+                path,
+                branch,
+            })
         } else {
             let branch = self.branch_name(issue, title);
             self.git(&["worktree", "add", "-b", &branch, path_str.as_ref(), base])?;
@@ -469,6 +489,28 @@ impl WorktreeManager {
             .map(str::to_string))
     }
 
+    /// The issue's branch as a **remote-tracking** ref (`refs/remotes/origin/<prefix>/…`),
+    /// if one exists, returned as the LOCAL branch name (the `origin/` stripped). This
+    /// is where the agent's pushed work lives after an L2 clone rebuild destroyed the
+    /// local head — [`create`](Self::create) re-creates the local branch from it rather
+    /// than cutting an empty one off `base`. Mirrors [`existing_issue_branch`](Self::existing_issue_branch)'s
+    /// match (exact `<prefix>/<issue>` or any `<prefix>/<issue>-<slug>`).
+    fn existing_remote_issue_branch(&self, issue: &str) -> Result<Option<String>, WorktreeError> {
+        let issue = issue.to_lowercase();
+        let prefix = format!("refs/remotes/origin/{}/", self.branch_prefix);
+        let out = self.git(&["for-each-ref", "--format=%(refname:short)", &prefix])?;
+        // `%(refname:short)` yields `origin/<prefix>/<issue>…`; strip the `origin/`.
+        let exact = format!("{}/{}", self.branch_prefix, issue);
+        let with_slug = format!("{exact}-");
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter_map(|n| n.strip_prefix("origin/"))
+            .filter(|name| *name == exact.as_str() || name.starts_with(with_slug.as_str()))
+            .min()
+            .map(str::to_string))
+    }
+
     /// The path of the worktree that currently has `branch` checked out, if any.
     /// Scans the *raw* worktree list (the main tree and any unmanaged worktrees
     /// included), since a branch may be held anywhere — not only under our root.
@@ -526,6 +568,58 @@ pub fn validate_issue_id(issue: &str) -> Result<(), WorktreeError> {
     } else {
         Err(WorktreeError::InvalidIssueId(issue.to_string()))
     }
+}
+
+/// Generate the `WORKSPACE.md` an agent reads at the root of a multi-repo issue's
+/// workspace (its cwd, `worktrees/<ISSUE>`), telling it which repos are checked out
+/// as sibling subdirectories and how to operate across them. Written before the
+/// agent spawns by the up-front select (ENG-536) and regenerated after a mid-session
+/// lazy-pull (ENG-542). Single-repo issues cd straight into the one worktree and get
+/// no file. `repos` is `(handle, branch)` in materialisation order, primary first.
+pub fn write_workspace_md(
+    workspace_dir: &Path,
+    issue: &str,
+    repos: &[(String, String)],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(workspace_dir)?;
+    let mut body = String::new();
+    body.push_str(&format!("# {issue} — multi-repo workspace\n\n"));
+    body.push_str(
+        "This issue spans several repositories. Each is checked out as a sibling\n\
+         subdirectory of this directory (your working directory):\n\n",
+    );
+    for (handle, branch) in repos {
+        body.push_str(&format!("- `{handle}/` — branch `{branch}`\n"));
+    }
+    body.push_str(
+        "\nWork across them as you would in any multi-checkout: operate on each repo\n\
+         inside its own subdirectory (e.g. `cd <repo>` or `git -C <repo> …`). Each\n\
+         repo is an independent git worktree on its own branch; commits in any of\n\
+         them are pushed to that repo's own remote automatically.\n",
+    );
+    std::fs::write(workspace_dir.join("WORKSPACE.md"), body)
+}
+
+/// One shared worktree lock per **canonical L2 clone path**. `git worktree
+/// add/prune/remove` mutate the clone's shared admin dir + ref store, so two
+/// `WorktreeManager`s built over the SAME clone — e.g. concurrent launches of
+/// different issues both selecting one secondary repo, or a launch racing a teardown
+/// / lazy-pull on that repo — must serialize. A per-instance lock wouldn't (each
+/// `with_layout` mints a fresh manager), so the lock is keyed by the clone path in a
+/// process-global table, mirroring `notify::push_mutex`. The primary manager is
+/// shared across launches and so already serialized; this extends the same guarantee
+/// to every secondary repo.
+fn git_lock_for(repo_root: &Path) -> Arc<Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, PoisonError};
+    static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    LOCKS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(repo_root.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 /// Default branch namespace: `$USER`, then `lindep`. Keeps Felix's `felix/…`
@@ -961,6 +1055,94 @@ mod tests {
             "web lists its issue independently"
         );
         let _ = std::fs::remove_dir_all(&wt_root);
+    }
+
+    #[test]
+    fn write_workspace_md_lists_each_repo_and_its_branch() {
+        let dir = std::env::temp_dir().join(format!("lindep-wsmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_workspace_md(
+            &dir,
+            "ENG-7",
+            &[
+                ("api".to_string(), "felix/eng-7-x".to_string()),
+                ("web".to_string(), "felix/eng-7-x".to_string()),
+            ],
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(dir.join("WORKSPACE.md")).unwrap();
+        assert!(body.contains("ENG-7"), "names the issue");
+        assert!(
+            body.contains("`api/`") && body.contains("`web/`"),
+            "lists each repo subdir"
+        );
+        assert!(body.contains("felix/eng-7-x"), "shows each repo's branch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_resumes_a_branch_that_lives_only_as_a_remote_tracking_ref() {
+        // After an L2 clone rebuild (fsck self-heal nuke+re-clone), the agent's pushed
+        // work branch has no LOCAL head — it survives only as `origin/<branch>`. create()
+        // must re-create the local branch FROM that remote-tracking ref so the agent
+        // resumes its committed work, never an empty branch off `base`.
+        let base = std::env::temp_dir().join(format!("lindep-remoteresume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let clone = base.join("clone");
+        let run = |dir: &Path, args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} in {}",
+                dir.display()
+            );
+        };
+        std::fs::create_dir_all(&remote).unwrap();
+        run(&remote, &["init", "-q", "-b", "main"]);
+        run(&remote, &["config", "user.email", "t@example.com"]);
+        run(&remote, &["config", "user.name", "Test"]);
+        std::fs::write(remote.join("base.txt"), b"base").unwrap();
+        run(&remote, &["add", "."]);
+        run(&remote, &["commit", "-q", "-m", "base"]);
+        // The agent's pushed work branch, carrying a unique file.
+        run(&remote, &["checkout", "-q", "-b", "felix/eng-7-x"]);
+        std::fs::write(remote.join("work.txt"), b"agent work").unwrap();
+        run(&remote, &["add", "."]);
+        run(&remote, &["commit", "-q", "-m", "work"]);
+        run(&remote, &["checkout", "-q", "main"]);
+        // Clone it: `origin/felix/eng-7-x` is a remote-tracking ref, with no local head
+        // (exactly the post-rebuild state of an L2 clone).
+        assert!(
+            Command::new("git")
+                .args(["clone", "-q"])
+                .arg(&remote)
+                .arg(&clone)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "clone failed"
+        );
+
+        let wt_root = base.join("worktrees");
+        let mgr = WorktreeManager::with_layout(&clone, "felix", wt_root, "api").unwrap();
+        let wt = mgr.create("ENG-7", "x", "HEAD").unwrap();
+        assert_eq!(
+            wt.branch, "felix/eng-7-x",
+            "resumed the pushed branch, not a fresh one"
+        );
+        assert!(
+            wt.path.join("work.txt").is_file(),
+            "the agent's committed work is in the resumed checkout"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

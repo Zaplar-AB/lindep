@@ -99,6 +99,14 @@ struct Cli {
     /// `--post-commit`). Not for direct use.
     #[arg(long, hide = true, value_name = "HANDLE")]
     repo_handle: Option<String>,
+
+    /// Request that an extra repo be pulled into this agent's workspace (v1.6 fenced
+    /// lazy-pull, ENG-542). Run by the agent itself *inside* its workspace as
+    /// `lindep request-repo <handle>`; reads the cockpit endpoint + project from the
+    /// agent's env. Fenced to the project's candidate set — an out-of-set handle
+    /// exits non-zero. Visible (not `hide`) so an agent can discover it via `--help`.
+    #[arg(long, value_name = "HANDLE")]
+    request_repo: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -131,6 +139,13 @@ fn real_main() -> Result<(), String> {
             cli.repo_handle.as_deref().unwrap_or(""),
         )
         .map_err(|e| e.to_string());
+    }
+
+    // Request-repo fast path (v1.6 fenced lazy-pull, ENG-542): the agent runs
+    // `lindep request-repo <handle>` inside its workspace. Fence to the project's
+    // candidate set (non-zero exit out-of-set), else POST a `RepoRequested` event.
+    if let Some(handle) = cli.request_repo.as_deref() {
+        return run_request_repo(handle);
     }
 
     // --list is a quick, key-only path.
@@ -500,9 +515,33 @@ fn start_control_plane(
         }
     };
     let layout = registry.layout().clone();
+    // Surface the layout so the disk-reclaim prompt (ENG-540, `Ctrl-a m`) can scan
+    // mirrors/clones; the registry itself moves into the workspace below.
+    app.layout = Some(layout.clone());
     // The switcher offers every registered project — lindep provisions clones on
-    // demand, so there is no cwd gating (the v1.5 `mapped_projects` source).
-    app.mapped_projects = registry.project_ids().into_iter().collect();
+    // demand, so there is no cwd gating (the v1.5 `mapped_projects` source). Taken
+    // once and reused for the candidate snapshot below.
+    let project_ids = registry.project_ids();
+    app.mapped_projects = project_ids.iter().cloned().collect();
+    // Surface each project's candidate repos for the up-front multi-select (ENG-536):
+    // the registry moves into the workspace below, so the cockpit takes a snapshot
+    // now — (handle, local-only, primary) per candidate, enough to render the select.
+    app.project_candidates = project_ids
+        .iter()
+        .filter_map(|pid| {
+            let primary = registry.project(pid).ok()?.primary.clone();
+            let choices = registry
+                .candidate_repos(pid)
+                .into_iter()
+                .map(|e| picker::RepoChoice {
+                    handle: e.handle.clone(),
+                    local: e.is_local_only(),
+                    primary: e.handle == primary,
+                })
+                .collect();
+            Some((pid.clone(), choices))
+        })
+        .collect();
 
     // Workspace store registry: the one loopback hook endpoint resolves each hook to
     // its owning project's store through it (a hook carries only a session id / cwd,
@@ -609,6 +648,38 @@ fn start_control_plane(
     }
 
     Some((ws_handle, ws_join))
+}
+
+/// The `lindep request-repo <handle>` CLI front (ENG-542). Reads the cockpit endpoint
+/// and owning project from the agent's environment (set at spawn), then **fences** the
+/// handle to the project's candidate set — exiting non-zero out-of-set so the agent
+/// gets a clear rejection — before POSTing a `RepoRequested` event. The fence lives
+/// here (not in the loopback `route`, which has no registry) so the agent sees the
+/// verdict; the workspace re-fences on confirm (defense-in-depth against a forged POST).
+fn run_request_repo(handle: &str) -> Result<(), String> {
+    let port: u16 = std::env::var("LINDEP_HOOK_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or("request-repo must be run inside a lindep agent (no LINDEP_HOOK_PORT)")?;
+    let token = std::env::var("LINDEP_HOOK_TOKEN").unwrap_or_default();
+    let project_id =
+        std::env::var("LINDEP_PROJECT").map_err(|_| "request-repo: no LINDEP_PROJECT in env")?;
+    if !registry::is_safe_handle(handle) {
+        return Err(format!("`{handle}` is not a valid repo handle"));
+    }
+    let (reg, _warnings) = registry::Registry::load();
+    let candidates: Vec<String> = reg
+        .candidate_repos(&project_id)
+        .into_iter()
+        .map(|e| e.handle)
+        .collect();
+    if !candidates.iter().any(|h| h == handle) {
+        return Err(format!(
+            "`{handle}` is not a candidate repo for this project (allowed: {})",
+            candidates.join(", ")
+        ));
+    }
+    notify::forward_request_repo(port, &token, handle).map_err(|e| e.to_string())
 }
 
 fn install_panic_hook() {
@@ -739,6 +810,66 @@ mod tests {
             issue.into(),
             backend as Arc<dyn crate::backend::AgentBackend>,
         );
+    }
+
+    #[test]
+    fn the_header_rolls_up_agents_across_projects() {
+        // ENG-406: the header counts live agents across the WHOLE workspace — the
+        // active project's fleet plus any backgrounded project's agents in `world`.
+        let mut app = App::new(demo::graph());
+        app.active_project = "proj-a".into();
+        app.fleet.insert("ZAP-201".into(), AgentStatus::Running); // active project
+        app.world
+            .entry("proj-b".into())
+            .or_default()
+            .insert("ENG-9".into(), AgentStatus::NeedsYou); // a backgrounded project
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(
+            out.contains("2 agents"),
+            "header rolls up agents across projects:\n{out}"
+        );
+        assert!(
+            out.contains("needs you"),
+            "the cross-project needs-you shows"
+        );
+    }
+
+    #[test]
+    fn the_global_all_agents_screen_lists_every_project() {
+        // ENG-406: Ctrl-a a opens a third top-level surface listing every agent.
+        let mut app = App::new(demo::graph());
+        app.active_project = "proj-a".into();
+        let issue = app.order.first().cloned().unwrap();
+        app.fleet.insert(issue, AgentStatus::Running);
+        app.project_list = vec![
+            crate::linear::ProjectRef {
+                id: "proj-a".into(),
+                name: "Alpha".into(),
+            },
+            crate::linear::ProjectRef {
+                id: "proj-b".into(),
+                name: "Beta".into(),
+            },
+        ];
+        app.world
+            .entry("proj-b".into())
+            .or_default()
+            .insert("ENG-9".into(), AgentStatus::NeedsYou);
+        // Open the global screen (its fields are public, so the test builds it).
+        let rows = app.all_agents();
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(Some(0));
+        app.global_view = Some(crate::app::GlobalView { rows, state });
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(
+            out.contains("ALL AGENTS"),
+            "the global screen title shows:\n{out}"
+        );
+        assert!(
+            out.contains("Beta"),
+            "a backgrounded project's agent is listed"
+        );
+        assert!(out.contains("ENG-9"), "its issue is listed");
     }
 
     #[test]

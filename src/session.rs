@@ -367,6 +367,21 @@ impl SessionStore {
         }
     }
 
+    /// Record the per-issue materialised repo handle set (v1.6 `STATE_VERSION 3`).
+    /// Written by the launch path once the chosen repos are checked out and, for a
+    /// mid-session lazy-pull, only **after** the new clone lands — so a crash never
+    /// leaves the set claiming a repo that isn't on disk. No-op if the issue has no
+    /// record; returns whether one was found and changed.
+    pub fn set_repos(&mut self, issue: &str, repos: Vec<String>) -> bool {
+        if let Some(s) = self.sessions.get_mut(issue) {
+            s.repos = repos;
+            s.updated_at = crate::ledger::now_unix();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Reverse lookups for the notification bus, which only knows a hook's
     /// `session_id` and `cwd`.
     pub fn issue_for_session_id(&self, session_id: &str) -> Option<&str> {
@@ -376,12 +391,26 @@ impl SessionStore {
             .map(|s| s.issue.as_str())
     }
 
-    /// Map a hook's `cwd` back to an issue by matching the worktree path.
+    /// Map a hook's `cwd` back to an issue by matching the worktree path. An exact
+    /// match wins; otherwise the session whose `worktree_path` is the closest
+    /// ancestor of `cwd`. A multi-repo issue's agent runs in the per-issue
+    /// **workspace** parent (`worktrees/<ISSUE>`) with each repo a sibling subdir,
+    /// so a hook fired from inside a repo subdir (`cwd = <workspace>/<repo>`, e.g. a
+    /// post-commit hook) still resolves to its issue. Distinct issues' worktree
+    /// paths are siblings, never nested, so the longest-prefix match is unambiguous.
     pub fn issue_for_cwd(&self, cwd: &Path) -> Option<&str> {
         self.sessions
             .values()
-            .find(|s| s.worktree_path == cwd)
+            .filter(|s| cwd == s.worktree_path || cwd.starts_with(&s.worktree_path))
+            .max_by_key(|s| s.worktree_path.as_os_str().len())
             .map(|s| s.issue.as_str())
+    }
+
+    /// Drop the record for `issue` — e.g. after its workspace is torn down
+    /// (ENG-541). Returns whether a record was removed. The caller persists the
+    /// store afterwards (via [`mutate_and_persist`]).
+    pub fn forget(&mut self, issue: &str) -> bool {
+        self.sessions.remove(issue).is_some()
     }
 
     /// Drop records whose worktree is no longer live, given the set of issues
@@ -1064,6 +1093,41 @@ mod tests {
         assert_eq!(store.issue_for_session_id(&sid), Some("ENG-2"));
         assert_eq!(store.issue_for_cwd(Path::new("/wt/ENG-1")), Some("ENG-1"));
         assert_eq!(store.issue_for_cwd(Path::new("/nope")), None);
+    }
+
+    #[test]
+    fn set_repos_records_the_per_issue_materialised_set() {
+        let path = temp_state_path();
+        let mut store = seeded(&path);
+        assert!(
+            store.get("ENG-1").unwrap().repos.is_empty(),
+            "a fresh record has no repos"
+        );
+        assert!(store.set_repos("ENG-1", vec!["api".into(), "web".into()]));
+        assert_eq!(store.get("ENG-1").unwrap().repos, vec!["api", "web"]);
+        // Latest selection wins; an unknown issue is a no-op.
+        assert!(store.set_repos("ENG-1", vec!["api".into()]));
+        assert_eq!(store.get("ENG-1").unwrap().repos, vec!["api"]);
+        assert!(!store.set_repos("ENG-404", vec!["x".into()]));
+    }
+
+    #[test]
+    fn issue_for_cwd_resolves_a_multi_repo_repo_subdir_to_its_issue() {
+        // A multi-repo agent runs in worktrees/<ISSUE>/ with each repo a sibling
+        // subdir, so a hook fired from inside a repo subdir (e.g. a post-commit
+        // hook, cwd = <workspace>/<repo>) must still resolve to its issue.
+        let path = temp_state_path();
+        let store = seeded(&path);
+        assert_eq!(
+            store.issue_for_cwd(Path::new("/wt/ENG-1/api")),
+            Some("ENG-1")
+        );
+        assert_eq!(
+            store.issue_for_cwd(Path::new("/wt/ENG-2/web/src")),
+            Some("ENG-2")
+        );
+        // An unrelated path still resolves to nothing.
+        assert_eq!(store.issue_for_cwd(Path::new("/wt-other/x")), None);
     }
 
     #[test]

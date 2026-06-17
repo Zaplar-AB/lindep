@@ -86,6 +86,29 @@ pub enum AppEvent {
         repo_handle: String,
         branch: String,
     },
+    /// The agent on `(project_id, issue)` requested an extra repo be pulled into its
+    /// workspace (from `lindep request-repo <handle>` over the hook endpoint, ENG-542).
+    /// Already fenced to the project's candidate set by the CLI; the cockpit raises a
+    /// confirmation modal and, on confirm, materialises it (L1→L2→L3). `repo_handle`
+    /// is the requested repo.
+    RepoRequested {
+        project_id: String,
+        issue: String,
+        repo_handle: String,
+    },
+    /// A background disk-reclaim scan finished (`Ctrl-a m`, ENG-540). Carries the
+    /// unreferenced mirrors safe to offer, whether this scan should *open* the
+    /// prompt (the initial scan) or merely *refresh* an already-open one (the
+    /// post-delete rescan), and an optional footer note (a delete's outcome). Both
+    /// the scan (`reclaimable_mirrors`, a recursive object-DB walk) and the delete
+    /// (`delete_mirror`, which takes a blocking cross-process flock) run on the
+    /// blocking pool so they can't freeze the render loop; this event carries the
+    /// result back. NOT agent-scoped — `project_id()` is `None`.
+    ReclaimScanned {
+        mirrors: Vec<crate::mirror::ReclaimableMirror>,
+        opening: bool,
+        note: Option<String>,
+    },
     /// A project switch's graph finished loading off the render thread (see
     /// `App::request_switch`). A pure wake signal: the loaded `(ProjectRef, Graph)`
     /// rides a side mailbox because `Graph` isn't `Clone`/`Debug` and so can't live
@@ -101,7 +124,9 @@ impl AppEvent {
     /// render loop uses this to file each event under the right project's fleet.
     pub fn project_id(&self) -> Option<&str> {
         match self {
-            AppEvent::Notification(_) | AppEvent::ProjectActivated => None,
+            AppEvent::Notification(_)
+            | AppEvent::ReclaimScanned { .. }
+            | AppEvent::ProjectActivated => None,
             AppEvent::AgentSpawned { project_id, .. }
             | AppEvent::AgentOutput { project_id, .. }
             | AppEvent::AgentExited { project_id, .. }
@@ -109,7 +134,8 @@ impl AppEvent {
             | AppEvent::AgentStatusChanged { project_id, .. }
             | AppEvent::AgentAction { project_id, .. }
             | AppEvent::AgentReaped { project_id, .. }
-            | AppEvent::AgentCommitted { project_id, .. } => Some(project_id),
+            | AppEvent::AgentCommitted { project_id, .. }
+            | AppEvent::RepoRequested { project_id, .. } => Some(project_id),
         }
     }
 }

@@ -381,6 +381,22 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
         return;
     }
 
+    // v1.6 fenced lazy-pull (ENG-542): the agent ran `lindep request-repo <handle>`.
+    // The handle was already fenced to the project's candidate set by the CLI (which
+    // exits non-zero out-of-set); the cockpit raises a confirmation modal and, on
+    // confirm, re-fences and materialises it. Bypasses the status machinery (a repo
+    // request is never "needs you"), exactly like AgentCommitted above.
+    if event_name == "RepoRequested" {
+        if let (Some(issue), Some(handle)) = (issue.clone(), payload.repo_handle.clone()) {
+            let _ = events.send(AppEvent::RepoRequested {
+                project_id,
+                issue,
+                repo_handle: handle,
+            });
+        }
+        return;
+    }
+
     let event = match (issue, event_name) {
         (Some(issue), "Notification") if notif_needs_you => {
             // A real permission / elicitation prompt: raise the flag.
@@ -734,6 +750,25 @@ pub fn forward_post_commit(port: u16, token: &str, repo_handle: &str) -> std::io
     Ok(())
 }
 
+/// One-shot **request-repo** forwarder (the `--request-repo` mode, ENG-542). The
+/// agent runs `lindep request-repo <handle>` inside its workspace; this synthesizes
+/// a `RepoRequested` payload (the `cwd` resolves the issue, even from a repo subdir)
+/// and POSTs it presenting the per-run bearer `token`. Always `Ok` — like every
+/// forwarder, it must never block the agent; the candidate fence + non-zero exit for
+/// an out-of-set handle happen in the CLI front (`run_request_repo`) *before* this.
+pub fn forward_request_repo(port: u16, token: &str, repo_handle: &str) -> std::io::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let payload = json!({
+        "cwd": cwd.to_string_lossy(),
+        "hook_event_name": "RepoRequested",
+        "repo_handle": repo_handle,
+    });
+    if let Ok(body) = serde_json::to_vec(&payload) {
+        let _ = post_hook(port, token, &body);
+    }
+    Ok(())
+}
+
 /// The worktree's current branch (`git rev-parse --abbrev-ref HEAD`), or `None`.
 fn current_branch(cwd: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
@@ -811,6 +846,22 @@ fn push_mutex(handle: &str) -> Arc<Mutex<()>> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     Arc::clone(locks.entry(handle.to_string()).or_default())
+}
+
+/// Push a worktree's branch to its true remote while holding the **same**
+/// per-handle [`push_mutex`] the background auto-push uses, so a deliberate push
+/// (ENG-541 teardown) can't race an in-flight auto-push of the same handle and
+/// spuriously fail on git's local ref lock — surfacing as a phantom "push
+/// rejected". Blocking; call from a blocking context (e.g. `spawn_blocking`).
+pub fn push_head_serialized(
+    handle: &str,
+    worktree: &std::path::Path,
+) -> Result<(), crate::mirror::MirrorError> {
+    let lock = push_mutex(handle);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::mirror::push_head(worktree)
 }
 
 /// Push a committed branch to its true remote in the background, then emit the
@@ -953,6 +1004,31 @@ mod tests {
             ),
             other => panic!("expected AgentStatusChanged, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_repo_hook_emits_repo_requested_for_the_resolved_issue() {
+        // ENG-542: `lindep request-repo web` POSTs a RepoRequested payload whose cwd
+        // resolves the issue; route() emits AppEvent::RepoRequested carrying the handle.
+        let store = seeded_store();
+        let registry = registry_of(store);
+        let (tx, mut rx) = crate::event::channel();
+        let payload = HookPayload {
+            cwd: Some("/wt/ENG-1".into()),
+            hook_event_name: Some("RepoRequested".into()),
+            repo_handle: Some("web".into()),
+            ..Default::default()
+        };
+        route(&payload, &registry, &tx).await;
+        let events = drain(&mut rx).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AppEvent::RepoRequested { issue, repo_handle, .. }
+                    if issue == "ENG-1" && repo_handle == "web"
+            )),
+            "a request-repo hook emits RepoRequested for the resolved issue: {events:?}"
+        );
     }
 
     /// Drain every queued event into a vec, polling briefly so the off-thread

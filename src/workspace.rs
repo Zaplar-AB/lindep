@@ -35,7 +35,7 @@ use crate::backend::SpawnFn;
 use crate::event::{AppEvent, AppEventTx};
 use crate::registry::Registry;
 use crate::session::{AgentStatus, SessionStore};
-use crate::supervisor::{Supervisor, SupervisorConfig, SupervisorHandle};
+use crate::supervisor::{RepoProvision, Supervisor, SupervisorConfig, SupervisorHandle};
 use crate::worktree::WorktreeManager;
 
 /// Every started project's session store, keyed by `project_id`. Shared between
@@ -73,11 +73,13 @@ impl PlaneBuilder {
         project_id: &str,
         hooks_dir: PathBuf,
         worktree: WorktreeManager,
+        provision: RepoProvision,
         store: Arc<Mutex<SessionStore>>,
     ) -> SupervisorConfig {
         SupervisorConfig {
             project_id: project_id.to_string(),
             worktree,
+            provision,
             store,
             events: self.events.clone(),
             spawn: Arc::clone(&self.spawn),
@@ -102,19 +104,52 @@ pub struct ProjectPlane {
     pub join: JoinHandle<()>,
 }
 
-/// Reconcile a project's store against its live worktrees and rehydrate the
-/// fleet view from the durable store — the "the process is disposable, the
-/// conversation is durable" restart behaviour, now per project. Drops sessions
-/// whose worktree vanished, then re-emits each surviving session's last-known
-/// status (a was-`Spawning`/`Running` process is gone after a restart, so it
-/// resolves to `Idle` — resumable, not falsely live). Returns the was-live set
-/// (the auto-resume / cockpit-restore candidates) for the caller that wants it.
+/// Reconcile a project's store against its live worktrees and rehydrate the fleet
+/// view from the durable store — the "the process is disposable, the conversation is
+/// durable" restart behaviour, now **bidirectional** (ENG-540):
+///
+/// 1. **Materialise-up** — re-provision each resumable session's recorded repo set
+///    ([`crate::session::Session::repos`]) from the durable store: ensure each L2
+///    clone (which `fsck`-self-heals a broken alternate) and re-create its worktree
+///    (idempotent, reusing the kept branch). A crash mid-clone / mid-worktree thus
+///    self-heals on restart, and a resumable multi-repo agent comes back with all of
+///    its repos. Warn-never-abort: a repo that can't be re-provisioned (offline, a
+///    handle no longer a candidate) is skipped, not fatal.
+/// 2. **Prune-down** — drop sessions whose (primary) worktree is gone.
+/// 3. **Downgrade** — re-emit each surviving session's status, resolving a was-live
+///    `Spawning`/`Running` (its process died with the old run) to `Idle` — resumable,
+///    not falsely live.
+///
+/// Returns the was-live set (the auto-resume / cockpit-restore candidates).
 pub fn reconcile_and_rehydrate(
     worktree: &WorktreeManager,
+    provision: &RepoProvision,
     store: &Arc<Mutex<SessionStore>>,
     events: &AppEventTx,
     project_id: &str,
 ) -> HashSet<String> {
+    // Materialise-up first, so the prune-down below sees a rebuilt worktree as live.
+    // Only resumable (was-live) sessions with a recorded repo set are rebuilt — a
+    // terminal session doesn't need its checkout back, and an empty repo set (a
+    // pre-ENG-536 record) leaves the existing prune behaviour untouched.
+    let to_rebuild: Vec<(String, Vec<String>)> = match store.lock() {
+        Ok(store) => store
+            .sessions()
+            .filter(|s| s.status.is_live() && !s.repos.is_empty())
+            .map(|s| (s.issue.clone(), s.repos.clone()))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    for (issue, repos) in &to_rebuild {
+        for handle in repos {
+            if let Err(e) = materialize_session_repo(provision, issue, handle) {
+                let _ = events.send(AppEvent::Notification(format!(
+                    "reconcile {issue}/{handle}: {e}"
+                )));
+            }
+        }
+    }
+
     let live: Vec<String> = worktree
         .list()
         .unwrap_or_default()
@@ -143,6 +178,219 @@ pub fn reconcile_and_rehydrate(
         }
     }
     resumable
+}
+
+/// Re-provision one repo of a session for the bidirectional reconcile: refresh the
+/// mirror (throttled, so a rebuild isn't from a stale cache), ensure the L2 clone
+/// (which `fsck`-self-heals a broken alternate, or rebuilds the clone), and re-create
+/// the per-issue worktree (idempotent — `create` prefers the issue's kept branch over
+/// cutting a fresh one, so committed work is preserved). The post-commit hook is
+/// **not** (re)installed here: the launch/resume path rewrites it with the current
+/// run's port+token before the agent runs (the stale-port discipline), so reconcile
+/// only needs the checkout present on disk.
+fn materialize_session_repo(
+    provision: &RepoProvision,
+    issue: &str,
+    handle: &str,
+) -> Result<(), String> {
+    let entry = provision
+        .candidates
+        .get(handle)
+        .ok_or_else(|| format!("`{handle}` is no longer a candidate"))?;
+    let _ = crate::mirror::refresh_mirror(&provision.layout, entry);
+    let clone = crate::mirror::ensure_clone(&provision.layout, &provision.project_handle, entry)
+        .map_err(|e| e.to_string())?;
+    let worktrees_root = provision.layout.worktrees_dir(&provision.project_handle);
+    let mgr =
+        WorktreeManager::with_layout(&clone, &provision.branch_prefix, &worktrees_root, handle)
+            .map_err(|e| e.to_string())?;
+    mgr.create(issue, "", "HEAD").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Tear down a finished issue's workspace (ENG-541): for each repo the issue
+/// materialised, **push its branch first** (so committed work is safe on the true
+/// remote — skipped for a local-only repo, whose origin is the synthesised mirror),
+/// then remove the worktree, **keeping the branch**. The L2 clones and the shared
+/// mirror are left intact (reference-counted separately by the reclaim prompt) — only
+/// the per-issue worktrees are reclaimed. Best-effort and warn-never-abort: a repo
+/// whose push is **rejected keeps its worktree** (its work may not be safe yet),
+/// surfaced as a footer, so unpushed work is never silently discarded; the session
+/// record is dropped only when every repo's worktree was reclaimed.
+fn teardown_issue(
+    registry: &Registry,
+    store: &Arc<Mutex<SessionStore>>,
+    events: &AppEventTx,
+    project_id: &str,
+    issue: &str,
+) {
+    let Ok(descriptor) = registry.project(project_id).cloned() else {
+        return;
+    };
+    let layout = registry.layout();
+    let prefix = descriptor
+        .branch_prefix
+        .clone()
+        .unwrap_or_else(crate::worktree::default_branch_prefix);
+    let repos = match store.lock() {
+        Ok(s) => s
+            .get(issue)
+            .map(|sess| sess.repos.clone())
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+    let repos = if repos.is_empty() {
+        vec![descriptor.primary.clone()]
+    } else {
+        repos
+    };
+
+    let mut all_removed = true;
+    for handle in &repos {
+        let Some(entry) = registry.repo(handle).cloned() else {
+            continue;
+        };
+        let clone = layout.repo_clone_path(&descriptor.handle, handle);
+        if !clone.exists() {
+            continue;
+        }
+        let worktrees_root = layout.worktrees_dir(&descriptor.handle);
+        let Ok(mgr) = WorktreeManager::with_layout(&clone, &prefix, &worktrees_root, handle) else {
+            continue;
+        };
+        let wt_path = mgr.worktree_path(issue);
+        if crate::mirror::can_push_to_remote(&entry)
+            && wt_path.is_dir()
+            // Serialize against an in-flight auto-push of the same handle (shared
+            // per-handle push mutex) so teardown's push can't lose a race on git's
+            // local ref lock and report a phantom "push rejected".
+            && let Err(e) = crate::notify::push_head_serialized(handle, &wt_path)
+        {
+            let _ = events.send(AppEvent::Notification(format!(
+                "teardown {issue}/{handle}: push rejected, keeping worktree ({e})"
+            )));
+            all_removed = false;
+            continue;
+        }
+        if let Err(e) = mgr.remove(issue) {
+            let _ = events.send(AppEvent::Notification(format!(
+                "teardown {issue}/{handle}: {e}"
+            )));
+            all_removed = false;
+        }
+    }
+
+    if all_removed && let Ok(mut s) = store.lock() {
+        s.forget(issue);
+        let _ = s.save();
+    }
+}
+
+/// Materialise a fenced + confirmed lazy-pull (ENG-542): the agent requested an
+/// extra repo and the human confirmed it. **Re-fence** the handle to the project's
+/// candidate set (the loopback POST is forgeable, so we never trust the CLI's fence
+/// alone) and re-validate it is path-safe, then run L1→L2 ([`crate::mirror::ensure_clone`]
+/// takes the per-handle mirror `flock` internally), install the post-commit hook with
+/// THIS run's port+token (the stale-port trap), create the L3 worktree, regenerate
+/// `WORKSPACE.md` over the full set, and update [`Session::repos`] **last** — the
+/// "tell" step is strictly last, so a crash mid-pull never leaves the set claiming a
+/// repo that isn't on disk and the agent never sees a half-materialised repo.
+/// `--add-dir` is argv-baked, so full tool access is honestly deferred to a resume.
+///
+/// [`Session::repos`]: crate::session::Session::repos
+#[allow(clippy::too_many_arguments)]
+fn materialize_repo_request(
+    registry: &Registry,
+    exe: &str,
+    port: u16,
+    token: &str,
+    store: &Arc<Mutex<SessionStore>>,
+    events: &AppEventTx,
+    project_id: &str,
+    issue: &str,
+    handle: &str,
+) {
+    let notify = |msg: String| {
+        let _ = events.send(AppEvent::Notification(msg));
+    };
+    let Ok(descriptor) = registry.project(project_id).cloned() else {
+        return;
+    };
+    if !crate::registry::is_safe_handle(handle)
+        || !descriptor.candidates.iter().any(|h| h == handle)
+    {
+        notify(format!(
+            "repo `{handle}` is not a candidate of {} — pull denied",
+            descriptor.name
+        ));
+        return;
+    }
+    let Some(entry) = registry.repo(handle).cloned() else {
+        notify(format!("repo `{handle}` is not registered"));
+        return;
+    };
+    let layout = registry.layout();
+    let prefix = descriptor
+        .branch_prefix
+        .clone()
+        .unwrap_or_else(crate::worktree::default_branch_prefix);
+    let worktrees_root = layout.worktrees_dir(&descriptor.handle);
+
+    // Best-effort, throttled mirror refresh so a (re)built clone forks off current
+    // upstream rather than the mirror's state at first create.
+    let _ = crate::mirror::refresh_mirror(layout, &entry);
+    let clone = match crate::mirror::ensure_clone(layout, &descriptor.handle, &entry) {
+        Ok(c) => c,
+        Err(e) => return notify(format!("pulling `{handle}` into {issue}: {e}")),
+    };
+    let _ = crate::notify::write_post_commit_hook(&clone, exe, port, token, handle);
+    let mgr = match WorktreeManager::with_layout(&clone, &prefix, &worktrees_root, handle) {
+        Ok(m) => m,
+        Err(e) => return notify(format!("pulling `{handle}` into {issue}: {e}")),
+    };
+    // The title isn't known here; create() reuses any existing `<prefix>/<issue>…`
+    // branch (cut by a sibling repo at launch) over minting a fresh one, so the
+    // issue's repos stay on the same branch name.
+    if let Err(e) = mgr.create(issue, "", "HEAD") {
+        return notify(format!("pulling `{handle}` into {issue}: {e}"));
+    }
+
+    // Commit the new repo set to the store, then regenerate the manifest over it —
+    // the "tell" step strictly last. The set is unioned with the CURRENT durable set
+    // re-read UNDER the write lock, not a stale earlier read, so two concurrent pulls
+    // for the same issue (each adding a different repo) can't lose-update each other:
+    // each union is computed against the freshest set under the lock that writes it.
+    let repos = match store.lock() {
+        Ok(mut s) => {
+            let mut cur = s.get(issue).map(|x| x.repos.clone()).unwrap_or_default();
+            if cur.is_empty() {
+                cur.push(descriptor.primary.clone());
+            }
+            if !cur.iter().any(|h| h == handle) {
+                cur.push(handle.to_string());
+            }
+            s.set_repos(issue, cur.clone());
+            let _ = s.save();
+            cur
+        }
+        Err(_) => return,
+    };
+
+    let mut manifest = Vec::new();
+    for h in &repos {
+        let c = layout.repo_clone_path(&descriptor.handle, h);
+        if let Ok(m) = WorktreeManager::with_layout(&c, &prefix, &worktrees_root, h)
+            && let Ok(Some(wt)) = m.find(issue)
+        {
+            manifest.push((h.clone(), wt.branch));
+        }
+    }
+    let workspace_dir = layout.issue_workspace_dir(&descriptor.handle, issue);
+    let _ = crate::worktree::write_workspace_md(&workspace_dir, issue, &manifest);
+
+    notify(format!(
+        "pulled `{handle}` into {issue} — resume the agent for full tool access"
+    ));
 }
 
 /// Re-emit every session's CURRENT status for `project_id` (no restart
@@ -198,6 +446,25 @@ pub async fn build_plane(
     let layout = registry.layout().clone();
     let project_handle = descriptor.handle.clone();
 
+    // The provisioning context lets each launch materialise its up-front-selected
+    // secondary repos (ENG-536) beyond the primary, and lets the bidirectional
+    // reconcile (ENG-540) rebuild a crashed session's repos from its handle set —
+    // both fenced to this project's candidate set (the trust boundary).
+    let provision = RepoProvision {
+        layout: layout.clone(),
+        project_handle: project_handle.clone(),
+        branch_prefix: descriptor
+            .branch_prefix
+            .clone()
+            .unwrap_or_else(crate::worktree::default_branch_prefix),
+        primary: descriptor.primary.clone(),
+        candidates: descriptor
+            .candidates
+            .iter()
+            .filter_map(|h| registry.repo(h).map(|e| (h.clone(), e.clone())))
+            .collect(),
+    };
+
     // Materialise the primary repo (mirror → reference clone) and re-root the
     // worktree manager there — all on the blocking pool, since `git clone` is slow.
     let worktree = {
@@ -209,6 +476,9 @@ pub async fn build_plane(
         let port = builder.hook_port;
         let token = builder.hook_token.clone();
         match tokio::task::spawn_blocking(move || -> Result<WorktreeManager, String> {
+            // Best-effort, throttled mirror refresh so a (re)built clone forks off
+            // current upstream rather than the mirror's state at first create.
+            let _ = crate::mirror::refresh_mirror(&layout, &primary);
             let clone = crate::mirror::ensure_clone(&layout, &handle, &primary)
                 .map_err(|e| e.to_string())?;
             // Install/refresh the v1.6 auto-push post-commit hook with THIS run's
@@ -270,21 +540,30 @@ pub async fn build_plane(
         reg.insert(descriptor.project_id.clone(), Arc::clone(&store));
     }
 
-    // Reconcile + rehydrate off the workers (worktree.list() shells out to git).
+    // Reconcile + rehydrate off the workers (worktree.list() + any materialise-up
+    // shells out to git). Bidirectional (ENG-540): rebuild a crashed session's repos
+    // from its durable handle set, then prune-down + downgrade was-live to Idle.
     let resumable = {
         let worktree = worktree.clone();
+        let provision = provision.clone();
         let store = Arc::clone(&store);
         let events = builder.events.clone();
         let project_id = descriptor.project_id.clone();
         tokio::task::spawn_blocking(move || {
-            reconcile_and_rehydrate(&worktree, &store, &events, &project_id)
+            reconcile_and_rehydrate(&worktree, &provision, &store, &events, &project_id)
         })
         .await
         .unwrap_or_default()
     };
 
     let hooks_dir = layout.hooks_dir(&project_handle);
-    let cfg = builder.supervisor_config(&descriptor.project_id, hooks_dir, worktree, store);
+    let cfg = builder.supervisor_config(
+        &descriptor.project_id,
+        hooks_dir,
+        worktree,
+        provision,
+        store,
+    );
     let (handle, join) = Supervisor::start(cfg, rt);
     Some((ProjectPlane { handle, join }, resumable))
 }
@@ -297,10 +576,28 @@ enum WorkspaceCommand {
         issue: String,
         title: String,
         size: Option<(u16, u16)>,
+        /// Up-front-selected repo handles beyond the primary (ENG-536); empty for a
+        /// single-repo launch.
+        repos: Vec<String>,
     },
     Cancel {
         project_id: String,
         issue: String,
+    },
+    /// Tear down a finished issue's workspace (ENG-541): push each repo's branch,
+    /// then remove the per-issue worktrees (keeping branches). Runs on the blocking
+    /// pool — best-effort, never blocking the command loop.
+    Teardown {
+        project_id: String,
+        issue: String,
+    },
+    /// Materialise a confirmed lazy-pull (ENG-542): clone + worktree an extra repo
+    /// into a running issue's workspace, then update its repo set. Re-fenced to the
+    /// candidate set and run on the blocking pool.
+    MaterializeRepo {
+        project_id: String,
+        issue: String,
+        repo_handle: String,
     },
     /// Bring `project_id` online without launching anything: build its plane if
     /// it isn't running, then re-emit its current fleet statuses so the cockpit's
@@ -328,11 +625,25 @@ impl WorkspaceHandle {
         title: String,
         size: Option<(u16, u16)>,
     ) {
+        self.launch_with_repos(project_id, issue, title, size, Vec::new());
+    }
+
+    /// Launch with an explicit up-front repo selection (ENG-536). The project's
+    /// primary is always materialised; `repos` adds the rest of the chosen set.
+    pub fn launch_with_repos(
+        &self,
+        project_id: String,
+        issue: String,
+        title: String,
+        size: Option<(u16, u16)>,
+        repos: Vec<String>,
+    ) {
         let _ = self.cmd_tx.send(WorkspaceCommand::Launch {
             project_id,
             issue,
             title,
             size,
+            repos,
         });
     }
 
@@ -342,6 +653,26 @@ impl WorkspaceHandle {
         let _ = self
             .cmd_tx
             .send(WorkspaceCommand::Cancel { project_id, issue });
+    }
+
+    /// Tear down a finished issue's workspace (ENG-541): push each repo's branch,
+    /// then remove its per-issue worktrees (keeping branches). Only meaningful for a
+    /// non-live agent — the cockpit gates it on that.
+    pub fn teardown(&self, project_id: String, issue: String) {
+        let _ = self
+            .cmd_tx
+            .send(WorkspaceCommand::Teardown { project_id, issue });
+    }
+
+    /// Materialise a confirmed lazy-pull (ENG-542): clone + worktree `repo_handle`
+    /// into `(project_id, issue)`'s workspace and grow its repo set. Re-fenced to the
+    /// candidate set inside the workspace.
+    pub fn materialize_repo(&self, project_id: String, issue: String, repo_handle: String) {
+        let _ = self.cmd_tx.send(WorkspaceCommand::MaterializeRepo {
+            project_id,
+            issue,
+            repo_handle,
+        });
     }
 
     /// Switch the cockpit into `project_id`: builds its plane if needed and
@@ -354,6 +685,15 @@ impl WorkspaceHandle {
     /// workspace task's `JoinHandle` so the process waits for all agents to die.
     pub fn shutdown(&self) {
         let _ = self.cmd_tx.send(WorkspaceCommand::Shutdown);
+    }
+
+    /// A handle whose receiver is dropped — sends are silently discarded. Lets a
+    /// cockpit unit test exercise the launch-button / repo-select flow (which needs
+    /// a `Some(workspace)`) without standing up a real workspace task.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        WorkspaceHandle { cmd_tx }
     }
 }
 
@@ -400,9 +740,10 @@ impl Workspace {
                     issue,
                     title,
                     size,
+                    repos,
                 } => {
                     if let Some(handle) = self.ensure_plane(&project_id).await {
-                        handle.launch(issue, title, size);
+                        handle.launch_with_repos(issue, title, size, repos);
                     }
                 }
                 WorkspaceCommand::Cancel { project_id, issue } => {
@@ -410,6 +751,58 @@ impl Workspace {
                     // unstarted one is a no-op (nothing to stop).
                     if let Some(plane) = self.planes.get(&project_id) {
                         plane.handle.cancel(issue);
+                    }
+                }
+                WorkspaceCommand::Teardown { project_id, issue } => {
+                    // Push + remove the issue's worktrees off the command loop (it
+                    // shells out to git). Fire-and-forget — the cockpit already
+                    // undocked the window; a footer surfaces any per-repo problem.
+                    let store = self
+                        .stores
+                        .lock()
+                        .ok()
+                        .and_then(|reg| reg.get(&project_id).cloned());
+                    if let Some(store) = store {
+                        let registry = self.registry.clone();
+                        let events = self.builder.events.clone();
+                        tokio::task::spawn_blocking(move || {
+                            teardown_issue(&registry, &store, &events, &project_id, &issue);
+                        });
+                    }
+                }
+                WorkspaceCommand::MaterializeRepo {
+                    project_id,
+                    issue,
+                    repo_handle,
+                } => {
+                    // Ensure the plane exists (the store + clones must be live), then
+                    // pull the repo on the blocking pool — best-effort, off the loop.
+                    if self.ensure_plane(&project_id).await.is_some() {
+                        let store = self
+                            .stores
+                            .lock()
+                            .ok()
+                            .and_then(|reg| reg.get(&project_id).cloned());
+                        if let Some(store) = store {
+                            let registry = self.registry.clone();
+                            let events = self.builder.events.clone();
+                            let exe = self.builder.exe.to_string_lossy().into_owned();
+                            let port = self.builder.hook_port;
+                            let token = self.builder.hook_token.clone();
+                            tokio::task::spawn_blocking(move || {
+                                materialize_repo_request(
+                                    &registry,
+                                    &exe,
+                                    port,
+                                    token.as_str(),
+                                    &store,
+                                    &events,
+                                    &project_id,
+                                    &issue,
+                                    &repo_handle,
+                                );
+                            });
+                        }
                     }
                 }
                 WorkspaceCommand::Activate { project_id } => {
@@ -665,6 +1058,182 @@ mod tests {
             .expect("workspace task joined cleanly");
     }
 
+    /// A spawn fn that records each launch's full [`SpawnConfig`] (cwd + args) by
+    /// issue, so a test can assert the multi-repo cwd + `--add-dir` wiring (ENG-536).
+    type CfgLog = Arc<Mutex<HashMap<String, SpawnConfig>>>;
+    fn capturing_spawn(count: Arc<AtomicUsize>, log: CfgLog) -> Arc<SpawnFn> {
+        Arc::new(move |cfg: SpawnConfig, _events: AppEventTx| {
+            log.lock().unwrap().insert(cfg.issue.clone(), cfg.clone());
+            count.fetch_add(1, Ordering::Relaxed);
+            Ok(FakeBackend::new(&cfg.issue) as Arc<dyn AgentBackend>)
+        })
+    }
+
+    /// A registry under a fresh temp `~/.lindep` with one project bound to TWO
+    /// local-only repos (`api` primary, `web` secondary) — the multi-repo launch path.
+    fn registry_two_repo(tag: &str, api: &Path, web: &Path) -> (Registry, Layout) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("lindep-mreg-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let body = format!(
+            "[[repo]]\nhandle = \"api\"\nlocal = \"{}\"\n\n\
+             [[repo]]\nhandle = \"web\"\nlocal = \"{}\"\n\n\
+             [[project]]\nid = \"proj\"\nhandle = \"proj\"\n\
+             candidates = [\"api\", \"web\"]\nprimary = \"api\"\n",
+            api.display(),
+            web.display(),
+        );
+        std::fs::write(root.join("registry.toml"), body).unwrap();
+        let layout = Layout::new(&root);
+        let (reg, warnings) = Registry::load_at(layout.clone());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        (reg, layout)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_up_front_multi_select_materialises_each_chosen_repo() {
+        let api = temp_repo("mr-api");
+        let web = temp_repo("mr-web");
+        let (registry, layout) = registry_two_repo("mr", &api, &web);
+        let (tx, _rx) = crate::event::channel();
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let cfgs: CfgLog = Arc::new(Mutex::new(HashMap::new()));
+        let b = builder(
+            tx,
+            capturing_spawn(Arc::clone(&spawns), Arc::clone(&cfgs)),
+            Arc::new(AtomicUsize::new(0)),
+            10,
+        );
+        let stores: StoreRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (ws, join) = Workspace::start(
+            Handle::current(),
+            b,
+            registry,
+            HashMap::new(),
+            Arc::clone(&stores),
+        );
+
+        // Launch ENG-1 picking the secondary `web` on top of the always-on `api`.
+        ws.launch_with_repos(
+            "proj".into(),
+            "ENG-1".into(),
+            "Feature".into(),
+            None,
+            vec!["web".into()],
+        );
+        assert!(
+            eventually(|| spawns.load(Ordering::Relaxed) >= 1).await,
+            "the multi-repo agent spawns"
+        );
+
+        let cfg = cfgs
+            .lock()
+            .unwrap()
+            .get("ENG-1")
+            .cloned()
+            .expect("a spawn for ENG-1");
+        // cwd is the per-issue workspace PARENT (worktrees/<ISSUE>), not one repo.
+        assert_eq!(cfg.cwd, layout.issue_workspace_dir("proj", "ENG-1"));
+        // Each materialised repo gets its own `--add-dir` (full tool access to each).
+        let add_dirs: Vec<&str> = cfg
+            .args
+            .windows(2)
+            .filter(|w| w[0] == "--add-dir")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(add_dirs.len(), 2, "one --add-dir per repo: {:?}", cfg.args);
+        assert!(add_dirs.iter().any(|d| d.ends_with("/api")));
+        assert!(add_dirs.iter().any(|d| d.ends_with("/web")));
+        // Both repos are checked out as siblings under the workspace dir…
+        let ws_dir = layout.issue_workspace_dir("proj", "ENG-1");
+        assert!(
+            ws_dir.join("api").is_dir() && ws_dir.join("web").is_dir(),
+            "both repos checked out on disk"
+        );
+        // …a WORKSPACE.md tells the agent which repos exist…
+        assert!(
+            ws_dir.join("WORKSPACE.md").is_file(),
+            "a manifest is written"
+        );
+        // …and the session durably records the materialised set (for ENG-540 rehydrate).
+        let store = stores.lock().unwrap().get("proj").cloned().unwrap();
+        let repos = store.lock().unwrap().get("ENG-1").unwrap().repos.clone();
+        assert_eq!(repos, vec!["api", "web"]);
+
+        ws.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_launch_survives_a_secondary_repo_that_cant_be_materialised() {
+        // Best-effort secondaries (ENG-536): a secondary whose source can't be cloned
+        // (here a real-but-non-git path) is skipped, not fatal — the agent still spawns
+        // on its primary, and only what actually materialised is recorded as durable, so
+        // the offline/reclaimed-mirror case can't strand an otherwise-runnable agent.
+        let api = temp_repo("be-api");
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("lindep-be-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let broken = root.join("not-a-git-repo");
+        std::fs::create_dir_all(&broken).unwrap();
+        let body = format!(
+            "[[repo]]\nhandle = \"api\"\nlocal = \"{}\"\n\n\
+             [[repo]]\nhandle = \"web\"\nlocal = \"{}\"\n\n\
+             [[project]]\nid = \"proj\"\nhandle = \"proj\"\n\
+             candidates = [\"api\", \"web\"]\nprimary = \"api\"\n",
+            api.display(),
+            broken.display(),
+        );
+        std::fs::write(root.join("registry.toml"), body).unwrap();
+        let layout = Layout::new(&root);
+        let (registry, warnings) = Registry::load_at(layout.clone());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let (tx, _rx) = crate::event::channel();
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let cfgs: CfgLog = Arc::new(Mutex::new(HashMap::new()));
+        let b = builder(
+            tx,
+            capturing_spawn(Arc::clone(&spawns), Arc::clone(&cfgs)),
+            Arc::new(AtomicUsize::new(0)),
+            10,
+        );
+        let stores: StoreRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (ws, join) = Workspace::start(
+            Handle::current(),
+            b,
+            registry,
+            HashMap::new(),
+            Arc::clone(&stores),
+        );
+
+        ws.launch_with_repos(
+            "proj".into(),
+            "ENG-1".into(),
+            "Feature".into(),
+            None,
+            vec!["web".into()],
+        );
+        assert!(
+            eventually(|| spawns.load(Ordering::Relaxed) >= 1).await,
+            "the agent still spawns on its primary despite the broken secondary"
+        );
+
+        // The primary checked out; the broken secondary did not, and is recorded nowhere.
+        assert!(layout.repo_clone_path("proj", "api").exists());
+        let store = stores.lock().unwrap().get("proj").cloned().unwrap();
+        let repos = store.lock().unwrap().get("ENG-1").unwrap().repos.clone();
+        assert_eq!(repos, vec!["api"], "only the materialised repo is durable");
+
+        ws.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_live_agent_cap_spans_projects() {
         // The cap's load-bearing promise: max_concurrent bounds live agents across
@@ -750,7 +1319,16 @@ mod tests {
         }
 
         let (tx, mut rx) = crate::event::channel();
-        let resumable = reconcile_and_rehydrate(&wt, &store, &tx, "proj-x");
+        // A dummy provision: these sessions have an empty repo set, so the
+        // materialise-up pass is skipped and only the prune/downgrade runs.
+        let provision = RepoProvision {
+            layout: Layout::new(repo.join(".lindep")),
+            project_handle: "p".to_string(),
+            branch_prefix: "felix".to_string(),
+            primary: "p".to_string(),
+            candidates: HashMap::new(),
+        };
+        let resumable = reconcile_and_rehydrate(&wt, &provision, &store, &tx, "proj-x");
 
         assert!(
             resumable.contains("ENG-live"),
@@ -788,6 +1366,226 @@ mod tests {
             Some(AgentStatus::Done),
             "a terminal session keeps its status verbatim"
         );
+    }
+
+    #[test]
+    fn bidirectional_reconcile_rebuilds_a_vanished_worktree_from_the_repo_set() {
+        // A crash that deleted a resumable session's worktree must be rebuilt on
+        // restart from its durable Session.repos (reusing the kept branch), not
+        // pruned — otherwise a multi-repo agent strands until a fresh launch.
+        let api_repo = temp_repo("recon-api");
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("lindep-recon-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let layout = Layout::new(&root);
+        let entry = crate::registry::RepoEntry {
+            handle: "api".to_string(),
+            remote: None,
+            local: Some(api_repo),
+        };
+        let provision = RepoProvision {
+            layout: layout.clone(),
+            project_handle: "proj".to_string(),
+            branch_prefix: "felix".to_string(),
+            primary: "api".to_string(),
+            candidates: HashMap::from([("api".to_string(), entry.clone())]),
+        };
+        // Materialise the primary clone + a worktree for ENG-1.
+        let clone = crate::mirror::ensure_clone(&layout, "proj", &entry).unwrap();
+        let wt_root = layout.worktrees_dir("proj");
+        let mgr = WorktreeManager::with_layout(&clone, "felix", wt_root, "api").unwrap();
+        let worktree = mgr.create("ENG-1", "Feature", "HEAD").unwrap();
+        assert!(worktree.path.is_dir());
+
+        let store = Arc::new(Mutex::new(
+            SessionStore::open_project("proj", layout.state_path("proj")).unwrap(),
+        ));
+        {
+            let mut s = store.lock().unwrap();
+            s.ensure("ENG-1", worktree.path.clone(), worktree.branch.clone());
+            s.set_status("ENG-1", AgentStatus::Running);
+            s.set_repos("ENG-1", vec!["api".to_string()]);
+        }
+
+        // Simulate a crash: the worktree directory is gone.
+        std::fs::remove_dir_all(&worktree.path).unwrap();
+        assert!(!worktree.path.is_dir());
+
+        let (tx, _rx) = crate::event::channel();
+        let resumable = reconcile_and_rehydrate(&mgr, &provision, &store, &tx, "proj");
+
+        assert!(worktree.path.is_dir(), "the vanished worktree was rebuilt");
+        assert!(
+            store.lock().unwrap().get("ENG-1").is_some(),
+            "the session survives (rebuilt, not pruned)"
+        );
+        assert!(
+            resumable.contains("ENG-1"),
+            "it's resumable, downgraded to Idle"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn teardown_removes_a_finished_issues_worktrees_but_keeps_the_branch() {
+        let api_repo = temp_repo("teardown-api");
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("lindep-teardown-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("registry.toml"),
+            format!(
+                "[[repo]]\nhandle = \"api\"\nlocal = \"{}\"\n\n\
+                 [[project]]\nid = \"proj\"\nhandle = \"proj\"\nprimary = \"api\"\n",
+                api_repo.display()
+            ),
+        )
+        .unwrap();
+        let layout = Layout::new(&root);
+        let (registry, warnings) = Registry::load_at(layout.clone());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Materialise the clone + a worktree for ENG-1.
+        let entry = registry.repo("api").unwrap().clone();
+        let clone = crate::mirror::ensure_clone(&layout, "proj", &entry).unwrap();
+        let mgr =
+            WorktreeManager::with_layout(&clone, "felix", layout.worktrees_dir("proj"), "api")
+                .unwrap();
+        let worktree = mgr.create("ENG-1", "Feature", "HEAD").unwrap();
+        let branch = worktree.branch.clone();
+        assert!(worktree.path.is_dir());
+
+        let store = Arc::new(Mutex::new(
+            SessionStore::open_project("proj", layout.state_path("proj")).unwrap(),
+        ));
+        {
+            let mut s = store.lock().unwrap();
+            s.ensure("ENG-1", worktree.path.clone(), worktree.branch.clone());
+            s.set_status("ENG-1", AgentStatus::Done);
+            s.set_repos("ENG-1", vec!["api".to_string()]);
+        }
+
+        let (tx, _rx) = crate::event::channel();
+        teardown_issue(&registry, &store, &tx, "proj", "ENG-1");
+
+        // The worktree is gone and the session forgotten, but the branch is KEPT
+        // (its commits outlive the disposable checkout — a re-launch resumes it).
+        assert!(!worktree.path.is_dir(), "the worktree was removed");
+        assert!(
+            store.lock().unwrap().get("ENG-1").is_none(),
+            "the session was forgotten"
+        );
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&clone)
+            .args(["branch", "--list", &branch])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&branch),
+            "the branch is kept after teardown"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Start ENG-1 in `proj` with just the primary `api` materialised, returning the
+    /// registry, layout and the store — the fixture both lazy-pull tests build on.
+    fn started_single_repo_issue(tag: &str) -> (Registry, Layout, Arc<Mutex<SessionStore>>) {
+        let api = temp_repo(&format!("{tag}-api"));
+        let web = temp_repo(&format!("{tag}-web"));
+        let (registry, layout) = registry_two_repo(tag, &api, &web);
+        let entry_api = registry.repo("api").unwrap().clone();
+        let clone = crate::mirror::ensure_clone(&layout, "proj", &entry_api).unwrap();
+        let mgr =
+            WorktreeManager::with_layout(&clone, "felix", layout.worktrees_dir("proj"), "api")
+                .unwrap();
+        let wt = mgr.create("ENG-1", "Feature", "HEAD").unwrap();
+        let store = Arc::new(Mutex::new(
+            SessionStore::open_project("proj", layout.state_path("proj")).unwrap(),
+        ));
+        {
+            let mut s = store.lock().unwrap();
+            s.ensure("ENG-1", wt.path.clone(), wt.branch.clone());
+            s.set_repos("ENG-1", vec!["api".to_string()]);
+        }
+        (registry, layout, store)
+    }
+
+    #[test]
+    fn a_confirmed_lazy_pull_materialises_an_in_candidate_repo_and_grows_the_set() {
+        let (registry, layout, store) = started_single_repo_issue("pull");
+        let (tx, _rx) = crate::event::channel();
+
+        materialize_repo_request(
+            &registry, "lindep", 1, "", &store, &tx, "proj", "ENG-1", "web",
+        );
+
+        // The pulled repo's worktree is on disk, the durable set grew (tell step last),
+        // and WORKSPACE.md now lists both repos.
+        let web_wt = layout.worktrees_dir("proj").join("ENG-1").join("web");
+        assert!(web_wt.is_dir(), "the pulled repo's worktree exists");
+        let repos = store.lock().unwrap().get("ENG-1").unwrap().repos.clone();
+        assert_eq!(repos, vec!["api", "web"]);
+        let md = std::fs::read_to_string(
+            layout
+                .issue_workspace_dir("proj", "ENG-1")
+                .join("WORKSPACE.md"),
+        )
+        .unwrap();
+        assert!(md.contains("web"), "the manifest names the pulled repo");
+    }
+
+    #[test]
+    fn a_lazy_pull_unions_with_the_current_durable_set_under_the_lock() {
+        // The repos write re-reads the CURRENT set under the write lock and unions, so a
+        // concurrent pull that added another repo isn't lost. Simulate that prior add by
+        // seeding the durable set with `db`, then pull `web`: the result keeps both.
+        let (registry, layout, store) = started_single_repo_issue("union");
+        store
+            .lock()
+            .unwrap()
+            .set_repos("ENG-1", vec!["api".to_string(), "db".to_string()]);
+        let (tx, _rx) = crate::event::channel();
+
+        materialize_repo_request(
+            &registry, "lindep", 1, "", &store, &tx, "proj", "ENG-1", "web",
+        );
+
+        assert_eq!(
+            store.lock().unwrap().get("ENG-1").unwrap().repos,
+            vec!["api", "db", "web"],
+            "the pull unions with the freshly-read set, never overwriting a concurrent add"
+        );
+        let _ = layout;
+    }
+
+    #[test]
+    fn an_out_of_candidate_lazy_pull_is_denied_and_changes_nothing() {
+        let (registry, _layout, store) = started_single_repo_issue("deny");
+        let (tx, mut rx) = crate::event::channel();
+
+        // `evil` is not a candidate → denied; nothing materialised, the set unchanged.
+        materialize_repo_request(
+            &registry, "lindep", 1, "", &store, &tx, "proj", "ENG-1", "evil",
+        );
+
+        assert_eq!(
+            store.lock().unwrap().get("ENG-1").unwrap().repos,
+            vec!["api"],
+            "the repo set is unchanged"
+        );
+        let mut denied = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::Notification(m) = ev
+                && m.contains("not a candidate")
+            {
+                denied = true;
+            }
+        }
+        assert!(denied, "an out-of-candidate pull surfaces a denial footer");
     }
 
     #[test]

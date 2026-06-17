@@ -33,9 +33,11 @@
 //! caller on the tokio runtime invokes them via `spawn_blocking`, exactly like the
 //! worktree manager.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use crate::registry::{Layout, RepoEntry};
 
@@ -76,6 +78,12 @@ pub enum MirrorError {
         existing: String,
         wanted: String,
     },
+
+    /// A mirror delete was refused because live reference clones still borrow its
+    /// objects (the alternates-fragility guard, ENG-541): deleting it would corrupt
+    /// every referrer. Mirror GC is explicit and never severs a live borrow.
+    #[error("mirror `{handle}` still has {refs} live reference clone(s); not deleting")]
+    Referenced { handle: String, refs: usize },
 }
 
 /// Ensure the L1 bare mirror for `repo` exists at [`Layout::mirror_path`] and is
@@ -83,6 +91,13 @@ pub enum MirrorError {
 /// matching mirror is returned untouched; a mismatched remote is a hard error
 /// rather than a silent repoint. Serialised per handle by a filesystem `flock` so
 /// two concurrent launches don't both clone the same mirror.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "standalone L1 mirror-ensure; ensure_clone now ensures the mirror under its own held lock via ensure_mirror_locked, but this stays the tested L1 entry point"
+    )
+)]
 pub fn ensure_mirror(layout: &Layout, repo: &RepoEntry) -> Result<PathBuf, MirrorError> {
     let mirror = layout.mirror_path(&repo.handle);
     let source = repo
@@ -99,21 +114,31 @@ pub fn ensure_mirror(layout: &Layout, repo: &RepoEntry) -> Result<PathBuf, Mirro
     let mirrors_dir = layout.mirrors_dir();
     mkdir_p(&mirrors_dir)?;
     let _lock = FileLock::acquire(&lock_path(&mirrors_dir, &repo.handle))?;
+    ensure_mirror_locked(layout, repo, &source, &mirror)
+}
 
-    // Re-check under the lock: another process may have created it while we waited.
-    if is_git_dir(&mirror) {
-        verify_mirror_source(&mirror, repo, &source)?;
-        return Ok(mirror);
+/// Materialise the bare mirror assuming the per-handle `flock` is **already held**.
+/// Factored out so [`ensure_clone`] can hold one lock across both the mirror-ensure
+/// and the reference clone, leaving no unlocked gap a concurrent [`delete_mirror`]
+/// could remove the mirror through. Re-checks under the lock (another process may
+/// have created it while we waited).
+fn ensure_mirror_locked(
+    layout: &Layout,
+    repo: &RepoEntry,
+    source: &str,
+    mirror: &Path,
+) -> Result<PathBuf, MirrorError> {
+    if is_git_dir(mirror) {
+        verify_mirror_source(mirror, repo, source)?;
+        return Ok(mirror.to_path_buf());
     }
 
+    let mirrors_dir = layout.mirrors_dir();
     sweep_partials(&mirrors_dir, &format!("{}.git", repo.handle));
-    let tmp = partial_path(&mirror);
+    let tmp = partial_path(mirror);
     // `--mirror` gives a bare repo whose refs map 1:1 to the source — the shared
     // object DB every reference clone borrows from.
-    git(
-        &["clone", "--mirror", source.as_str(), &tmp.to_string_lossy()],
-        None,
-    )?;
+    git(&["clone", "--mirror", source, &tmp.to_string_lossy()], None)?;
     if !is_git_dir(&tmp) {
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(MirrorError::Git {
@@ -122,8 +147,8 @@ pub fn ensure_mirror(layout: &Layout, repo: &RepoEntry) -> Result<PathBuf, Mirro
             stderr: "clone produced no git directory".to_string(),
         });
     }
-    rename(&tmp, &mirror)?;
-    Ok(mirror)
+    rename(&tmp, mirror)?;
+    Ok(mirror.to_path_buf())
 }
 
 /// Ensure the L2 reference clone for `(project, repo)` exists at
@@ -138,7 +163,22 @@ pub fn ensure_clone(
     project_handle: &str,
     repo: &RepoEntry,
 ) -> Result<PathBuf, MirrorError> {
-    let mirror = ensure_mirror(layout, repo)?;
+    let mirror_path = layout.mirror_path(&repo.handle);
+    let source = repo
+        .mirror_source()
+        .ok_or_else(|| MirrorError::NoSource(repo.handle.clone()))?;
+    let mirrors_dir = layout.mirrors_dir();
+    mkdir_p(&mirrors_dir)?;
+    // Hold the per-handle mirror flock across BOTH the mirror-ensure AND the
+    // clone/validate (which READ the mirror's object DB: `git clone --shared`
+    // borrows its objects; validate_clone fscks against them). One lock with no
+    // intervening gap means a concurrent delete_mirror (which takes the same lock
+    // and re-counts under it) can never remove_dir_all the mirror out from under an
+    // in-flight clone — the alternates-fragility guard. Ensuring the mirror under
+    // the held lock also closes the former lockless window between resolving the
+    // mirror path and re-acquiring the lock, where a reclaim could delete it.
+    let _lock = FileLock::acquire(&lock_path(&mirrors_dir, &repo.handle))?;
+    let mirror = ensure_mirror_locked(layout, repo, &source, &mirror_path)?;
     let dst = layout.repo_clone_path(project_handle, &repo.handle);
 
     if dst.exists() {
@@ -210,6 +250,178 @@ pub fn can_push_to_remote(repo: &RepoEntry) -> bool {
 pub fn push_head(worktree: &Path) -> Result<(), MirrorError> {
     git(&["push", "-u", "origin", "HEAD"], Some(worktree))?;
     Ok(())
+}
+
+// ── staleness, reference-counting & reclaim (ENG-540 / ENG-541) ───────────────
+
+/// How long a freshly-fetched mirror is trusted before another `remote update` is
+/// allowed. The mirror is a *cache*, not the source of truth, so a few-minute
+/// staleness window is fine; the throttle keeps activation from re-fetching every
+/// repo on every switch.
+const REFRESH_THROTTLE: Duration = Duration::from_secs(300);
+
+/// Bring the L1 mirror up to date with its true remote — a throttled
+/// `git remote update --prune` under the **same** per-handle `flock` as
+/// [`ensure_mirror`] (so a refresh never races a clone-time mirror create on the
+/// object DB). Best-effort and idempotent: a local-only repo (no remote) or a
+/// not-yet-created mirror is a no-op, and a refresh within [`REFRESH_THROTTLE`] is
+/// skipped. The mirror is a cache; this is what keeps a re-clone from a stale mirror
+/// from missing a just-pushed branch (the design's two-hop freshness concern).
+pub fn refresh_mirror(layout: &Layout, repo: &RepoEntry) -> Result<(), MirrorError> {
+    if repo.is_local_only() {
+        return Ok(()); // a synthesised mirror has no upstream to update from
+    }
+    let mirror = layout.mirror_path(&repo.handle);
+    if !is_git_dir(&mirror) {
+        return Ok(()); // nothing to refresh yet — ensure_mirror creates it
+    }
+    let mirrors_dir = layout.mirrors_dir();
+    let _lock = FileLock::acquire(&lock_path(&mirrors_dir, &repo.handle))?;
+    let sentinel = mirror.join("lindep-fetched");
+    if fresh_within(&sentinel, REFRESH_THROTTLE) {
+        return Ok(());
+    }
+    git(&["remote", "update", "--prune"], Some(&mirror))?;
+    let _ = std::fs::write(&sentinel, b"ok\n");
+    Ok(())
+}
+
+/// Fetch the latest remote-tracking refs into an L2 clone without disturbing any
+/// in-flight worktree: `git fetch --prune origin` only advances `refs/remotes/origin/*`,
+/// never the local branches a worktree has checked out. Best-effort.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "per-clone staleness refresh (ENG-541); exercised by tests, wired opportunistically"
+    )
+)]
+pub fn fetch_clone(clone: &Path) -> Result<(), MirrorError> {
+    git(&["fetch", "--prune", "origin"], Some(clone))?;
+    Ok(())
+}
+
+/// Count, per repo handle, how many L2 reference clones across **all** projects
+/// currently borrow that handle's mirror — the mirror's live reference count. A
+/// clone at `projects/<project>/repos/<handle>` is one reference; a handle with zero
+/// is an unreferenced mirror (safe to reclaim). Filesystem-only (no git, no registry),
+/// so it's cheap enough to run on a deliberate user action.
+pub fn count_clone_refs(layout: &Layout) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let Ok(projects) = std::fs::read_dir(layout.projects_dir()) else {
+        return counts;
+    };
+    for project in projects.flatten() {
+        let repos = project.path().join("repos");
+        let Ok(clones) = std::fs::read_dir(&repos) else {
+            continue;
+        };
+        for clone in clones.flatten() {
+            let handle = clone.file_name().to_string_lossy().into_owned();
+            // Skip half-built/crash debris (`<handle>.partial.<pid>.<seq>`): it
+            // borrows the mirror's objects but is bucketed under a bogus key, so
+            // counting it neither protects the real handle nor is ever matched —
+            // it just leaks the reference. Swept on the next ensure_clone.
+            if handle.contains(".partial.") {
+                continue;
+            }
+            if clone.path().is_dir() {
+                *counts.entry(handle).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// An unreferenced mirror the reclaim prompt can surface: its handle and on-disk
+/// size, so the cockpit can show e.g. `core (842 MB) — reclaim?`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimableMirror {
+    pub handle: String,
+    pub size_bytes: u64,
+}
+
+/// Every mirror with **no** live reference clone — the only mirrors safe to
+/// auto-offer for reclamation (deleting one loses nothing not on its remote; it
+/// re-clones on next use). Sorted by handle for a stable display. The
+/// uncommitted/unpushed-worktree and diverged-branch cases the design also names
+/// are deliberately **never** offered here — those can lose real work, so they are
+/// surfaced (elsewhere) but never auto-deleted.
+pub fn reclaimable_mirrors(layout: &Layout) -> Vec<ReclaimableMirror> {
+    let refs = count_clone_refs(layout);
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(layout.mirrors_dir()) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(handle) = name.strip_suffix(".git") else {
+            continue;
+        };
+        if !entry.path().is_dir() || refs.get(handle).copied().unwrap_or(0) > 0 {
+            continue;
+        }
+        out.push(ReclaimableMirror {
+            handle: handle.to_string(),
+            size_bytes: dir_size(&entry.path()),
+        });
+    }
+    out.sort_by(|a, b| a.handle.cmp(&b.handle));
+    out
+}
+
+/// Delete a mirror's bare object DB — **refusing** if any live reference clone still
+/// borrows it ([`MirrorError::Referenced`]), since that would corrupt every referrer
+/// (the alternates-fragility guard). Mirror GC is explicit and never automatic; this
+/// is the one delete path, and it always reference-counts first.
+pub fn delete_mirror(layout: &Layout, handle: &str) -> Result<(), MirrorError> {
+    // Take the per-handle flock and re-count UNDER it, so a clone of this handle that
+    // started after a stale reclaim scan can't slip past: ensure_clone holds the same
+    // lock across its object-DB read, so either it finishes (and its new L2 clone bumps
+    // the refcount, blocking the delete) or it hasn't started (and waits behind us).
+    let _lock = FileLock::acquire(&lock_path(&layout.mirrors_dir(), handle))?;
+    let refs = count_clone_refs(layout).get(handle).copied().unwrap_or(0);
+    if refs > 0 {
+        return Err(MirrorError::Referenced {
+            handle: handle.to_string(),
+            refs,
+        });
+    }
+    let mirror = layout.mirror_path(handle);
+    if mirror.exists() {
+        std::fs::remove_dir_all(&mirror).map_err(|source| MirrorError::Io {
+            path: mirror,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// Whether `path` exists and was modified within `window` of now — the staleness
+/// throttle for [`refresh_mirror`]. A clock that jumped backwards just means an
+/// extra fetch (harmless), so this never trusts the timestamp for correctness.
+fn fresh_within(path: &Path, window: Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .is_some_and(|age| age < window)
+}
+
+/// Total size in bytes of everything under `path` (recursively). Best-effort: an
+/// unreadable entry is skipped rather than failing the whole walk.
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for entry in rd.flatten() {
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => total += dir_size(&entry.path()),
+                Ok(_) => total += entry.metadata().map(|m| m.len()).unwrap_or(0),
+                Err(_) => {}
+            }
+        }
+    }
+    total
 }
 
 // ── validation & self-heal ──────────────────────────────────────────────────
@@ -682,5 +894,74 @@ mod tests {
         // Same handle, different remote → refuse rather than corrupt referrers.
         let err = ensure_mirror(&layout, &repo("lindep", remote_b)).unwrap_err();
         assert!(matches!(err, MirrorError::RemoteMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn reference_counting_protects_a_borrowed_mirror_from_deletion() {
+        let layout = temp_layout("refcount");
+        let remote = fake_remote("refcount");
+        let r = repo("lindep", remote);
+        // Two projects clone the same repo → the mirror's refcount is 2.
+        ensure_clone(&layout, "proj-a", &r).unwrap();
+        ensure_clone(&layout, "proj-b", &r).unwrap();
+        assert_eq!(count_clone_refs(&layout).get("lindep"), Some(&2));
+        // A referenced mirror is never reclaimable and a delete is refused.
+        assert!(reclaimable_mirrors(&layout).is_empty());
+        let err = delete_mirror(&layout, "lindep").unwrap_err();
+        assert!(
+            matches!(err, MirrorError::Referenced { refs: 2, .. }),
+            "{err:?}"
+        );
+        assert!(is_git_dir(&layout.mirror_path("lindep")), "still on disk");
+    }
+
+    #[test]
+    fn an_unreferenced_mirror_is_reclaimable_and_deletable() {
+        let layout = temp_layout("reclaim");
+        let remote = fake_remote("reclaim");
+        let r = repo("lindep", remote);
+        // A mirror with no reference clone borrowing it.
+        let mirror = ensure_mirror(&layout, &r).unwrap();
+        let reclaimable = reclaimable_mirrors(&layout);
+        assert_eq!(reclaimable.len(), 1);
+        assert_eq!(reclaimable[0].handle, "lindep");
+        assert!(reclaimable[0].size_bytes > 0, "the mirror has a size");
+        // Reclaim it — the bare object DB is gone, and nothing remains reclaimable.
+        delete_mirror(&layout, "lindep").unwrap();
+        assert!(!mirror.exists(), "the unreferenced mirror was reclaimed");
+        assert!(reclaimable_mirrors(&layout).is_empty());
+    }
+
+    #[test]
+    fn fetch_clone_refreshes_remote_tracking_idempotently() {
+        let layout = temp_layout("fetchclone");
+        let remote = fake_remote("fetchclone");
+        let r = repo("lindep", remote);
+        let dst = ensure_clone(&layout, "proj", &r).unwrap();
+        // A per-clone fetch from origin (the true remote) succeeds and is idempotent;
+        // it only advances refs/remotes/origin/*, never a checked-out local branch.
+        fetch_clone(&dst).unwrap();
+        fetch_clone(&dst).unwrap();
+    }
+
+    #[test]
+    fn refresh_mirror_updates_then_throttles_and_skips_local_only() {
+        let layout = temp_layout("refresh");
+        let remote = fake_remote("refresh");
+        let r = repo("lindep", remote.clone());
+        ensure_mirror(&layout, &r).unwrap();
+        // First refresh runs and drops the throttle sentinel…
+        refresh_mirror(&layout, &r).unwrap();
+        let sentinel = layout.mirror_path("lindep").join("lindep-fetched");
+        assert!(sentinel.exists(), "a fetch sentinel is written");
+        // …a second immediate refresh is throttled (no error, still fresh)…
+        refresh_mirror(&layout, &r).unwrap();
+        // …and a local-only repo (no upstream) is a clean no-op.
+        let local_only = RepoEntry {
+            handle: "scratch".to_string(),
+            remote: None,
+            local: Some(remote),
+        };
+        refresh_mirror(&layout, &local_only).unwrap();
     }
 }
