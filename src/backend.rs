@@ -354,8 +354,9 @@ impl PtyAgent {
         {
             let parser = Arc::clone(&parser);
             let events = events.clone();
-            let project_id = cfg.project_id.clone();
-            let issue = cfg.issue.clone();
+            // `Arc<str>` so each per-chunk `AgentOutput` clones a refcount, not a String.
+            let project_id: Arc<str> = Arc::from(cfg.project_id.as_str());
+            let issue: Arc<str> = Arc::from(cfg.issue.as_str());
             thread::Builder::new()
                 .name(format!("pty-read-{issue}"))
                 .spawn(move || read_pump(reader, &parser, &events, &project_id, &issue))
@@ -576,8 +577,8 @@ fn read_pump(
     mut reader: Box<dyn Read + Send>,
     parser: &Arc<RwLock<Parser>>,
     events: &AppEventTx,
-    project_id: &str,
-    issue: &str,
+    project_id: &Arc<str>,
+    issue: &Arc<str>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -587,9 +588,10 @@ fn read_pump(
                 if let Ok(mut parser) = parser.write() {
                     parser.process(&buf[..n]);
                 }
+                // Refcount bumps, not allocations — this fires per PTY read chunk.
                 let _ = events.send(AppEvent::AgentOutput {
-                    project_id: project_id.to_string(),
-                    issue: issue.to_string(),
+                    project_id: Arc::clone(project_id),
+                    issue: Arc::clone(issue),
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,

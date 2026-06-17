@@ -36,8 +36,10 @@ pub enum AppEvent {
         backend: Arc<dyn AgentBackend>,
     },
     /// An agent's PTY produced output and its pane should repaint. Coalesced by
-    /// the loop into a single redraw per tick.
-    AgentOutput { project_id: String, issue: String },
+    /// the loop into a single redraw per tick. The ids are `Arc<str>` (not `String`)
+    /// because the pump emits one of these per PTY read — cloning an `Arc` is a
+    /// refcount bump, where two fresh `String`s would heap-allocate on every chunk.
+    AgentOutput { project_id: Arc<str>, issue: Arc<str> },
     /// An agent process exited (cleanly or not).
     AgentExited {
         project_id: String,
@@ -145,7 +147,6 @@ impl AppEvent {
             | AppEvent::ReclaimScanned { .. }
             | AppEvent::ProjectActivated => None,
             AppEvent::AgentSpawned { project_id, .. }
-            | AppEvent::AgentOutput { project_id, .. }
             | AppEvent::AgentExited { project_id, .. }
             | AppEvent::AgentNeedsYou { project_id, .. }
             | AppEvent::AgentStatusChanged { project_id, .. }
@@ -155,6 +156,9 @@ impl AppEvent {
             | AppEvent::MaterializeProgress { project_id, .. }
             | AppEvent::MaterializeDone { project_id, .. }
             | AppEvent::RepoRequested { project_id, .. } => Some(project_id),
+            // Separate arm: its `project_id` is `Arc<str>`, not `String`, so it can't
+            // share the or-pattern above (both still deref-coerce to `&str` here).
+            AppEvent::AgentOutput { project_id, .. } => Some(project_id),
         }
     }
 }

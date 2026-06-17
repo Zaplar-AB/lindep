@@ -265,6 +265,11 @@ pub struct App {
     /// Whether auto-resume is on (off under `--no-resume`, in `--demo`, tests).
     /// Gates the lazy resume-on-first-focus of docked agents.
     auto_resume: bool,
+    /// The session's standing resume *policy* (set once by [`Self::begin_resume`],
+    /// false under `--no-resume`). `auto_resume` is the live toggle; this is what a
+    /// project switch restores it to — without it, [`Self::activate_project`] would
+    /// re-enable resume after a switch and silently defeat `--no-resume`.
+    auto_resume_enabled: bool,
     /// Handle to the workspace (every project's fleet), when running with one
     /// (absent in `--demo`, snapshots and unit tests). Launch/cancel route through
     /// it by `(active_project, issue)`.
@@ -386,17 +391,9 @@ pub struct App {
 impl App {
     pub fn new(graph: Graph) -> Self {
         // Default selection: the most-connected real issue — usually the spine of
-        // the dependency web — so the cockpit opens somewhere interesting.
-        let root = graph
-            .keys()
-            .iter()
-            .filter(|k| graph.get(k).is_some_and(|i| !i.external))
-            .max_by_key(|k| {
-                graph.direct_count(k, Direction::Upstream)
-                    + graph.direct_count(k, Direction::Downstream)
-            })
-            .cloned()
-            .unwrap_or_default();
+        // the dependency web — so the cockpit opens somewhere interesting. Shares the
+        // one helper with the project-switch path so the two picks can't drift.
+        let root = most_connected_root(&graph);
 
         let mut windows = WindowSet::new();
         // Seed the transient context window at index 1 for the default selection,
@@ -438,6 +435,7 @@ impl App {
             resuming: HashMap::new(),
             resume_cap: 0,
             auto_resume: false,
+            auto_resume_enabled: false,
             workspace: None,
             active_project: String::new(),
             project_list: Vec::new(),
@@ -1167,7 +1165,10 @@ impl App {
         if let Some(workspace) = &self.workspace {
             workspace.activate(project.id.clone());
         }
-        self.auto_resume = true;
+        // Restore resume to the session's standing policy — NOT unconditionally on,
+        // which would silently re-enable auto-resume after a switch even under
+        // `--no-resume` (where the policy is off and resume_cap is 0).
+        self.auto_resume = self.auto_resume_enabled;
 
         self.set_footer(format!(
             "switched to {} · {} issues",
@@ -1402,6 +1403,16 @@ impl App {
             .cloned()
     }
 
+    /// The active project's capacity-gate load: agents that hold a genuinely-live
+    /// process. A terminal agent (Done/Failed/Stopped) whose EXITED card is still
+    /// windowed keeps a `self.backends` entry but is NOT live, so counting
+    /// `backends.len()` would falsely refuse a launch when nothing is actually
+    /// running. The supervisor's shared `live_count` stays the authoritative
+    /// workspace-wide enforcer; this is the cockpit's local pre-check.
+    fn live_agent_count(&self) -> usize {
+        self.fleet.values().filter(|s| s.is_live()).count()
+    }
+
     fn button(&mut self) {
         let Some(issue) = self.focused_issue() else {
             self.status_msg = Some("no issue selected".into());
@@ -1443,7 +1454,7 @@ impl App {
         // Capacity gate: the workspace caps concurrent agents (`max_concurrent`).
         // A refusal here is NOT a dependency block — say so plainly, or a full
         // fleet reads as a bogus dep block (RFC §6).
-        let load = self.backends.len() + self.resuming.len();
+        let load = self.live_agent_count() + self.resuming.len();
         if self.resume_cap > 0 && load >= self.resume_cap {
             self.set_footer(format!(
                 "fleet at capacity ({load}/{}) — finish or stop an agent first",
@@ -2202,6 +2213,10 @@ impl App {
     /// was-live set (never Done/Failed). Enables auto-resume for the session.
     pub fn begin_resume(&mut self, resumable: &HashSet<String>, cap: usize) {
         self.auto_resume = true;
+        // Record the policy so a later project switch restores resume to ON rather
+        // than fabricating it; under `--no-resume` begin_resume is never called, so
+        // this stays false and a switch leaves resume OFF.
+        self.auto_resume_enabled = true;
         self.resume_cap = cap;
         if self.workspace.is_none() {
             return;
@@ -2270,8 +2285,10 @@ impl App {
         // would emit a bare Notification (never an AgentSpawned), so the spinner
         // would burn its whole grace window for an agent that never comes up.
         // Leave it a docked card; the lazy path retries on the next focus once a
-        // live backend frees a slot. (live backends + in-flight resumes ≈ load.)
-        if self.resume_cap > 0 && self.backends.len() + self.resuming.len() >= self.resume_cap {
+        // live agent frees a slot. (live agents + in-flight resumes ≈ load — a
+        // terminal EXITED card holds a backend but no live process, so it must not
+        // count, or a project full of finished cards would never resume.)
+        if self.resume_cap > 0 && self.live_agent_count() + self.resuming.len() >= self.resume_cap {
             return;
         }
         let title = self
@@ -4663,14 +4680,14 @@ mod tests {
         press(&mut app, KeyCode::Enter); // open + focus ZAP-205's window
         assert!(
             app.apply_event(AppEvent::AgentOutput {
-                project_id: String::new(),
+                project_id: "".into(),
                 issue: "ZAP-205".into()
             }),
             "a visible agent's output forces a redraw"
         );
         // An agent with no window changes nothing visible.
         assert!(!app.apply_event(AppEvent::AgentOutput {
-            project_id: String::new(),
+            project_id: "".into(),
             issue: "ZAP-999".into()
         }));
     }
@@ -5283,7 +5300,8 @@ mod tests {
         a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
         a.active_project = "proj".into();
         a.resume_cap = 1; // a fleet ceiling of one…
-        register(&mut a, "ZAP-201"); // …already filled by one live backend
+        register(&mut a, "ZAP-201"); // …already filled by one genuinely-live agent
+        a.fleet.insert("ZAP-201".into(), AgentStatus::Running); // (backend + live status)
         a.aim_spine("ZAP-188".into()); // a READY issue, so this is NOT a dep block
         a.button();
         assert!(
@@ -5298,6 +5316,26 @@ mod tests {
         assert!(
             !msg.contains("blocked by"),
             "a capacity refusal must not read as a dependency block, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_exited_card_does_not_consume_fleet_capacity() {
+        // The capacity gate counts genuinely-live agents, not backend-map size. A
+        // finished agent whose EXITED card is still open keeps a `backends` entry but
+        // a terminal fleet status, so it must NOT fill the ceiling — otherwise a
+        // project full of finished cards could never launch again.
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.resume_cap = 1;
+        register(&mut a, "ZAP-201"); // a backend whose card is still up…
+        a.fleet.insert("ZAP-201".into(), AgentStatus::Done); // …but the agent finished
+        a.aim_spine("ZAP-188".into()); // a READY issue
+        a.button();
+        assert!(
+            a.pending_launch.contains("ZAP-188"),
+            "a terminal EXITED card must not count toward capacity"
         );
     }
 

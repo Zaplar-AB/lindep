@@ -217,10 +217,16 @@ impl Layout {
     /// set — a headless environment with no home, where the control plane stays
     /// off rather than scattering state into the filesystem root.
     pub fn from_env() -> Option<Self> {
-        if let Some(explicit) = std::env::var_os("LINDEP_HOME") {
+        // An exported-but-empty var (`export LINDEP_HOME=$UNSET`) yields `Some("")`,
+        // whose `PathBuf` is the empty *relative* path — rooting the whole control
+        // plane at the cwd. Treat empty as unset so it falls through to `HOME`, or to
+        // `None` (control plane off), matching the documented intent above.
+        if let Some(explicit) = std::env::var_os("LINDEP_HOME").filter(|v| !v.is_empty()) {
             return Some(Layout::new(PathBuf::from(explicit)));
         }
-        std::env::var_os("HOME").map(|home| Layout::new(PathBuf::from(home).join(".lindep")))
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(|home| Layout::new(PathBuf::from(home).join(".lindep")))
     }
 
     /// The `~/.lindep` root.
@@ -674,19 +680,48 @@ pub fn write_binding(
     }
 
     let out = doc.to_string();
-    if let Some(parent) = path.parent() {
+    let parent = path.parent();
+    if let Some(parent) = parent {
         std::fs::create_dir_all(parent).map_err(|source| RegistryError::Write {
             path: path.clone(),
             source,
         })?;
     }
+    // Write durably, matching `SessionStore::write_snapshot`: a process-unique sibling
+    // temp (so two lindep instances both onboarding can't collide on one fixed temp
+    // name and corrupt the user-global registry), fsync the temp, rename, then fsync
+    // the parent dir so the rename survives a crash.
     let mut tmp = path.clone();
-    tmp.set_file_name("registry.toml.tmp");
-    std::fs::write(&tmp, &out).map_err(|source| RegistryError::Write {
-        path: tmp.clone(),
-        source,
+    tmp.set_file_name(format!("registry.toml.tmp.{}", std::process::id()));
+    let write_tmp = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(out.as_bytes())?;
+        f.sync_all()
+    };
+    write_tmp().map_err(|source| {
+        let _ = std::fs::remove_file(&tmp);
+        RegistryError::Write {
+            path: tmp.clone(),
+            source,
+        }
     })?;
-    std::fs::rename(&tmp, &path).map_err(|source| RegistryError::Write { path, source })
+    std::fs::rename(&tmp, &path).map_err(|source| {
+        let _ = std::fs::remove_file(&tmp);
+        RegistryError::Write {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    if let Some(parent) = parent {
+        std::fs::File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(|source| RegistryError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+    }
+    Ok(())
 }
 
 /// Parse the registry document: repos first (so projects can cross-reference
@@ -733,6 +768,16 @@ fn parse_registry(
                         ));
                         continue;
                     }
+                    // A handle is the stable identity for the shared mirror; a second
+                    // `[[repo]]` claiming it is a user error, not a silent last-wins.
+                    if repos.contains_key(&repo.handle) {
+                        warnings.push(format!(
+                            "registry {}: repo handle `{}` is declared more than once; keeping the first",
+                            path.display(),
+                            repo.handle
+                        ));
+                        continue;
+                    }
                     repos.insert(repo.handle.clone(), repo);
                 }
                 Err(msg) => warnings.push(format!(
@@ -753,6 +798,12 @@ fn parse_registry(
     }
 
     // ── [[project]] ───────────────────────────────────────────────────────────
+    // Every on-disk path (`state.json`, `ledger.json`, worktrees, repos) is derived
+    // purely from `project_dir(handle)`, so two projects sharing a handle would
+    // collapse into one world and silently clobber each other's session state and
+    // checkouts. Enforce the documented handle-uniqueness invariant (the carry-over
+    // of v1.5's repo-root collision guard) here, warn-and-skip on a collision.
+    let mut seen_handles: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (index, raw) in array_of(&doc, "project", path, warnings)
         .into_iter()
         .enumerate()
@@ -774,6 +825,15 @@ fn parse_registry(
         };
         match entry.into_descriptor(&repos, path, warnings) {
             Some(p) => {
+                if !seen_handles.insert(p.handle.clone()) {
+                    warnings.push(format!(
+                        "registry {}: project `{}` reuses on-disk handle `{}` already claimed by another project; skipping",
+                        path.display(),
+                        p.project_id,
+                        p.handle
+                    ));
+                    continue;
+                }
                 projects.insert(p.project_id.clone(), p);
             }
             None => continue, // a warning was already pushed
@@ -827,6 +887,17 @@ impl RepoFile {
                 "repo `{}` has neither `remote` nor `local`",
                 self.handle
             ));
+        }
+        // The source is fed to `git clone` as a positional argument. We pass it after
+        // a `--` separator (see `mirror::ensure_*`), so a leading `-` can't be parsed
+        // as an option — but reject one here too (mirroring `is_safe_handle`) and the
+        // arbitrary-command `ext::`/`fd::` transports, which lindep never legitimately
+        // clones from. Standard URLs and local paths pass untouched.
+        if let Some(r) = &remote {
+            let r = r.trim();
+            if r.starts_with('-') || r.starts_with("ext::") || r.starts_with("fd::") {
+                return Err(format!("repo `{}` has an unsafe `remote`", self.handle));
+            }
         }
         Ok(RepoEntry {
             handle: self.handle,
@@ -948,13 +1019,34 @@ impl ProjectFile {
                 persist: sf.persist,
             });
         }
+        // A branch prefix is interpolated raw into `<prefix>/<issue>` git refs at
+        // launch; an invalid one (a space, `~`, a leading `/`) would fail every
+        // worktree create. The wizard already gates this, but a hand-edited registry
+        // can bypass it — so drop an invalid prefix with a warning and fall back to
+        // the default, rather than letting it brick the project at launch.
+        let branch_prefix = self
+            .branch_prefix
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| {
+                if crate::worktree::is_valid_branch_prefix(s.trim()) {
+                    Some(s)
+                } else {
+                    warnings.push(format!(
+                        "registry {}: project `{}` branch_prefix `{}` is not a valid git ref segment; using the default",
+                        here(),
+                        self.id,
+                        s
+                    ));
+                    None
+                }
+            });
         Some(ProjectDescriptor {
             project_id: self.id,
             handle: self.handle,
             name: self.name,
             candidates,
             primary: self.primary,
-            branch_prefix: self.branch_prefix.filter(|s| !s.trim().is_empty()),
+            branch_prefix,
             scratch,
         })
     }
@@ -1031,6 +1123,129 @@ mod tests {
         assert_eq!(proj.candidates, vec!["lindep", "shared-proto"]);
         assert_eq!(proj.branch_prefix.as_deref(), Some("felix"));
         assert_eq!(reg.candidate_repos("p1").len(), 2);
+    }
+
+    #[test]
+    fn a_duplicate_repo_handle_is_warned_and_first_wins() {
+        let root = temp_root("duprepo");
+        let layout = write_registry(
+            &root,
+            r#"
+            [[repo]]
+            handle = "api"
+            remote = "git@github.com:zaplar/api"
+
+            [[repo]]
+            handle = "api"
+            remote = "git@github.com:zaplar/other"
+
+            [[project]]
+            id = "p1"
+            handle = "proj"
+            primary = "api"
+            "#,
+        );
+        let (reg, warnings) = Registry::load_at(layout);
+        assert_eq!(
+            reg.repo("api").unwrap().remote.as_deref(),
+            Some("git@github.com:zaplar/api"),
+            "the first definition is kept"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("declared more than once")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn two_projects_sharing_an_on_disk_handle_drop_the_second() {
+        let root = temp_root("duphandle");
+        let layout = write_registry(
+            &root,
+            r#"
+            [[repo]]
+            handle = "api"
+            remote = "git@github.com:zaplar/api"
+
+            [[project]]
+            id = "p1"
+            handle = "shared"
+            primary = "api"
+
+            [[project]]
+            id = "p2"
+            handle = "shared"
+            primary = "api"
+            "#,
+        );
+        let (reg, warnings) = Registry::load_at(layout);
+        assert!(reg.project("p1").is_ok(), "the first project loads");
+        assert!(
+            reg.project("p2").is_err(),
+            "the second, colliding on the on-disk handle, is skipped"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("reuses on-disk handle")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_branch_prefix_is_dropped_and_falls_back_to_default() {
+        let root = temp_root("badprefix");
+        let layout = write_registry(
+            &root,
+            r#"
+            [[repo]]
+            handle = "api"
+            remote = "git@github.com:zaplar/api"
+
+            [[project]]
+            id = "p1"
+            handle = "proj"
+            primary = "api"
+            branch_prefix = "bad prefix"
+            "#,
+        );
+        let (reg, warnings) = Registry::load_at(layout);
+        assert_eq!(
+            reg.project("p1").unwrap().branch_prefix,
+            None,
+            "a malformed prefix is dropped so launch uses the default"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("branch_prefix")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_repo_with_an_unsafe_remote_is_dropped() {
+        let root = temp_root("badremote");
+        let layout = write_registry(
+            &root,
+            r#"
+            [[repo]]
+            handle = "evil"
+            remote = "ext::sh -c id"
+
+            [[repo]]
+            handle = "api"
+            remote = "git@github.com:zaplar/api"
+
+            [[project]]
+            id = "p1"
+            handle = "proj"
+            primary = "api"
+            "#,
+        );
+        let (reg, warnings) = Registry::load_at(layout);
+        assert!(reg.repo("evil").is_none(), "the unsafe-remote repo is dropped");
+        assert!(reg.repo("api").is_some(), "the safe repo still loads");
+        assert!(
+            warnings.iter().any(|w| w.contains("unsafe `remote`")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
