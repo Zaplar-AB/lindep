@@ -16,7 +16,7 @@ use ratatui::widgets::{
 use tui_term::widget::PseudoTerminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Flash, LeftView};
+use crate::app::{App, Flash, Readiness, Sort};
 use crate::backend::Lifecycle;
 use crate::keymap::Action;
 use crate::layout;
@@ -437,62 +437,35 @@ fn window_block(
 
 // ── Spine (issue list / agents roster) ─────────────────────────────────────
 
-/// The Spine's tab strip — ISSUES | AGENTS, the active tab lit with its count.
-fn left_tabs_title(app: &App) -> Line<'static> {
-    let tab = |label: &str, count: usize, active: bool| {
-        let style = if active {
-            Style::new().fg(GREEN_100).bg(GREEN_700).bold()
-        } else {
-            Style::new().fg(MUTED)
-        };
-        Span::styled(format!(" {label} {count} "), style)
-    };
-    Line::from(vec![
-        tab("ISSUES", app.order.len(), app.left_view == LeftView::Issues),
-        Span::raw(" "),
-        tab("AGENTS", app.fleet.len(), app.left_view == LeftView::Agents),
-    ])
+/// The Spine's title — the issue list, lit with its count. (v1.7 folded the
+/// agents roster into the readiness bands, so there's no longer an AGENTS tab.)
+fn spine_title(app: &App) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(" ISSUES {} ", app.order.len()),
+        Style::new().fg(GREEN_100).bg(GREEN_700).bold(),
+    ))
 }
 
 fn render_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bool) {
-    let block = window_block(left_tabs_title(app), focused, BORDER, false, app.frame);
+    let block = window_block(spine_title(app), focused, BORDER, false, app.frame);
 
-    match app.left_view {
-        LeftView::Issues => {
-            let items: Vec<ListItem> = app.order.iter().map(|k| issue_item(app, k)).collect();
-            let list = list_widget(items, block, focused);
-            frame.render_stateful_widget(list, area, &mut app.list_state);
+    if app.sort == Sort::Readiness {
+        // The readiness schedule: bands + a ready rail. Re-band first if an
+        // agent event left the order stale (the Readiness sort orders by fleet
+        // state, which events mutate without re-sorting) so the dividers stay
+        // contiguous and navigation matches the rows on screen.
+        if !app.order_is_banded() {
+            app.rebuild_order();
         }
-        LeftView::Agents => {
-            let agents = app.agent_order();
-            if agents.is_empty() {
-                let inner = block.inner(area);
-                frame.render_widget(block, area);
-                frame.render_widget(
-                    Paragraph::new(vec![
-                        Line::raw(""),
-                        Line::from(Span::styled(
-                            "  no agents running",
-                            Style::new().fg(MUTED).italic(),
-                        )),
-                        Line::from(Span::styled(
-                            "  Enter on an issue opens one",
-                            Style::new().fg(BORDER),
-                        )),
-                    ]),
-                    inner,
-                );
-                return;
-            }
-            // The roster highlight tracks the selection (the single source of
-            // truth), derived fresh — no second persistent selection to sync.
-            let selected = agents.iter().position(|k| *k == app.root);
-            let items: Vec<ListItem> = agents.iter().map(|k| issue_item(app, k)).collect();
-            let list = list_widget(items, block, focused);
-            let mut state = ListState::default();
-            state.select(selected);
-            frame.render_stateful_widget(list, area, &mut state);
-        }
+        render_banded_spine(app, frame, area, focused, block);
+    } else {
+        let items: Vec<ListItem> = app
+            .order
+            .iter()
+            .map(|k| issue_item(app, k, false, false))
+            .collect();
+        let list = list_widget(items, block, focused);
+        frame.render_stateful_widget(list, area, &mut app.list_state);
     }
 }
 
@@ -506,6 +479,81 @@ fn list_widget<'a>(items: Vec<ListItem<'a>>, block: Block<'a>, active: bool) -> 
         } else {
             theme::cursor_idle()
         })
+}
+
+/// The readiness-banded Issues spine (ENG-558): the existing list, the same
+/// single `order` Vec, with thin section dividers spliced between readiness
+/// bands. The dividers are non-selectable rows, so navigation still indexes
+/// `order` (issue keys only); we render through `app.banded_list_state`, whose
+/// selected index is offset by the dividers above the selection and whose scroll
+/// offset persists across frames. No new view, no new color hue: the only
+/// net-new visuals are these dividers and the `▸` ready rail in `issue_line`.
+fn render_banded_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bool, block: Block) {
+    // Divider content width = pane inner (− borders) − the always-on highlight
+    // gutter ("▸ " / "  "). A short rule just truncates; it never wraps.
+    let rule_width = area.width.saturating_sub(4);
+    let mut items: Vec<ListItem> = Vec::with_capacity(app.order.len() + 5);
+    let mut selected = None;
+    let mut prev_band: Option<Readiness> = None;
+    for key in &app.order {
+        let band = app.readiness(key);
+        if prev_band != Some(band) {
+            items.push(band_divider(band, rule_width));
+            prev_band = Some(band);
+        }
+        let selected_here = focused && *key == app.root;
+        if *key == app.root {
+            selected = Some(items.len());
+        }
+        items.push(issue_item(
+            app,
+            key,
+            band == Readiness::Ready,
+            selected_here,
+        ));
+    }
+    let list = list_widget(items, block, focused);
+    // Persistent state: the scroll offset survives between frames (natural
+    // scrolling), unlike a fresh `ListState` which would re-pin every draw.
+    app.banded_list_state.select(selected);
+    frame.render_stateful_widget(list, area, &mut app.banded_list_state);
+}
+
+/// A thin section header between readiness bands. Reuses each band's *existing*
+/// accent (no new hue): the glyph + label carry the colour, a dim rule fills the
+/// row. The READY header gets a right-aligned `dispatch` hint; DONE dims.
+fn band_divider<'a>(band: Readiness, rule_width: u16) -> ListItem<'a> {
+    let (glyph, label, accent) = match band {
+        Readiness::NeedsYou => ("⚑", "NEEDS YOU", AMBER_400),
+        Readiness::Running => ("▶", "RUNNING", ORANGE_400),
+        Readiness::Ready => ("▸", "READY", INK),
+        Readiness::Blocked => ("⊘", "BLOCKED", AMBER_400),
+        Readiness::Done => ("✓", "DONE", MUTED),
+    };
+    let head = format!("{glyph} {label} ");
+    let hint = if matches!(band, Readiness::Ready) {
+        "  dispatch "
+    } else {
+        ""
+    };
+    let rule_len =
+        (rule_width as usize).saturating_sub(head.chars().count() + hint.chars().count());
+    let dim = if matches!(band, Readiness::Done) {
+        Modifier::DIM
+    } else {
+        Modifier::empty()
+    };
+    let mut spans = vec![
+        Span::styled(head, Style::new().fg(accent).bold().add_modifier(dim)),
+        Span::styled(
+            "─".repeat(rule_len),
+            Style::new().fg(BORDER).add_modifier(dim),
+        ),
+    ];
+    if !hint.is_empty() {
+        spans.push(Span::styled(hint, Style::new().fg(MUTED)));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 // ── Agent windows (live PTY screens) ────────────────────────────────────────
@@ -588,8 +636,14 @@ fn render_agent_window(
     // final screen. Keyed by WindowId so zoom's two geometries don't collide.
     let size = (pane.height, pane.width);
     if !exited && app.preview_size.get(&id) != Some(&size) {
-        let _ = backend.resize(pane.height, pane.width);
-        app.preview_size.insert(id, size);
+        // Only record the size once the resize actually took. Recording it on a
+        // failed resize would make the `!= size` guard skip every retry, leaving our
+        // render half at the new geometry while claude's PTY stays at the old one —
+        // the exact divergence backend::resize warns about. A failure here leaves
+        // preview_size stale so the next frame retries at the correct geometry.
+        if backend.resize(pane.height, pane.width).is_ok() {
+            app.preview_size.insert(id, size);
+        }
     }
     if let Ok(parser) = backend.parser().read() {
         frame.render_widget(PseudoTerminal::new(parser.screen()), pane);
@@ -768,7 +822,11 @@ fn render_fleet_window(app: &mut App, frame: &mut Frame, rect: Rect, focused: bo
             };
             let mut spans = vec![Span::styled(label, Style::new().fg(GREEN_400).bold())];
             for key in chunk {
-                let (glyph, color) = status_for(g, key);
+                // Keep the workflow-state glyph shape, but tint it by readiness
+                // (ENG-560) so the map reads "what can I dispatch," consistent
+                // with the spine bands — a pure recolour, no new hue.
+                let (glyph, _) = status_for(g, key);
+                let color = readiness_tint(app.readiness(key));
                 let key_style = if *key == app.root {
                     root_line = Some(lines.len());
                     Style::new().fg(GREEN_100).bg(GREEN_700).bold()
@@ -915,28 +973,16 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
         " type to filter · ⏎ accept · esc clear".to_string()
     } else if app.kill_confirm.is_some() {
         " y / ⏎ confirm kill · any other key cancels".to_string()
-    } else if app.command_mode {
-        format!(
-            " ⌘ COMMAND: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} rail/mosaic · esc or {p} exits",
-            vk(Action::ContextToggle),
-            vk(Action::ZoomToggle),
-            vk(Action::PinWindow),
-            vk(Action::CloseWindow),
-            vk(Action::KillWindow),
-            vk(Action::LayoutToggle),
-        )
     } else if app.prefix_armed {
         format!(
-            " {p} armed: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} rail/mosaic · {} command · {} quit · {} help · {p} again → agent",
+            " {p} armed: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} rail/mosaic · {} quit · {p} again → agent",
             vk(Action::ContextToggle),
             vk(Action::ZoomToggle),
             vk(Action::PinWindow),
             vk(Action::CloseWindow),
             vk(Action::KillWindow),
             vk(Action::LayoutToggle),
-            vk(Action::CommandMode),
             vk(Action::Quit),
-            vk(Action::ToggleHelp),
         )
     } else {
         match app.windows.focused_kind() {
@@ -967,10 +1013,9 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
                 dk(Action::ToggleHelp),
             ),
             WindowKind::Spine => format!(
-                " ↑↓ move · ⏎ open agent · {} deps · {} map · {} roster · {} needs-you · {} find · {} summary · {} ledger · {p} {} quit · {} help",
+                " ↑↓ move · ⏎ open agent · {} deps · {} map · {} needs-you · {} find · {} summary · {} ledger · {p} {} quit · {} help",
                 dk(Action::OpenDeps),
                 dk(Action::OpenFleet),
-                dk(Action::ToggleRoster),
                 dk(Action::JumpNeedsYou),
                 dk(Action::StartSearch),
                 dk(Action::ToggleSummary),
@@ -1012,10 +1057,6 @@ fn render_help(app: &App, frame: &mut Frame) {
         (
             direct(Action::OpenFleet),
             "open the project overview (Fleet) tab",
-        ),
-        (
-            direct(Action::ToggleRoster),
-            "flip the spine: issues ↔ agents roster",
         ),
         (
             direct(Action::StartSearch),
@@ -1110,10 +1151,6 @@ fn render_help(app: &App, frame: &mut Frame) {
         (
             verb(Action::ReclaimMirrors),
             "reclaim disk: free unreferenced mirrors",
-        ),
-        (
-            verb(Action::CommandMode),
-            "command mode: verbs without re-pressing the prefix",
         ),
         (verb(Action::Quit), "quit the cockpit"),
     ];
@@ -1399,6 +1436,8 @@ fn issue_line<'a>(
     agent: Option<AgentStatus>,
     frame: u64,
     flash: Option<Flash>,
+    ready_band: bool,
+    selected_here: bool,
 ) -> Line<'a> {
     let Some(issue) = graph.get(key) else {
         return Line::from(key.to_string());
@@ -1416,12 +1455,23 @@ fn issue_line<'a>(
     // status glyph (`⚑◇` → `⚑ ◇`) and the status column stays aligned whether or
     // not an issue has an agent. The trailing space is fg-only styled, so it
     // shows nothing of its own — the whole-row tint (`agent_row_bg`) covers it.
-    let gutter = match agent {
-        Some(status) => {
-            let (mark, mstyle) = theme::agent_marker(status, frame);
-            Span::styled(format!("{mark} "), mstyle)
+    let gutter = if ready_band {
+        // READY band owns the gutter: the dispatch rail (bright `▸`, no hue —
+        // racing green is reserved for the agent/selection). It shows even when a
+        // *terminal* agent reverted the issue to Ready, so the row never displays
+        // that dead agent's marker (e.g. a green `✓`) and contradict its band.
+        // Blank on the focused-selected row, where the list's own `▸ ` highlight
+        // cursor already draws the arrow (no doubled `▸ ▸`).
+        if selected_here {
+            Span::raw("  ")
+        } else {
+            Span::styled("▸ ", Style::new().fg(INK).bold())
         }
-        None => Span::raw("  "),
+    } else if let Some(status) = agent {
+        let (mark, mstyle) = theme::agent_marker(status, frame);
+        Span::styled(format!("{mark} "), mstyle)
+    } else {
+        Span::raw("  ")
     };
     // A resolved issue's key + title dim; the status glyph stays bright as the
     // scannable "done" marker.
@@ -1454,16 +1504,27 @@ fn issue_line<'a>(
 
 /// One issue row as a list item, carrying the whole-row status tint on the
 /// *item* style (so it spans the full row including the highlight gutter).
-fn issue_item<'a>(app: &App, key: &str) -> ListItem<'a> {
+fn issue_item<'a>(app: &App, key: &str, ready_band: bool, selected_here: bool) -> ListItem<'a> {
     let flash = app
         .flash
         .get(key)
         .and_then(|&(kind, until)| (app.frame < until).then_some(kind));
     let status = app.fleet.get(key).copied();
-    let item = ListItem::new(issue_line(&app.graph, key, status, app.frame, flash));
+    let item = ListItem::new(issue_line(
+        &app.graph,
+        key,
+        status,
+        app.frame,
+        flash,
+        ready_band,
+        selected_here,
+    ));
+    // A READY-band row is the dispatch launchpad: no agent row tint — a terminal
+    // agent that reverted to Ready must not paint a stale (possibly green)
+    // background under the rail. (The selected row's highlight bg covers it anyway.)
     match status {
-        Some(s) => item.style(Style::new().bg(theme::agent_row_bg(s, app.frame))),
-        None => item,
+        Some(s) if !ready_band => item.style(Style::new().bg(theme::agent_row_bg(s, app.frame))),
+        _ => item,
     }
 }
 
@@ -1557,6 +1618,23 @@ fn status_for(graph: &Graph, key: &str) -> (&'static str, ratatui::style::Color)
     }
 }
 
+/// Node tint for the readiness-colored Fleet overview (ENG-560): the classifier,
+/// not the raw workflow status, drives the colour — reusing the existing hue
+/// vocabulary, never a new one. Ready is bright `INK`, **never green** (the
+/// theme house rule reserves green for the agent / selection — and raw
+/// `status_glyph` painted "Started" issues green, which this corrects); Blocked
+/// keeps the amber of its `⊘`; Done recedes to `MUTED`. NeedsYou / Running match
+/// their agent-marker hues so the map and the spine bands read the same.
+fn readiness_tint(r: Readiness) -> Color {
+    match r {
+        Readiness::NeedsYou => AMBER_400,
+        Readiness::Running => ORANGE_400,
+        Readiness::Ready => INK,
+        Readiness::Blocked => AMBER_400,
+        Readiness::Done => MUTED,
+    }
+}
+
 fn status_label(status: Status) -> &'static str {
     match status {
         Status::Triage => "Triage",
@@ -1612,5 +1690,73 @@ mod tests {
     fn truncate_respects_a_width_budget() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 5), "hell…");
+    }
+
+    #[test]
+    fn the_fleet_recolor_reuses_hues_and_never_paints_ready_green() {
+        // ENG-560: node tints come from the readiness classifier, not the raw
+        // workflow status, reusing the existing hue vocabulary.
+        assert_eq!(readiness_tint(Readiness::NeedsYou), AMBER_400);
+        assert_eq!(readiness_tint(Readiness::Running), ORANGE_400);
+        assert_eq!(readiness_tint(Readiness::Ready), INK);
+        assert_eq!(readiness_tint(Readiness::Blocked), AMBER_400);
+        assert_eq!(readiness_tint(Readiness::Done), MUTED);
+        // Load-bearing house rule: green is reserved for the agent / selection,
+        // so no readiness band may be painted green (raw `status_glyph` made
+        // "Started" issues status-green — this is exactly what 560 corrects).
+        for r in [
+            Readiness::NeedsYou,
+            Readiness::Running,
+            Readiness::Ready,
+            Readiness::Blocked,
+            Readiness::Done,
+        ] {
+            assert_ne!(
+                readiness_tint(r),
+                GREEN_400,
+                "{r:?} must not be racing green"
+            );
+            assert_ne!(
+                readiness_tint(r),
+                STATUS_400,
+                "{r:?} must not be status green"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_band_row_shows_the_rail_not_a_terminal_agent_marker() {
+        // Review regression: a terminal (Done) agent reverts its issue to the
+        // READY band; the gutter must be the bright ▸ rail, never the agent's ✓
+        // (which is green) — the row must never contradict its own band header.
+        use crate::model::{Issue, Priority, Status};
+        let mut g = Graph::new("t");
+        g.add_issue(Issue {
+            key: "A".into(),
+            title: "a".into(),
+            status: Status::Unstarted,
+            priority: Priority::None,
+            assignee: None,
+            external: false,
+        });
+        g.finalize();
+        // ready_band = true, not the selected row, with a Done agent present.
+        let line = issue_line(&g, "A", Some(AgentStatus::Done), 0, None, true, false);
+        assert_eq!(
+            line.spans[0].content, "▸ ",
+            "a ready row shows the dispatch rail"
+        );
+        assert_eq!(
+            line.spans[0].style.fg,
+            Some(INK),
+            "the rail is INK — never the terminal agent's green ✓"
+        );
+        // On the focused-selected row the list's highlight cursor provides the
+        // arrow, so the gutter is blank (no doubled ▸ ▸).
+        let sel = issue_line(&g, "A", Some(AgentStatus::Done), 0, None, true, true);
+        assert_eq!(
+            sel.spans[0].content, "  ",
+            "selected ready row defers the arrow to the highlight cursor"
+        );
     }
 }

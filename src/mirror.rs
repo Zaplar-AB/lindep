@@ -161,6 +161,9 @@ fn ensure_mirror_locked(
             "clone",
             "--mirror",
             "--progress",
+            // `--` ends option parsing, so a `source` beginning with `-` (a forged or
+            // typo'd registry value) is treated as a URL/path, never a git option.
+            "--",
             source,
             &tmp.to_string_lossy(),
         ],
@@ -246,6 +249,10 @@ pub fn ensure_clone_with_progress(
             "clone",
             "--shared",
             "--progress",
+            // `--` for symmetry; the source here is an internal mirror path, not
+            // user input, but keeping both clone call-sites identical avoids a
+            // future edit reintroducing the gap on the user-facing one.
+            "--",
             &mirror.to_string_lossy(),
             &tmp.to_string_lossy(),
         ],

@@ -236,13 +236,16 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
         Err(_) => return,
     };
     let n_projects = candidates.len();
-    let resolved = candidates.into_iter().find(|(_, store)| {
-        store
-            .lock()
-            .map(|s| resolve_issue(payload, &s).is_some())
-            .unwrap_or(false)
+    // Resolve the owning issue ONCE here and carry it forward, rather than testing
+    // `is_some()` now and re-resolving under the second lock below: between the two
+    // locks a concurrent teardown (`forget`) could remove the record, so the re-resolve
+    // would return None and mislabel a real hook as "unmapped" even though we just
+    // identified its project. (Also halves the per-hook resolution work.)
+    let resolved = candidates.into_iter().find_map(|(project_id, store)| {
+        let issue = store.lock().ok().and_then(|s| resolve_issue(payload, &s))?;
+        Some((project_id, store, issue))
     });
-    let Some((project_id, store)) = resolved else {
+    let Some((project_id, store, resolved_issue)) = resolved else {
         // No project's store recognizes this session — surface one footer line
         // rather than dropping it silently (a forwarder/transport regression would
         // otherwise make every prompt vanish).
@@ -262,7 +265,10 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
     // rename never stalls another hook. A poisoned lock drops the hook.
     let (issue, snapshot, notif_needs_you, working) = match store.lock() {
         Ok(mut store) => {
-            let issue = resolve_issue(payload, &store);
+            // The issue resolved during owner identification above — reused rather than
+            // re-resolved, so a teardown racing between the two locks can't turn a
+            // recognised hook into an "unmapped" one.
+            let issue = Some(resolved_issue);
             let mut dirty = false;
 
             // Transcript path: kept as a path, never inlined. Accept it only if
@@ -533,16 +539,29 @@ fn sanitize_transcript_path(transcript: &str, worktree: &Path) -> Option<PathBuf
     path.starts_with(worktree).then(|| path.to_path_buf())
 }
 
+/// Whether `c` is a Unicode bidirectional or format control that could reorder
+/// displayed text without being a C0/C1 control. Covers LRM/RLM/ALM, the embedding/
+/// override pair (LRE…RLO), and the directional isolates (LRI…PDI) — the Trojan-Source
+/// character set. These are category Cf, which [`char::is_control`] does not match.
+fn is_bidi_or_format(c: char) -> bool {
+    matches!(c,
+        '\u{200E}' | '\u{200F}' | '\u{061C}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2066}'..='\u{2069}')
+}
+
 /// Clamp a hook-derived display string for the footer: strip control/escape
 /// bytes (the hook body is untrusted, locally-forgeable text) and truncate to a
 /// sane length so a runaway or adversarial message can't bloat the status line.
 /// Truncates on a char boundary, never mid-codepoint.
 fn clamp_display(s: &str) -> String {
-    // Drop C0/C1 controls (incl. ESC, CR, LF, TAB) so nothing reaches the
-    // terminal that could disturb the footer's single line, and keep at most
-    // MAX_DISPLAY chars (truncating on a char boundary, never mid-codepoint).
+    // Drop C0/C1 controls (incl. ESC, CR, LF, TAB) AND the Unicode bidi/format
+    // controls (RLO/LRO, the directional isolates, LRM/RLM) — `char::is_control`
+    // only covers category Cc, so without this a Trojan-Source-style override could
+    // reorder the displayed footer even though the single-line invariant holds. Keep
+    // at most MAX_DISPLAY chars (truncating on a char boundary, never mid-codepoint).
     s.chars()
-        .filter(|ch| !ch.is_control())
+        .filter(|ch| !ch.is_control() && !is_bidi_or_format(*ch))
         .take(MAX_DISPLAY)
         .collect()
 }
@@ -885,12 +904,22 @@ fn spawn_auto_push(
         })
         .await;
         // The commit happened regardless of the push outcome: always show the
-        // passive indicator; add a footer only when the push itself was rejected.
-        if let Ok(Err(e)) = &push {
-            let _ = events.send(AppEvent::Notification(format!(
-                "{issue}: auto-push failed: {}",
-                clamp_display(&e.to_string())
-            )));
+        // passive indicator; add a footer when the push itself was rejected OR the
+        // push task panicked. Surfacing the panic (like `session::persist_snapshot`
+        // does) keeps a push that never ran from masquerading as a clean success.
+        match &push {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = events.send(AppEvent::Notification(format!(
+                    "{issue}: auto-push failed: {}",
+                    clamp_display(&e.to_string())
+                )));
+            }
+            Err(join) => {
+                let _ = events.send(AppEvent::Notification(format!(
+                    "{issue}: auto-push task aborted: {join}"
+                )));
+            }
         }
         let _ = events.send(AppEvent::AgentCommitted {
             project_id,
@@ -1129,6 +1158,9 @@ mod tests {
     fn clamp_display_strips_controls_and_truncates() {
         // Embedded ESC / CR / LF are dropped, the rest preserved in order.
         assert_eq!(clamp_display("ok\x1b[2J\rhi\n!"), "ok[2Jhi!");
+        // Unicode bidi/format controls (RLO, the isolates) are dropped too — they
+        // aren't C0/C1 controls, so without the Cf filter they'd reorder the footer.
+        assert_eq!(clamp_display("a\u{202E}b\u{2066}c"), "abc");
         // Over-long input is cut to MAX_DISPLAY chars.
         let long = "x".repeat(MAX_DISPLAY * 3);
         assert_eq!(clamp_display(&long).chars().count(), MAX_DISPLAY);

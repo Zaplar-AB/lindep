@@ -99,24 +99,6 @@ impl AgentStatus {
             AgentStatus::Spawning | AgentStatus::Running | AgentStatus::NeedsYou
         )
     }
-
-    /// Ordering rank for the agents roster — lower sorts first. needs-you leads
-    /// (it's the one that must be acted on), then live work (running, then the
-    /// brief spawning), then idle, then the terminal states — a crash (Failed)
-    /// ahead of a clean stop/finish so a failure stays visible at the top of the
-    /// dead pile. Ranks 0–2 are exactly the [`AgentStatus::is_animating`] set, so
-    /// the roster's "live work floats up" order tracks what visibly moves.
-    pub const fn salience_rank(self) -> u8 {
-        match self {
-            AgentStatus::NeedsYou => 0,
-            AgentStatus::Running => 1,
-            AgentStatus::Spawning => 2,
-            AgentStatus::Idle => 3,
-            AgentStatus::Failed => 4,
-            AgentStatus::Stopped => 5,
-            AgentStatus::Done => 6,
-        }
-    }
 }
 
 /// What one `[[scratch]]` resource (ENG-561) materialised for an issue — enough to
@@ -604,10 +586,21 @@ impl SessionStore {
                 source,
             }
         })?;
+        // Advance the gate the instant the rename publishes our content — NOT after
+        // the parent fsync below. `*highest` tracks "newest content visible at this
+        // path", established by the rename; visibility to a concurrent writer doesn't
+        // wait on the durability fsync. If we deferred this past a failing parent
+        // fsync, a later-arriving OLDER write would see `seq < *highest` as false (the
+        // mark never advanced) and clobber the newer file we just published — the very
+        // revert the gate exists to prevent. The rename-failure branch above must NOT
+        // advance it: nothing was published there.
+        *highest = seq;
 
         // fsync the parent directory so the rename itself is durable — otherwise a
         // power loss after the data flush can still roll the rename back, silently
-        // reverting a committed status change.
+        // reverting a committed status change. A failure here still surfaces as Err
+        // (the caller footers it), but the gate is already advanced so an out-of-order
+        // older write can't revert the published state.
         if let Some(parent) = parent {
             File::open(parent)
                 .and_then(|d| d.sync_all())
@@ -616,7 +609,6 @@ impl SessionStore {
                     source,
                 })?;
         }
-        *highest = seq;
         Ok(())
     }
 }

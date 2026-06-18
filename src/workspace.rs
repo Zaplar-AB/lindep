@@ -167,15 +167,26 @@ pub fn reconcile_and_rehydrate(
         }
     }
 
-    let live: Vec<String> = worktree
-        .list()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|w| w.issue)
-        .collect();
-    if let Ok(mut store) = store.lock() {
-        store.reconcile(live);
-        let _ = store.save();
+    // Prune-down only when the live set was actually OBSERVED. `list()` fails on a
+    // transient error (a stale `index.lock`/worktree lock held by a concurrent git op,
+    // a not-yet-pruned repo) — and `unwrap_or_default()` would turn that into an empty
+    // live set, so `reconcile([])` would prune EVERY session and `save()` would persist
+    // the wipe, destroying the durable conversation index over a recoverable read error
+    // (the inverse of warn-never-abort). On Err we skip the prune entirely, leaving the
+    // store intact, and still run the downgrade pass below.
+    match worktree.list() {
+        Ok(worktrees) => {
+            let live: Vec<String> = worktrees.into_iter().map(|w| w.issue).collect();
+            if let Ok(mut store) = store.lock() {
+                store.reconcile(live);
+                let _ = store.save();
+            }
+        }
+        Err(e) => {
+            let _ = events.send(AppEvent::Notification(format!(
+                "reconcile {project_id}: worktree list failed, keeping all sessions ({e})"
+            )));
+        }
     }
     let mut resumable = HashSet::new();
     if let Ok(store) = store.lock() {
@@ -626,6 +637,13 @@ pub async fn build_plane(
             }
             Err(_) => {
                 close_stderr_meter();
+                // The blocking provision task panicked. Surface it like the clone-error
+                // arm, or the user-initiated switch/launch returns None and the cockpit
+                // just silently does nothing (the docstring promises a footer line).
+                let _ = builder.events.send(AppEvent::Notification(format!(
+                    "project {}: provisioning task crashed",
+                    descriptor.name
+                )));
                 return None;
             }
         }
@@ -657,7 +675,13 @@ pub async fn build_plane(
             )));
             SessionStore::empty(state_path).for_project(&descriptor.project_id)
         }
-        Err(_) => return None,
+        Err(_) => {
+            let _ = builder.events.send(AppEvent::Notification(format!(
+                "project {}: session-state task crashed",
+                descriptor.name
+            )));
+            return None;
+        }
     };
     let store = Arc::new(Mutex::new(store));
     // Register the store so the notification bus and the global view can find this
@@ -675,11 +699,18 @@ pub async fn build_plane(
         let store = Arc::clone(&store);
         let events = builder.events.clone();
         let project_id = descriptor.project_id.clone();
+        let events_for_panic = builder.events.clone();
+        let name = descriptor.name.clone();
         tokio::task::spawn_blocking(move || {
             reconcile_and_rehydrate(&worktree, &provision, &store, &events, &project_id)
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|_| {
+            let _ = events_for_panic.send(AppEvent::Notification(format!(
+                "project {name}: reconcile task crashed"
+            )));
+            HashSet::new()
+        })
     };
 
     let hooks_dir = layout.hooks_dir(&project_handle);
@@ -858,6 +889,16 @@ impl Workspace {
         (WorkspaceHandle { cmd_tx }, join)
     }
 
+    // The command loop is a single serial task. A `Launch`/`Activate` of a not-yet-
+    // built project `.await`s `ensure_plane` → `build_plane`, which can run a slow
+    // first-time `git clone --mirror` (hundreds of MB) — so a command sent during a
+    // cold first-clone (including `Cancel` of another project, or `Shutdown`) waits
+    // behind it. This is bounded, not a hang: the clone runs on the blocking pool so
+    // the runtime/render loop/hook server stay responsive, and `ControlPlaneGuard::
+    // shutdown` caps the quit wait with `SHUTDOWN_GRACE`. Decoupling the build onto a
+    // spawned task would keep the loop draining other commands, but adds per-project
+    // "building" dedup + deferred-launch state — only worth it if this latency is
+    // observed to matter.
     async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<WorkspaceCommand>) {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {

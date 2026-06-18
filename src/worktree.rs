@@ -570,6 +570,37 @@ pub fn validate_issue_id(issue: &str) -> Result<(), WorktreeError> {
     }
 }
 
+/// Whether `prefix` is safe as the leading segment(s) of a branch ref
+/// `<prefix>/<issue>` (the form [`WorktreeManager::branch_name`] builds). Replicates
+/// the `git check-ref-format` rules that bear on a prefix: non-empty, no whitespace
+/// or control char, none of the ref metacharacters `~^:?*[\`, no `..` or `@{`, no
+/// leading/trailing `/`, no empty `//` segment, and no segment that starts with `.`
+/// or ends in `.` / `.lock`. The issue id appended after it is already constrained
+/// by [`validate_issue_id`], so a valid prefix guarantees a valid ref. `pub` so the
+/// onboarding wizard and the registry loader gate the same value the same way —
+/// otherwise a bad prefix (a space, `~`, a leading `/`) would be accepted and then
+/// fail `git worktree add -b` for *every* issue in the project, bricking it silently
+/// at first launch.
+pub fn is_valid_branch_prefix(prefix: &str) -> bool {
+    if prefix.is_empty()
+        || prefix.starts_with('/')
+        || prefix.ends_with('/')
+        || prefix.contains("..")
+        || prefix.contains("@{")
+    {
+        return false;
+    }
+    if prefix.chars().any(|c| {
+        c.is_whitespace() || c.is_control() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    }) {
+        return false;
+    }
+    // Each `/`-separated segment must be a valid ref component.
+    prefix.split('/').all(|seg| {
+        !seg.is_empty() && !seg.starts_with('.') && !seg.ends_with('.') && !seg.ends_with(".lock")
+    })
+}
+
 /// Generate the `WORKSPACE.md` an agent reads at the root of a multi-repo issue's
 /// workspace (its cwd, `worktrees/<ISSUE>`), telling it which repos are checked out
 /// as sibling subdirectories and how to operate across them. Written before the
@@ -743,6 +774,22 @@ mod tests {
                 ),
                 "{bad:?} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn valid_branch_prefix_accepts_real_namespaces_and_rejects_bad_refs() {
+        for ok in ["felix", "lindep", "team/felix", "a-b_c", "user.name"] {
+            assert!(is_valid_branch_prefix(ok), "{ok:?} should be accepted");
+        }
+        // A space, the ref metacharacters, `..`/`@{`, leading/trailing `/`, an empty
+        // `//` segment, and a segment starting `.` / ending `.`/`.lock` would each make
+        // `git worktree add -b <prefix>/<issue>` reject the ref for every issue.
+        for bad in [
+            "", "has space", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "a..b",
+            "a@{b", "/lead", "trail/", "a//b", ".hidden", "ends.", "x.lock",
+        ] {
+            assert!(!is_valid_branch_prefix(bad), "{bad:?} should be rejected");
         }
     }
 

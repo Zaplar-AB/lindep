@@ -50,9 +50,13 @@ a `Bearer` OAuth token).
 
 ## How it reads
 
-The **spine** — the permanent left column — lists every issue in the project,
-sorted **ready-first** by default — unblocked, ready-to-start work on top (press
-<kbd>s</kbd> to re-sort). Press <kbd>d</kbd> to open a **dependency window**: a
+The **spine** — the permanent left column — lists every issue in the project as a
+**readiness schedule**: one scroll banded top→bottom **NEEDS-YOU · RUNNING ·
+READY · BLOCKED · DONE**, so "what should I look at right now" is always at the
+top and the dispatchable work — the **READY** lane, marked with a `▸` rail — reads
+at a glance. Within each band, highest-downstream-impact first (then priority).
+Press <kbd>r</kbd> to toggle to plain id order. Press <kbd>d</kbd> to open a
+**dependency window**: a
 **lens** on the selected issue:
 
 - **Upstream** — its blockers, transitively. What must finish first.
@@ -77,10 +81,10 @@ When the **spine** is focused:
 | <kbd>d</kbd> | open a dependency window for the selection |
 | <kbd>g</kbd> | open the layered top-down overview (Fleet) window |
 | <kbd>/</kbd> | fuzzy-find issues by id or title |
-| <kbd>f</kbd> | filter: all / blocked / has-deps |
-| <kbd>s</kbd> | sort: ready / blocked / status / priority / id |
+| <kbd>f</kbd> | filter: all / has-deps |
+| <kbd>r</kbd> | sort: readiness schedule / id |
 | <kbd>c</kbd> | jump through issues that sit on a cycle |
-| <kbd>r</kbd> | flip the spine: issue list ↔ agents roster |
+| <kbd>n</kbd> | jump to the next issue whose agent needs you |
 | <kbd>i</kbd> | summary card for the selected issue (details + deps) |
 | <kbd>t</kbd> | agent run ledger for the selected issue (its session history) |
 | <kbd>?</kbd> | help (quit is <kbd>Ctrl-A</kbd> <kbd>q</kbd> — see the cockpit, below) |
@@ -98,6 +102,7 @@ Window management (focus, zoom, pin, close, layout) lives behind the
 
 - Status: `●` done · `◐` in progress · `○` todo/backlog · `◇` triage · `⊘` canceled
 - Priority: `▲` urgent · `△` high · `◦` medium · `▽` low
+- `▸` (left rail) ready to dispatch — unblocked, unresolved, no live agent
 - `⊘` blocked (an unresolved blocker) · `↺` on a dependency cycle
 - `⇗ … [ext]` a cross-project blocker, shown as a terminal leaf
 - `↺ … back-edge` where a tree would loop; `↗ shown above` where a node re-appears
@@ -116,8 +121,8 @@ yet and lindep walks you through connecting it to a repo (see
 read-only graph viewer.
 
 The cockpit is a **tiling window manager**: a horizontal strip of focusable
-columns — the permanent **spine** (issue list / agents roster), live **agent**
-PTYs (one per issue), and **dependency** windows. The focused window takes every
+columns — the permanent **spine** (the readiness-banded issue schedule), live
+**agent** PTYs (one per issue), and **dependency** windows. The focused window takes every
 keystroke; **`Ctrl-A` is the prefix** that escapes to window commands (press it
 twice to send a literal `Ctrl-A` through to the agent).
 
@@ -139,16 +144,20 @@ twice to send a literal `Ctrl-A` through to the agent).
 | <kbd>Ctrl-A</kbd> <kbd>m</kbd> | Reclaim disk — free unreferenced mirrors |
 | <kbd>Ctrl-A</kbd> <kbd>g</kbd> | Jump focus home to the spine |
 | <kbd>Ctrl-A</kbd> <kbd>q</kbd> | Quit the cockpit |
-| <kbd>n</kbd> | Jump to the next issue whose agent needs you |
-| <kbd>r</kbd> | Flip the spine: issue list ↔ agents roster |
+| <kbd>n</kbd> · <kbd>Ctrl-A</kbd> <kbd>n</kbd> | Jump to the next issue whose agent needs you (works from any focus) |
+| <kbd>r</kbd> · <kbd>f</kbd> | Cycle the spine sort (readiness / id) · filter (all / has-deps) |
 | <kbd>i</kbd> · <kbd>t</kbd> | Summary card · agent run ledger for the selected issue |
 
 Each issue **row** carries its agent's state two ways: a whole-row colour tint
-plus a marker in a fixed left gutter — `◌` spawning · `⠙` running (an animated spinner) · `⚑` needs you (the row
-breathes) · `◦` idle · `✓` done · `✗` failed; the header shows a fleet summary
-(`3 agents · 1 needs you`). The **agents roster** (`r`) is a salience-sorted tab
-on the spine — needs-you first, then live work, then idle, then finished — so
-triage is one glance.
+plus a marker in a fixed left gutter — `◌` spawning · `⠙` running (an animated
+spinner) · `⚑` needs you (the row breathes) · `◦` idle · `✓` done · `✗` failed;
+the header shows a fleet summary (`3 agents · 1 needs you`). Live agents float to
+the top **NEEDS-YOU** and **RUNNING** bands of the schedule, so the spine *is* the
+agents roster — there's no separate tab. **Dispatch** is just <kbd>Enter</kbd> on
+a **READY** row (it launches the agent); a **BLOCKED** row is refused with its
+blocker named, so you never launch work that can't progress. The Fleet overview
+(<kbd>g</kbd>) tints every node by the same readiness, so its READY lane reads as
+"what can I dispatch."
 
 Open as many **agent windows** as fit side by side and drive each live `claude`
 directly — the focused window gets every keystroke, so answering a prompt or
@@ -225,7 +234,7 @@ prefix = "ctrl-a"                  # the escape to window commands (default)
 [keys]
 deps = "D"                         # open a dependency window (default d)
 filter = ["f", "ctrl-f"]           # an action may take several keys
-sort = "s"
+sort = "s"                         # cycle the spine sort (default r)
 
 [verbs]
 kill = "k"                         # Ctrl-A k to kill the focused agent (default x)
@@ -235,12 +244,15 @@ open-in-editor = "e"               # Ctrl-A e to open the agent's workspace (def
 ```
 
 Direct-key action names: `move-up` `move-down` `switch-side` `enter`
-`toggle-collapse` `back` `deps` `fleet` `jump-cycle` `jump-needs-you` `agents`
+`toggle-collapse` `back` `deps` `fleet` `jump-cycle` `jump-needs-you`
 `filter` `sort` `search` `help` `summary` `ledger` `context`. Verb names:
 `focus-left` `focus-right` `focus-nav` `zoom` `pin` `close` `kill` `layout`
-`open` `quit` `search` `help` `roster` `jump-needs-you` `summary` `ledger`
-`context` `switch-project` `open-in-editor` `reclaim-mirrors` `discard-workspace`
-`global-view` `configure-project` `command-mode`.
+`open` `quit` `jump-needs-you` `context` `switch-project` `open-in-editor`
+`reclaim-mirrors` `discard-workspace` `global-view` `configure-project`.
+
+(The overlay/issue actions — `search` `help` `summary` `ledger` — are direct-only
+as of v1.7: the prefix keeps spatial pane verbs. `jump-needs-you` and `context`
+appear in both tables — a bare key on the spine, the prefix form from any focus.)
 
 Keys: single chars (`a`, `/`), `f1`–`f12`, the named keys (`enter` `tab` `space`
 `up` `down` `left` `right` `home` `end` `pageup` `pagedown` `backspace` `delete`
