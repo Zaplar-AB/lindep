@@ -106,14 +106,18 @@ pub fn cursor_idle() -> Style {
 /// Glyph + colour for a workflow state. Matched defensively — Linear's
 /// `state.type` is a plain string, so unknown values fall back to a neutral dot.
 pub fn status_glyph(status: Status) -> (&'static str, Color) {
+    // One shape per state, so the column survives a monochrome terminal (see
+    // `status_glyphs_disambiguate_the_colour_only_collisions`): Backlog is `·` (not a second `○` that only
+    // colour told apart from Todo), and Canceled is `⊗` (not `⊘`, which is reserved for
+    // *blocked* — a live "needs unblocking" state, the opposite of a dead one).
     match status {
         Status::Completed | Status::Duplicate => ("●", STATUS_600),
         Status::Started => ("◐", STATUS_400),
         Status::Unstarted => ("○", INK),
-        Status::Backlog => ("○", MUTED),
+        Status::Backlog => ("·", MUTED),
         Status::Triage => ("◇", AMBER_400),
-        Status::Canceled => ("⊘", MUTED),
-        Status::Unknown => ("·", MUTED),
+        Status::Canceled => ("⊗", MUTED),
+        Status::Unknown => ("?", MUTED),
     }
 }
 
@@ -199,13 +203,18 @@ pub fn repo_check(checked: bool) -> (&'static str, Style) {
 }
 
 /// Glyph + colour for priority. A leading space keeps the column aligned when a
-/// priority marker is absent.
+/// priority marker is absent. The glyphs stay off the `▲/▼` triangle family — those
+/// are reserved for dependency *direction* (upstream/downstream) everywhere — and off
+/// `◦`, which is the idle-agent marker; intensity reads Urgent `‼` › High `!` ›
+/// Medium `◻` › Low `▫`. Medium is an *outline* square, not the filled `▪`, so it
+/// can't be mistaken for the filled `◼` Stopped-agent marker (also MUTED) one row
+/// over — each glyph stays a distinct shape for monochrome legibility.
 pub fn priority_marker(priority: Priority) -> (&'static str, Color) {
     match priority {
-        Priority::Urgent => ("▲", AMBER_500),
-        Priority::High => ("△", AMBER_400),
-        Priority::Medium => ("◦", MUTED),
-        Priority::Low => ("▽", MUTED),
+        Priority::Urgent => ("‼", AMBER_500),
+        Priority::High => ("!", AMBER_400),
+        Priority::Medium => ("◻", MUTED),
+        Priority::Low => ("▫", MUTED),
         Priority::None => (" ", MUTED),
     }
 }
@@ -271,5 +280,46 @@ mod tests {
             agent_spinner(SPINNER.len() as u64),
             "it wraps"
         );
+    }
+
+    #[test]
+    fn status_glyphs_disambiguate_the_colour_only_collisions() {
+        use crate::model::Status;
+        // Backlog and Todo used to share `○`, told apart only by colour — now distinct.
+        assert_ne!(
+            status_glyph(Status::Backlog).0,
+            status_glyph(Status::Unstarted).0,
+            "Backlog must not reuse Todo's ○"
+        );
+        // Canceled must not reuse `⊘` (reserved for *blocked*) nor `✗` (a failed agent).
+        assert_ne!(status_glyph(Status::Canceled).0, "⊘", "⊘ is blocked, not canceled");
+        assert_ne!(
+            status_glyph(Status::Canceled).0,
+            agent_marker(AgentStatus::Failed, 0).0,
+            "canceled is not a crash"
+        );
+    }
+
+    #[test]
+    fn priority_glyphs_are_distinct_and_off_the_reserved_glyphs() {
+        use crate::model::Priority;
+        const ALL: [Priority; 5] = [
+            Priority::Urgent,
+            Priority::High,
+            Priority::Medium,
+            Priority::Low,
+            Priority::None,
+        ];
+        let glyphs: HashSet<&str> = ALL.iter().map(|p| priority_marker(*p).0).collect();
+        assert_eq!(glyphs.len(), ALL.len(), "each priority is a distinct glyph");
+        // Off the idle-agent `◦` and the direction triangles (those mean graph
+        // direction everywhere), so a row never shows the same glyph in two columns.
+        for p in ALL {
+            let g = priority_marker(p).0;
+            assert!(
+                !["◦", "▲", "▼", "△", "▽"].contains(&g),
+                "{p:?} uses a reserved glyph: {g}"
+            );
+        }
     }
 }

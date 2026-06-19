@@ -301,6 +301,67 @@ pub fn push_head(worktree: &Path) -> Result<(), MirrorError> {
     Ok(())
 }
 
+/// Probe — without prompting and without fetching objects — whether `remote` is
+/// reachable and readable. The onboarding wizard calls this *before* it writes a
+/// binding so a bad remote is caught at setup rather than as a silent mirror-clone
+/// failure at the next launch (which the cockpit only reports as "agent control
+/// plane unavailable"). `git ls-remote` lists refs cheaply, under the **same**
+/// `GIT_TERMINAL_PROMPT=0` discipline as the real clone — plus ssh `BatchMode` /
+/// `ConnectTimeout` and a hard wall-clock `timeout` — so it can never stall the
+/// wizard's synchronous terminal on a credential prompt or a black-hole host. A
+/// green result predicts a clone that won't fail on credentials. `Ok(())` on
+/// success; [`MirrorError::Git`] (carrying git's stderr tail, or a "timed out"
+/// note) otherwise.
+pub fn probe_remote(remote: &str, timeout: std::time::Duration) -> Result<(), MirrorError> {
+    let mut child = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // git's own prompt is disabled above; ssh has its own. `BatchMode` makes it
+        // fail instead of asking for a passphrase / host-key, `ConnectTimeout` bounds
+        // a dead host. Harmless for an https remote (no ssh is spawned).
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=8")
+        // `--` so a remote beginning with `-` is never read as a git option.
+        .args(["ls-remote", "--", remote])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(MirrorError::Spawn)?;
+
+    // Poll rather than block on `wait()`: an https remote pointed at an unroutable
+    // host can outlast even ssh's `ConnectTimeout` (libcurl has no equivalent env),
+    // and the wizard owns the raw terminal — a hang there is unescapable. ls-remote's
+    // stderr is a few lines at most, well under the pipe buffer, so leaving it unread
+    // until the child exits can't deadlock.
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(MirrorError::Stream)? {
+            Some(status) => break status,
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MirrorError::Git {
+                    command: format!("git ls-remote {remote}"),
+                    code: None,
+                    stderr: format!("timed out after {}s", timeout.as_secs()),
+                });
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    Err(MirrorError::Git {
+        command: format!("git ls-remote {remote}"),
+        code: status.code(),
+        stderr: stderr.trim().to_string(),
+    })
+}
+
 // ── staleness, reference-counting & reclaim (ENG-540 / ENG-541) ───────────────
 
 /// How long a freshly-fetched mirror is trusted before another `remote update` is

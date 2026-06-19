@@ -178,6 +178,9 @@ fn real_main() -> Result<(), String> {
             return Err("no issues found for that project".into());
         }
         let mut app = App::new(graph);
+        // Mirror run_tui: a snapshot is a read-only render, so mark a demo run as demo
+        // (not degraded) — else the M13 "⚠ agents off" chip bakes into a --demo snapshot.
+        app.demo = cli.demo;
         if cli.graph {
             app.windows.open_fleet();
         }
@@ -328,6 +331,7 @@ fn run_tui(
         eprintln!("lindep: config: {w}");
     }
     app.keymap = km;
+    app.demo = demo; // read-only viewer: refusals/banner/dispatch affordances adapt (H6)
     // Resolve the live-backend ceiling: a validated `[agents] max_concurrent`
     // override, else the compiled-in default.
     let (max_concurrent, mc_warning) = resolve_max_concurrent(settings.max_concurrent);
@@ -373,13 +377,30 @@ fn run_tui(
         app.enable_project_switching(client, runtime.handle().clone(), tx.clone(), projects);
     }
 
-    // Greet the user via the event path so the footer shows the cockpit is live.
-    {
-        let banner = format!(
-            "cockpit live · {} · {} issues — Enter: open agent · ? help",
-            app.graph.project,
-            app.graph.len()
-        );
+    // Greet the user via the event path so the footer shows the cockpit is live —
+    // but ONLY when it actually is. Each degraded launch (project not connected, repo
+    // unreachable, hook endpoint unbindable, state from a newer lindep) already
+    // emitted its own specific, actionable notice from the failing path; a blanket
+    // "cockpit live" here would overwrite that accurate reason and leave the user
+    // believing agents work when the control plane never armed. So when degraded we
+    // stay quiet and let the real reason stand. `--demo` is an intentional read-only
+    // viewer, not a failure, so it keeps the live banner.
+    if control_plane.is_some() || demo {
+        // `--demo` is a read-only viewer — don't advertise "Enter: open agent" it
+        // can't honour; point at the way to get real agents instead (H6).
+        let banner = if control_plane.is_some() {
+            format!(
+                "cockpit live · {} · {} issues — Enter: open agent · ? help",
+                app.graph.project,
+                app.graph.len()
+            )
+        } else {
+            format!(
+                "read-only demo · {} · {} issues — drop --demo to run agents · ? help",
+                app.graph.project,
+                app.graph.len()
+            )
+        };
         let tx = tx.clone();
         runtime.spawn(async move {
             let _ = tx.send(event::AppEvent::Notification(banner));
@@ -548,17 +569,19 @@ fn start_control_plane(
                 registry = reloaded;
             }
             Ok(false) => {
-                let _ = events.send(event::AppEvent::Notification(format!(
+                let reason = format!(
                     "agents disabled: {} isn't connected to a repo — re-open it to set up, \
                      or edit ~/.lindep/registry.toml",
                     active.name
-                )));
+                );
+                let _ = events.send(event::AppEvent::Notification(reason.clone()));
+                app.degrade_reason = Some(reason);
                 return None;
             }
             Err(e) => {
-                let _ = events.send(event::AppEvent::Notification(format!(
-                    "agents disabled: onboarding couldn't run ({e})"
-                )));
+                let reason = format!("agents disabled: onboarding couldn't run ({e})");
+                let _ = events.send(event::AppEvent::Notification(reason.clone()));
+                app.degrade_reason = Some(reason);
                 return None;
             }
         }
@@ -566,10 +589,12 @@ fn start_control_plane(
     let descriptor = match registry.project(&active.id) {
         Ok(d) => d.clone(),
         Err(_) => {
-            let _ = events.send(event::AppEvent::Notification(format!(
+            let reason = format!(
                 "agents disabled: project {} is not in ~/.lindep/registry.toml",
                 active.name
-            )));
+            );
+            let _ = events.send(event::AppEvent::Notification(reason.clone()));
+            app.degrade_reason = Some(reason);
             return None;
         }
     };
@@ -608,12 +633,25 @@ fn start_control_plane(
     // plane builds. Bind the endpoint before any agent launches so their settings
     // can point at it — block_on is safe here on the synchronous main thread.
     let stores: workspace::StoreRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let endpoint = match runtime.block_on(notify::serve(events.clone(), Arc::clone(&stores))) {
+        Ok(endpoint) => endpoint,
+        // Without the hook endpoint agents can't report back, so we degrade — but say
+        // why instead of vanishing silently (the cockpit otherwise just shows the
+        // graph with no clue agents are off). A bind failure is usually a port clash
+        // with another lindep, which editing the registry won't fix.
+        Err(e) => {
+            let reason = format!(
+                "agents disabled: couldn't bind the local hook endpoint ({e}); another lindep may already be running"
+            );
+            let _ = events.send(event::AppEvent::Notification(reason.clone()));
+            app.degrade_reason = Some(reason);
+            return None;
+        }
+    };
     let notify::Endpoint {
         port: hook_port,
         token: hook_token,
-    } = runtime
-        .block_on(notify::serve(events.clone(), Arc::clone(&stores)))
-        .ok()?;
+    } = endpoint;
 
     let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("lindep").to_path_buf());
     let (cols, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
@@ -645,7 +683,7 @@ fn start_control_plane(
     // projects' fleets start lazily on first launch/switch. The returned resumable
     // set seeds both auto-resume and the cockpit-layout restore (a docked agent only
     // comes back if it was live, never Done/Failed/Stopped).
-    let (plane, resumable) = runtime.block_on(workspace::build_plane(
+    let plane_result = runtime.block_on(workspace::build_plane(
         runtime.handle(),
         &builder,
         &registry,
@@ -655,7 +693,24 @@ fn start_control_plane(
         // loop to take footer events — so a slow first clone streams its meter
         // straight to stderr (where "Loading {name}…" already printed).
         workspace::CloneProgressOut::Stderr,
-    ))?;
+    ));
+    let (plane, resumable) = match plane_result {
+        Some(pr) => pr,
+        None => {
+            // build_plane already emitted the specific reason as a Notification, but
+            // that's a transient footer the first keystroke wipes. Persist a standing
+            // reason too, so the "⚠ agents off" chip + launch refusal name a real cause
+            // instead of the opaque "control plane unavailable" jargon (M13). This is
+            // the most common real degradation (a repo lindep can't clone/provision).
+            app.degrade_reason.get_or_insert_with(|| {
+                format!(
+                    "agents disabled: couldn't provision {}'s repos — see the startup notice",
+                    active.name
+                )
+            });
+            return None;
+        }
+    };
     let mut planes = std::collections::HashMap::new();
     planes.insert(active.id.clone(), plane);
 
@@ -980,27 +1035,37 @@ mod tests {
     #[test]
     fn the_spine_bands_issues_by_readiness() {
         // ENG-558: the Issues spine is a readiness schedule — section dividers
-        // NEEDS-YOU · RUNNING · READY · BLOCKED · DONE, top→bottom. Reuses the
-        // existing list (no new view). Host two agents on otherwise-blocked
-        // issues so the agent bands appear without emptying the READY band.
+        // NEEDS-YOU · WORKING · IDLE · READY · BLOCKED · DONE, top→bottom. Reuses
+        // the existing list (no new view). Host agents on otherwise-blocked issues
+        // so the agent bands appear without emptying the READY band.
         let mut app = App::new(demo::graph());
+        // A live workspace so the READY lane shows its dispatch affordance (H6 gates
+        // it on workspace.is_some(); the demo/degraded case is covered separately).
+        app.workspace = Some(crate::workspace::WorkspaceHandle::detached());
         app.fleet.insert("ZAP-201".into(), AgentStatus::NeedsYou);
         app.fleet.insert("ZAP-205".into(), AgentStatus::Running);
+        app.fleet.insert("ZAP-210".into(), AgentStatus::Idle);
         let out = render_snapshot(&mut app, 160, 48).expect("render");
-        for band in ["NEEDS YOU", "RUNNING", "READY", "BLOCKED", "DONE"] {
+        // Match the glyph-prefixed divider headers so a band label can't collide
+        // with the same word used as a window-status title (e.g. "WORKING").
+        let headers = [
+            "⚑ NEEDS YOU",
+            "◉ WORKING",
+            "◦ IDLE",
+            "▸ READY",
+            "⊘ BLOCKED",
+            "✓ DONE",
+        ];
+        for band in headers {
             assert!(out.contains(band), "band header {band} missing:\n{out}");
         }
         // The READY divider carries the dispatch affordance.
         assert!(out.contains("dispatch"), "ready lane hint missing:\n{out}");
         // Bands are ordered top→bottom.
         let pos = |s: &str| out.find(s).expect("band header present");
-        assert!(
-            pos("NEEDS YOU") < pos("RUNNING"),
-            "needs-you above running:\n{out}"
-        );
-        assert!(pos("RUNNING") < pos("READY"), "running above ready:\n{out}");
-        assert!(pos("READY") < pos("BLOCKED"), "ready above blocked:\n{out}");
-        assert!(pos("BLOCKED") < pos("DONE"), "blocked above done:\n{out}");
+        for w in headers.windows(2) {
+            assert!(pos(w[0]) < pos(w[1]), "{} above {}:\n{out}", w[0], w[1]);
+        }
     }
 
     #[test]

@@ -326,16 +326,21 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
             let implied = match event_name {
                 "Notification" if notif_needs_you => Some(AgentStatus::NeedsYou),
                 "Stop" => Some(AgentStatus::Idle),
-                // Any working signal promotes a live, non-terminal agent to
-                // Running — Spawning/Idle (it began a turn) AND NeedsYou (it
-                // resumed after you answered). Never revive a terminal agent; a
-                // no-op when already Running is absorbed by the `changed` guard.
+                // A working signal promotes a live, non-terminal agent to Running.
+                // Spawning/NeedsYou/Running all promote (a turn began, or it resumed
+                // after you answered). An *Idle* agent is only revived by a genuine
+                // new turn — `UserPromptSubmit` — never by a mid-turn `PostToolUse`,
+                // so a late or out-of-order tool hook can't flip a settled agent back
+                // to Running (A4). Mirrors the runtime rule (UserPromptSubmit routed
+                // as a status change; PostToolUse promotes non-idle only). Never
+                // revive a terminal agent; a no-op when already Running is absorbed by
+                // the `changed` guard.
                 _ if working => match current {
+                    Some(AgentStatus::Idle) if event_name == "UserPromptSubmit" => {
+                        Some(AgentStatus::Running)
+                    }
                     Some(
-                        AgentStatus::Spawning
-                        | AgentStatus::Idle
-                        | AgentStatus::NeedsYou
-                        | AgentStatus::Running,
+                        AgentStatus::Spawning | AgentStatus::NeedsYou | AgentStatus::Running,
                     ) => Some(AgentStatus::Running),
                     _ => None,
                 },
@@ -417,14 +422,15 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
                 reason,
             }
         }
-        // The user submitted a turn: the agent is working now. A bare status
-        // change (no tool name to show) that, like any working signal, clears a
-        // standing NeedsYou — answering a question is precisely a prompt submit.
-        (Some(issue), "UserPromptSubmit") => AppEvent::AgentAction {
+        // The user submitted a turn: a genuine new-turn status change → Running. It
+        // revives even an *Idle* agent (a fresh turn started) and clears a standing
+        // NeedsYou (answering a question is precisely a prompt submit). Routed as a
+        // status change — not an AgentAction — so that a *mid-turn* PostToolUse can't
+        // also revive Idle: only a real new turn does (A4).
+        (Some(issue), "UserPromptSubmit") => AppEvent::AgentStatusChanged {
             project_id,
             issue,
-            action: "working…".to_string(),
-            working: true,
+            status: AgentStatus::Running,
         },
         (Some(issue), "Notification") => {
             // A non-blocking notification (idle nudge / auth-success /
@@ -1399,9 +1405,10 @@ mod tests {
         assert!(
             got.iter().any(|ev| matches!(
                 ev,
-                AppEvent::AgentAction { issue, working, .. } if issue == "ENG-1" && *working
+                AppEvent::AgentStatusChanged { issue, status, .. }
+                    if issue == "ENG-1" && *status == AgentStatus::Running
             )),
-            "the prompt submit emits a working action; got {got:?}"
+            "the prompt submit emits a Running status change (a new turn); got {got:?}"
         );
     }
 

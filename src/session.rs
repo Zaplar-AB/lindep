@@ -66,6 +66,20 @@ impl AgentStatus {
         matches!(self, AgentStatus::NeedsYou)
     }
 
+    /// Whether the agent is actively churning — spawning, or producing output /
+    /// running tools. Drives the `Working` readiness band; the exact complement of
+    /// [`is_idle`](Self::is_idle) *within* the live-but-not-needs-you set, so a
+    /// resting agent never reads as still working.
+    pub const fn is_working(&self) -> bool {
+        matches!(self, AgentStatus::Spawning | AgentStatus::Running)
+    }
+
+    /// Whether the agent is alive but resting — it finished a turn (a `Stop` hook
+    /// fired) with its process still up. Drives the `Idle` readiness band.
+    pub const fn is_idle(&self) -> bool {
+        matches!(self, AgentStatus::Idle)
+    }
+
     /// Whether a live process backs this status — i.e. the agent is genuinely
     /// "on". This is what the header counts: a `Stopped`/`Done`/`Failed` agent
     /// (and an issue with no agent at all) is *not* live, so the count drops the

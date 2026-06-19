@@ -322,9 +322,9 @@ impl Supervisor {
             // the user it's still stopping rather than the misleading "already
             // running" — the relaunch will take once the matching `Reaped` lands.
             if record.cancelling {
-                self.notify(format!("still stopping {issue}, try again in a moment"));
+                self.reject_launch(&issue, format!("still stopping {issue}, try again in a moment"));
             } else {
-                self.notify(format!("{issue} already has a running agent"));
+                self.reject_launch(&issue, format!("{issue} already has a running agent"));
             }
             return;
         }
@@ -342,10 +342,13 @@ impl Supervisor {
             })
             .is_err()
         {
-            self.notify(format!(
-                "at capacity ({} agents across the workspace) — cancel one first",
-                self.cfg.max_concurrent
-            ));
+            self.reject_launch(
+                &issue,
+                format!(
+                    "at capacity ({} agents across the workspace) — cancel one first",
+                    self.cfg.max_concurrent
+                ),
+            );
             return;
         }
 
@@ -425,6 +428,15 @@ impl Supervisor {
 
     fn notify(&self, message: String) {
         let _ = self.cfg.events.send(AppEvent::Notification(message));
+    }
+
+    /// Refuse a launch for a specific `issue`, carrying the id so the cockpit drops
+    /// only that issue's double-press guard rather than everyone's (M10).
+    fn reject_launch(&self, issue: &str, reason: String) {
+        let _ = self.cfg.events.send(AppEvent::LaunchRejected {
+            issue: issue.to_string(),
+            reason,
+        });
     }
 }
 
@@ -1642,12 +1654,12 @@ mod tests {
 
         let saw_still_stopping = wait_for(|| {
             while let Ok(ev) = rx.try_recv() {
-                if let AppEvent::Notification(msg) = &ev {
+                if let AppEvent::LaunchRejected { reason, .. } = &ev {
                     assert!(
-                        !msg.contains("already has a running agent"),
+                        !reason.contains("already has a running agent"),
                         "a cancelling record must not report 'already running'"
                     );
-                    if msg.contains("still stopping ENG-1") {
+                    if reason.contains("still stopping ENG-1") {
                         return true;
                     }
                 }

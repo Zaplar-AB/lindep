@@ -41,6 +41,12 @@ pub enum Action {
     // ── Direct keys (Spine / Deps focus) ──────────────────────────────────
     MoveUp,
     MoveDown,
+    /// Spine/Deps: jump to the first / last row (no wrap).
+    MoveTop,
+    MoveBottom,
+    /// Spine/Deps: page the selection up / down (no wrap).
+    PageUp,
+    PageDown,
     /// In a Deps window, flip the active tree (upstream ↔ downstream).
     SwitchSide,
     /// Flip the context (active) window between chat and deps. Bare `Tab` when
@@ -62,8 +68,6 @@ pub enum Action {
     JumpNeedsYou,
     /// Spine: cycle the issue filter.
     CycleFilter,
-    /// Spine: cycle the issue sort.
-    CycleSort,
     /// Fuzzy-find issues (Spine list).
     StartSearch,
     ToggleHelp,
@@ -124,6 +128,12 @@ pub enum Action {
 const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::MoveUp, "move-up", &["up", "k"]),
     (Action::MoveDown, "move-down", &["down", "j"]),
+    // `g` is OpenFleet, so top/bottom take Home/End (gg/G would clash); paging takes
+    // the PgUp/PgDn keys — all previously dead on the Spine/Deps (M3).
+    (Action::MoveTop, "move-top", &["home"]),
+    (Action::MoveBottom, "move-bottom", &["end"]),
+    (Action::PageUp, "page-up", &["pageup"]),
+    (Action::PageDown, "page-down", &["pagedown"]),
     (
         Action::SwitchSide,
         "switch-side",
@@ -141,9 +151,6 @@ const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::JumpCycle, "jump-cycle", &["c"]),
     (Action::JumpNeedsYou, "jump-needs-you", &["n"]),
     (Action::CycleFilter, "filter", &["f"]),
-    // `r` (vacated by the v1.7 roster fold) cycles the sort, leaving `s` solely
-    // to the prefix project-switcher — no more direct-`s` / prefix-`s` clash.
-    (Action::CycleSort, "sort", &["r"]),
     (Action::StartSearch, "search", &["/"]),
     (Action::ToggleHelp, "help", &["?"]),
     (Action::ToggleSummary, "summary", &["i"]),
@@ -389,6 +396,12 @@ impl Keymap {
     /// The verb bound to `key` when reached behind the prefix.
     pub fn verb_for(&self, key: KeyEvent) -> Option<Action> {
         self.verbs.get(&Binding::of(key)).copied()
+    }
+
+    /// Human label for an arbitrary pressed key (e.g. `W`, `↑`, `Ctrl-A`) — used to
+    /// acknowledge an unbound prefix key in the footer (M5).
+    pub fn key_label(&self, key: KeyEvent) -> String {
+        Binding::of(key).label()
     }
 
     /// Joined labels of the direct keys bound to `action` (for help/hints):

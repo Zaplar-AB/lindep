@@ -98,6 +98,12 @@ pub enum AppEvent {
         issue: String,
         repo_handle: String,
     },
+    /// The supervisor refused a specific launch (at capacity, already running, or
+    /// still stopping). Carries the rejected `issue` so the cockpit drops *only* that
+    /// issue's double-press guard — unlike a bare `Notification`, which used to clear
+    /// every issue's `pending_launch` (M10). NOT agent-scoped — launches only target
+    /// the active project, so `project_id()` is `None`.
+    LaunchRejected { issue: String, reason: String },
     /// A background disk-reclaim scan finished (`Ctrl-a m`, ENG-540). Carries the
     /// unreferenced mirrors safe to offer, whether this scan should *open* the
     /// prompt (the initial scan) or merely *refresh* an already-open one (the
@@ -144,6 +150,7 @@ impl AppEvent {
     pub fn project_id(&self) -> Option<&str> {
         match self {
             AppEvent::Notification(_)
+            | AppEvent::LaunchRejected { .. }
             | AppEvent::ReclaimScanned { .. }
             | AppEvent::ProjectActivated => None,
             AppEvent::AgentSpawned { project_id, .. }

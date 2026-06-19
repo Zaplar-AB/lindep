@@ -60,9 +60,12 @@ pub fn run_for_project(project: &ProjectRef) -> io::Result<String> {
     let mut terminal = ratatui::init();
     let result = run_loop(&mut terminal, &mut wizard);
     ratatui::restore();
-    Ok(if result? {
+    Ok(if result? && wizard.wrote {
         "saved to ~/.lindep/registry.toml — restart lindep to apply".to_string()
     } else {
+        // Cancelled, or completed but nothing actually differed from the existing
+        // binding — either way the on-disk config is unchanged, so don't nudge a
+        // pointless restart.
         "configuration unchanged".to_string()
     })
 }
@@ -149,7 +152,9 @@ impl ScratchForm {
             return Err("scratch name must be a safe handle (letters, digits, - _ .)".into());
         }
         if self.provision.trim().is_empty() {
-            return Err("scratch needs a provision command".into());
+            // Point at the exit, not just the missing field: the step is optional, so a
+            // user who typed a name then changed their mind needs to know how to bail.
+            return Err("add a provision command, or clear the name (backspace) to skip".into());
         }
         let mut env = std::collections::BTreeMap::new();
         for tok in self.env.split_whitespace() {
@@ -199,6 +204,21 @@ pub struct Wizard {
     scratch_form: ScratchForm,
     /// A transient message shown under the body (a bad input, a write failure).
     error: Option<String>,
+    /// Checks each new remote is reachable before [`Step::Confirm`] writes it (see
+    /// [`RemoteProbe`]). Defaults to the real `git ls-remote` probe; tests swap a stub.
+    probe: RemoteProbe,
+    /// Set once the user has been warned a remote is unreachable and chose to write
+    /// anyway — a second Enter on [`Step::Confirm`] then commits. Reset whenever the
+    /// repo set changes so a newly-added bad remote re-warns.
+    acknowledged_unreachable: bool,
+    /// First-Esc-on-Repos guard: every other step's Esc steps back, but Repos is the
+    /// first step, so its Esc tears down the whole wizard. Warn once, then a second
+    /// consecutive Esc confirms — so a back-walk reflex can't discard setup unprompted.
+    cancel_armed: bool,
+    /// Whether the Confirm step actually wrote registry.toml (vs a no-op write that
+    /// changed nothing). Lets the re-config footer say "configuration unchanged"
+    /// instead of nudging a needless restart when nothing differed.
+    wrote: bool,
 }
 
 impl Wizard {
@@ -222,6 +242,10 @@ impl Wizard {
             scratch: Vec::new(),
             scratch_form: ScratchForm::default(),
             error: None,
+            probe: default_remote_probe,
+            acknowledged_unreachable: false,
+            cancel_armed: false,
+            wrote: false,
         }
     }
 
@@ -334,6 +358,15 @@ impl Wizard {
                 label: input.to_string(),
             });
         }
+        // It looks like a path the user meant (tilde / dot / a separator) but no dir is
+        // there — name *that* (a typo to fix), not the generic "not a path/URL/repo".
+        if input.starts_with('~')
+            || input.starts_with('.')
+            || input.starts_with('/')
+            || input.contains(std::path::MAIN_SEPARATOR)
+        {
+            return Err(format!("no directory at {} — check the path", expanded.display()));
+        }
         Err("not a directory, a URL, or a registered repo — give a path or remote URL".into())
     }
 
@@ -350,6 +383,9 @@ impl Wizard {
                     self.repos.push(row);
                     self.input.clear();
                     self.error = None;
+                    // The set changed: a newly-added remote must be re-checked, so a
+                    // prior "write anyway" acknowledgement no longer covers it.
+                    self.acknowledged_unreachable = false;
                 }
             }
             Err(e) => self.error = Some(e),
@@ -464,6 +500,38 @@ impl Wizard {
     fn new_repos(&self) -> Vec<RepoDraft> {
         self.repos.iter().filter_map(|r| r.draft.clone()).collect()
     }
+
+    /// The remotes this binding will newly clone, as `(handle, url)`. Reused repos
+    /// (no draft) and local-only repos (no remote) contribute none — and a local
+    /// repo *with* an origin is included, because `mirror_source` prefers the remote
+    /// over the local path, so the remote is exactly what the boot clone will fetch.
+    fn remotes_to_check(&self) -> Vec<(String, String)> {
+        self.repos
+            .iter()
+            .filter_map(|r| Some((r.handle.clone(), r.draft.as_ref()?.remote.clone()?)))
+            .collect()
+    }
+
+    /// Probe every [`Self::remotes_to_check`] remote, returning the unreachable ones
+    /// as `(handle, reason)`. Empty when all are reachable (or there are none).
+    fn unreachable_remotes(&self) -> Vec<(String, String)> {
+        self.remotes_to_check()
+            .into_iter()
+            .filter_map(|(handle, url)| (self.probe)(&url).err().map(|reason| (handle, reason)))
+            .collect()
+    }
+}
+
+/// A one-line [`Step::Confirm`] footer naming the unreachable remote(s) and the
+/// first failure reason, and telling the user that a second Enter writes anyway.
+fn unreachable_warning(bad: &[(String, String)]) -> String {
+    let reason = bad.first().map(|(_, r)| r.as_str()).unwrap_or("unreachable");
+    let names = bad
+        .iter()
+        .map(|(h, _)| h.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("can't reach {names}: {reason} — ⏎ writes it anyway, esc to fix")
 }
 
 /// Whether `s` looks like a git remote rather than a bare word — so a typo doesn't
@@ -486,6 +554,30 @@ fn expand_tilde(raw: &str) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     PathBuf::from(raw)
+}
+
+/// How a repo's remote is checked for reachability before the wizard writes it.
+/// A plain fn pointer (not a capturing closure) so the [`Wizard`] stays a simple
+/// value and tests can swap in a deterministic stub with no network. `Ok(())` if
+/// the remote is reachable; `Err(reason)` — a short, footer-ready message — if not.
+type RemoteProbe = fn(&str) -> Result<(), String>;
+
+/// The production [`RemoteProbe`]: a bounded, non-interactive `git ls-remote`
+/// ([`crate::mirror::probe_remote`]) reduced to a concise reason for the footer.
+/// The wizard owns the raw terminal, so the probe is hard-capped and can never
+/// hang it. The single most actionable line of git's stderr is surfaced — for a
+/// private https remote that's `could not read Username for 'https://…'`.
+fn default_remote_probe(remote: &str) -> Result<(), String> {
+    crate::mirror::probe_remote(remote, std::time::Duration::from_secs(12)).map_err(|e| match e {
+        crate::mirror::MirrorError::Git { stderr, .. } if !stderr.trim().is_empty() => stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("unreachable")
+            .to_string(),
+        other => other.to_string(),
+    })
 }
 
 /// The `origin` remote URL of a git clone, or `None` if it isn't a repo or has no
@@ -520,17 +612,40 @@ fn run_loop(terminal: &mut DefaultTerminal, wizard: &mut Wizard) -> io::Result<b
             return Ok(false);
         }
         match wizard.step {
-            Step::Repos => match key.code {
-                KeyCode::Esc => return Ok(false),
-                // Enter on a filled field adds the repo; on an empty field it advances.
-                KeyCode::Enter if wizard.input.trim().is_empty() => wizard.advance_from_repos(),
-                KeyCode::Enter => wizard.add_repo(),
-                KeyCode::Backspace => {
-                    wizard.input.pop();
+            Step::Repos => {
+                // Any key other than the arming Esc clears the cancel guard, so the
+                // confirm must be two *consecutive* Esc presses — and clears the stale
+                // "esc again to cancel setup" warning so it doesn't linger as a lie once
+                // the guard is gone.
+                if key.code != KeyCode::Esc {
+                    if wizard.cancel_armed {
+                        wizard.error = None;
+                    }
+                    wizard.cancel_armed = false;
                 }
-                KeyCode::Char(c) if !ctrl && !alt => wizard.input.push(c),
-                _ => {}
-            },
+                match key.code {
+                    // Repos is the first step, so Esc tears down the whole wizard
+                    // (every other step's Esc steps back). Guard it: warn once, then a
+                    // second consecutive Esc confirms the teardown.
+                    KeyCode::Esc => {
+                        if wizard.cancel_armed {
+                            return Ok(false);
+                        }
+                        wizard.cancel_armed = true;
+                        wizard.error = Some("esc again to cancel setup".into());
+                    }
+                    // Enter on a filled field adds the repo; on an empty field advances.
+                    KeyCode::Enter if wizard.input.trim().is_empty() => {
+                        wizard.advance_from_repos();
+                    }
+                    KeyCode::Enter => wizard.add_repo(),
+                    KeyCode::Backspace => {
+                        wizard.input.pop();
+                    }
+                    KeyCode::Char(c) if !ctrl && !alt => wizard.input.push(c),
+                    _ => {}
+                }
+            }
             Step::Primary => match key.code {
                 KeyCode::Esc => wizard.step = Step::Repos,
                 KeyCode::Up => wizard.primary_move(-1),
@@ -569,15 +684,39 @@ fn run_loop(terminal: &mut DefaultTerminal, wizard: &mut Wizard) -> io::Result<b
                 _ => {}
             },
             Step::Confirm => match key.code {
-                KeyCode::Esc => wizard.step = Step::Scratch,
+                KeyCode::Esc => {
+                    // Re-check on the next visit — they may go back and change repos.
+                    wizard.acknowledged_unreachable = false;
+                    wizard.step = Step::Scratch;
+                }
                 KeyCode::Enter => {
+                    // Catch an unreachable remote HERE, at setup, instead of writing a
+                    // binding that only fails as a silent mirror-clone error at the next
+                    // launch ("agent control plane unavailable"). Offline / credentials-
+                    // later is legitimate, so warn once and let a second Enter commit.
+                    if !wizard.acknowledged_unreachable && !wizard.remotes_to_check().is_empty() {
+                        wizard.error = Some("checking remotes…".into());
+                        terminal.draw(|frame| draw(wizard, frame))?;
+                        let unreachable = wizard.unreachable_remotes();
+                        if !unreachable.is_empty() {
+                            wizard.acknowledged_unreachable = true;
+                            wizard.error = Some(unreachable_warning(&unreachable));
+                            continue;
+                        }
+                        wizard.error = None;
+                    }
                     match registry::write_binding(
                         &wizard.layout,
                         &wizard.new_repos(),
                         &wizard.project_draft(),
                         &wizard.scratch,
                     ) {
-                        Ok(()) => return Ok(true),
+                        // `wrote` is false when the binding was byte-identical (no-op),
+                        // so the re-config footer can say "configuration unchanged".
+                        Ok(wrote) => {
+                            wizard.wrote = wrote;
+                            return Ok(true);
+                        }
                         // A write failure stays in the wizard so the user can retry or
                         // cancel rather than crashing out of the cockpit launch.
                         Err(e) => wizard.error = Some(e.to_string()),
@@ -992,6 +1131,76 @@ mod tests {
         // Only the freshly-added remote repo is written; the reused one isn't.
         assert_eq!(w.new_repos().len(), 1);
         assert_eq!(w.new_repos()[0].handle, "core");
+    }
+
+    #[test]
+    fn remotes_to_check_skips_reused_and_local_only_repos() {
+        let mut w = wizard(&["shared"], &[]);
+        // A freshly-added remote repo → checked.
+        w.input = "git@github.com:zaplar/core.git".into();
+        w.add_repo();
+        // A reused (already-registered) repo → no draft → not checked.
+        w.input = "shared".into();
+        w.add_repo();
+        // A local-only repo (a draft with no remote) → nothing to clone → not checked.
+        w.repos.push(RepoRow {
+            handle: "localthing".into(),
+            draft: Some(RepoDraft {
+                handle: "localthing".into(),
+                remote: None,
+                local: Some("/tmp/localthing".into()),
+            }),
+            label: "local-only".into(),
+        });
+        let to_check = w.remotes_to_check();
+        assert_eq!(to_check.len(), 1, "only the new remote repo is probed");
+        assert_eq!(to_check[0].0, "core");
+        assert_eq!(to_check[0].1, "git@github.com:zaplar/core.git");
+    }
+
+    #[test]
+    fn unreachable_remotes_uses_the_injected_probe() {
+        let mut w = wizard(&[], &[]);
+        w.input = "git@github.com:zaplar/reachable.git".into();
+        w.add_repo();
+        w.input = "git@github.com:zaplar/unreachable.git".into();
+        w.add_repo();
+        // Stub probe (non-capturing → coerces to the fn pointer): only the
+        // "unreachable" remote fails, exercising the wizard's logic without a network.
+        w.probe = |remote| {
+            if remote.contains("unreachable") {
+                Err("could not read Username".into())
+            } else {
+                Ok(())
+            }
+        };
+        let bad = w.unreachable_remotes();
+        assert_eq!(bad.len(), 1, "only the unreachable remote is reported");
+        assert_eq!(bad[0].0, "unreachable");
+        assert!(bad[0].1.contains("Username"), "the probe's reason is carried");
+    }
+
+    #[test]
+    fn adding_a_repo_resets_the_unreachable_acknowledgement() {
+        let mut w = wizard(&[], &[]);
+        w.acknowledged_unreachable = true; // user previously chose "write anyway"
+        w.input = "git@github.com:zaplar/core.git".into();
+        w.add_repo();
+        assert!(
+            !w.acknowledged_unreachable,
+            "a changed repo set must re-warn before writing"
+        );
+    }
+
+    #[test]
+    fn unreachable_warning_names_repos_and_offers_an_override() {
+        let msg = unreachable_warning(&[
+            ("core".into(), "could not read Username".into()),
+            ("shared".into(), "host unreachable".into()),
+        ]);
+        assert!(msg.contains("core") && msg.contains("shared"), "names both repos");
+        assert!(msg.contains("could not read Username"), "shows the first reason");
+        assert!(msg.contains("esc"), "tells the user how to go back and fix it");
     }
 
     #[test]

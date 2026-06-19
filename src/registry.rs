@@ -537,12 +537,18 @@ pub struct ScratchDraft {
 /// The first block this call appends is tagged with a provenance comment; an updated
 /// project keeps its own leading comment. The write is atomic (tmp → rename), like the
 /// rest of lindep's on-disk state.
+/// Returns `Ok(true)` when the registry file was (re)written, `Ok(false)` when the
+/// prospective document was byte-identical to what's already on disk — a no-op, so
+/// nothing was written and the caller can report "configuration unchanged" instead
+/// of nudging a needless restart. The byte-compare is reliable for blocks the wizard
+/// itself wrote (this fn rebuilds them deterministically); a semantically-equal but
+/// hand-formatted block falls through to a harmless rewrite, never the reverse.
 pub fn write_binding(
     layout: &Layout,
     new_repos: &[RepoDraft],
     project: &ProjectDraft,
     scratch: &[ScratchDraft],
-) -> Result<(), RegistryError> {
+) -> Result<bool, RegistryError> {
     use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
     let path = layout.registry_path();
@@ -680,6 +686,13 @@ pub fn write_binding(
     }
 
     let out = doc.to_string();
+    // Nothing changed (re-opened the wizard and edited nothing, or re-applied the same
+    // values): skip the write so a no-op re-config doesn't rewrite the file or nudge a
+    // pointless restart. `existing` is "" when the file is absent, which never equals a
+    // non-empty `out`, so a first-time write always proceeds.
+    if out == existing {
+        return Ok(false);
+    }
     let parent = path.parent();
     if let Some(parent) = parent {
         std::fs::create_dir_all(parent).map_err(|source| RegistryError::Write {
@@ -721,7 +734,7 @@ pub fn write_binding(
                 source,
             })?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Parse the registry document: repos first (so projects can cross-reference
@@ -1555,6 +1568,40 @@ mod tests {
         let proj = reg.project("p-uuid").unwrap();
         assert_eq!(proj.primary, "core-pms");
         assert_eq!(proj.candidates, vec!["core-pms"]);
+    }
+
+    #[test]
+    fn re_writing_an_identical_binding_is_a_reported_no_op() {
+        // A re-config that changes nothing must not rewrite the file or nudge a restart:
+        // the first write reports Ok(true), an identical second write Ok(false), and the
+        // file's bytes are untouched (so its mtime/content are stable).
+        let root = temp_root("noop-rewrite");
+        let layout = Layout::new(&root);
+        let repo = RepoDraft {
+            handle: "core".into(),
+            remote: Some("git@github.com:zaplar/core".into()),
+            local: None,
+        };
+        let project = ProjectDraft {
+            id: "p1".into(),
+            handle: "core".into(),
+            name: "Core".into(),
+            candidates: vec!["core".into()],
+            primary: "core".into(),
+            branch_prefix: None,
+        };
+        assert!(
+            write_binding(&layout, std::slice::from_ref(&repo), &project, &[]).unwrap(),
+            "the first write actually writes"
+        );
+        let after_first = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        // Re-apply the SAME binding (no new repo — it's already registered now).
+        assert!(
+            !write_binding(&layout, &[], &project, &[]).unwrap(),
+            "an identical re-apply is a no-op (Ok(false))"
+        );
+        let after_second = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        assert_eq!(after_first, after_second, "a no-op must not alter the file");
     }
 
     #[test]

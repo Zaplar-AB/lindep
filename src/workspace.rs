@@ -1521,8 +1521,8 @@ mod tests {
         ws.launch("proj-b".into(), "ENG-1".into(), "three".into(), None);
         let at_capacity = eventually(|| {
             while let Ok(ev) = rx.try_recv() {
-                if let AppEvent::Notification(m) = ev
-                    && m.contains("at capacity")
+                if let AppEvent::LaunchRejected { reason, .. } = ev
+                    && reason.contains("at capacity")
                 {
                     return true;
                 }
