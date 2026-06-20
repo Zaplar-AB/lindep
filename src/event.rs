@@ -34,6 +34,13 @@ pub enum AppEvent {
         project_id: String,
         issue: String,
         backend: Arc<dyn AgentBackend>,
+        /// The repo handles the supervisor materialised for this agent, primary
+        /// first (ENG-536). One entry is the common single-repo case; more than
+        /// one is a multi-repo agent spanning sibling worktrees. The cockpit keeps
+        /// this so a launched agent can show *which* repos/worktrees it owns — the
+        /// supervisor is the only authority here (it folds in the primary and any
+        /// lazily-pulled repos a resume rehydrates, which the picker never sees).
+        repos: Vec<String>,
     },
     /// An agent's PTY produced output and its pane should repaint. Coalesced by
     /// the loop into a single redraw per tick. The ids are `Arc<str>` (not `String`)

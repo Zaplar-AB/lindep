@@ -78,6 +78,17 @@ pub enum Action {
     /// ended). Mnemonic: agent **t**imeline.
     ToggleLedger,
 
+    // ── Global window switch (any focus, NO prefix) ───────────────────────
+    /// Move focus one window forward, wrapping past the last back to the Spine
+    /// (`Alt-→` by default). Unlike the prefixed [`FocusRight`], this fires even
+    /// from inside a focused chat — it sits above PTY forwarding, so the same two
+    /// keys both step directionally and cycle the whole row. Stolen from the PTY
+    /// by design (Alt-arrows aren't claude editing keys), as the prefix is.
+    CycleNext,
+    /// Move focus one window back, wrapping past the Spine to the last window
+    /// (`Alt-←`). The mirror of [`CycleNext`].
+    CyclePrev,
+
     // ── Prefix verbs (any focus, behind the prefix) ───────────────────────
     FocusLeft,
     FocusRight,
@@ -218,6 +229,17 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::DispatchReady, "dispatch-ready", &["g"]),
     (Action::ChooseRepos, "choose-repos", &["c"]),
     (Action::AskAgent, "ask", &["?"]),
+];
+
+/// `(action, config name, default keys)` for the **global** window-switch chords,
+/// reached from any focus *without* the prefix — they're checked above PTY
+/// forwarding, so they fire even inside a focused chat (the only other keys that
+/// do are the prefix itself). Kept to Alt-arrows by default: claude uses Ctrl-arrow
+/// for word-jump in its prompt, so stealing Alt-arrows costs nothing there.
+/// Overridable via a `[globals]` table in `config.toml`.
+const GLOBAL_DEFAULTS: &[(Action, &str, &[&str])] = &[
+    (Action::CycleNext, "cycle-next", &["alt-right"]),
+    (Action::CyclePrev, "cycle-prev", &["alt-left"]),
 ];
 
 /// The default prefix chord — tmux's `Ctrl-A`, which never collides with
@@ -372,6 +394,8 @@ pub struct Keymap {
     prefix: Binding,
     singles: HashMap<Binding, Action>,
     verbs: HashMap<Binding, Action>,
+    /// Window-switch chords that fire from any focus without the prefix (Alt-arrows).
+    globals: HashMap<Binding, Action>,
 }
 
 impl Default for Keymap {
@@ -391,6 +415,7 @@ impl Default for Keymap {
             prefix: parse_binding(DEFAULT_PREFIX).expect("the default prefix parses"),
             singles: load(DIRECT_DEFAULTS),
             verbs: load(VERB_DEFAULTS),
+            globals: load(GLOBAL_DEFAULTS),
         }
     }
 }
@@ -420,6 +445,18 @@ impl Keymap {
     /// The verb bound to `key` when reached behind the prefix.
     pub fn verb_for(&self, key: KeyEvent) -> Option<Action> {
         self.verbs.get(&Binding::of(key)).copied()
+    }
+
+    /// The global window-switch action bound to `key` (Alt-arrows by default) —
+    /// consulted above PTY forwarding so it works even inside a focused chat.
+    pub fn global_for(&self, key: KeyEvent) -> Option<Action> {
+        self.globals.get(&Binding::of(key)).copied()
+    }
+
+    /// Joined labels of the global chords bound to `action` (for help/hints),
+    /// e.g. `Alt-→`. `—` when unbound.
+    pub fn global_label(&self, action: Action) -> String {
+        join_labels(&self.globals, action)
     }
 
     /// Human label for an arbitrary pressed key (e.g. `W`, `↑`, `Ctrl-A`) — used to
@@ -531,6 +568,11 @@ impl Keymap {
         Self::apply_table(&mut self.verbs, VERB_DEFAULTS, overrides, "verb")
     }
 
+    /// Apply `[globals]` (prefix-less window-switch) overrides.
+    pub fn apply_globals(&mut self, overrides: &[(String, Vec<String>)]) -> Vec<String> {
+        Self::apply_table(&mut self.globals, GLOBAL_DEFAULTS, overrides, "global")
+    }
+
     /// Set the prefix chord from a config string, warning (and keeping the
     /// default) on a bad or reserved value.
     ///
@@ -575,6 +617,14 @@ impl Keymap {
                 self.prefix.label()
             ));
         }
+        // `on_key` arms the prefix before consulting `global_for`, so a global chord
+        // bound onto the prefix is dead too — warn with the same voice as the others.
+        if let Some(a) = self.globals.get(&self.prefix) {
+            warnings.push(format!(
+                "'prefix': {} is also a global switch ({a:?}); that binding is now shadowed",
+                self.prefix.label()
+            ));
+        }
         warnings
     }
 }
@@ -605,6 +655,9 @@ struct ConfigFile {
     /// Prefix verbs (any focus).
     #[serde(default)]
     verbs: HashMap<String, KeySpec>,
+    /// Global window-switch chords (any focus, no prefix — Alt-arrows).
+    #[serde(default)]
+    globals: HashMap<String, KeySpec>,
     /// The `[agents]` table — non-keybinding settings.
     #[serde(default)]
     agents: AgentsConfig,
@@ -700,6 +753,9 @@ pub fn load(local_root: Option<&Path>) -> (Keymap, Settings, Vec<String>) {
                 for w in keymap.apply_verbs(&collect(cfg.verbs)) {
                     warnings.push(format!("{}: {w}", path.display()));
                 }
+                for w in keymap.apply_globals(&collect(cfg.globals)) {
+                    warnings.push(format!("{}: {w}", path.display()));
+                }
                 // Personal config (read last) wins over the repo's.
                 if let Some(mc) = cfg.agents.max_concurrent {
                     settings.max_concurrent = Some(mc);
@@ -722,6 +778,41 @@ mod tests {
 
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn alt_arrows_are_global_window_switch_chords_not_direct_or_verb() {
+        let km = Keymap::default();
+        assert_eq!(
+            km.global_for(ev(KeyCode::Right, KeyModifiers::ALT)),
+            Some(Action::CycleNext)
+        );
+        assert_eq!(
+            km.global_for(ev(KeyCode::Left, KeyModifiers::ALT)),
+            Some(Action::CyclePrev)
+        );
+        // They live in their own band — not a direct Spine key, not a prefix verb —
+        // so on_key's global check is the only thing that resolves them.
+        assert_eq!(km.action_for(ev(KeyCode::Right, KeyModifiers::ALT)), None);
+        assert_eq!(km.verb_for(ev(KeyCode::Right, KeyModifiers::ALT)), None);
+        // A bare arrow is unaffected — still the Spine's direct move/side key.
+        assert_eq!(km.global_for(ev(KeyCode::Right, KeyModifiers::NONE)), None);
+        // The help/hint label renders the arrow glyph.
+        assert_eq!(km.global_label(Action::CycleNext), "Alt-→");
+    }
+
+    #[test]
+    fn a_globals_table_can_rebind_the_window_switch() {
+        let mut km = Keymap::default();
+        let warnings =
+            km.apply_globals(&[("cycle-next".into(), vec!["alt-l".into()])]);
+        assert!(warnings.is_empty(), "a clean rebind warns about nothing: {warnings:?}");
+        assert_eq!(
+            km.global_for(ev(KeyCode::Char('l'), KeyModifiers::ALT)),
+            Some(Action::CycleNext)
+        );
+        // The default chord is released by the rebind.
+        assert_eq!(km.global_for(ev(KeyCode::Right, KeyModifiers::ALT)), None);
     }
 
     #[test]

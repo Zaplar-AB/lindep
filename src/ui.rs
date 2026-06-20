@@ -803,6 +803,8 @@ fn render_agent_window(
         Span::styled(format!(" {label}  "), Style::new().fg(hue).bold()),
         Span::styled(format!("{key} "), Style::new().fg(INK).bold()),
     ];
+    // Name the repos/worktrees this agent owns, right after the issue key (ENG-536).
+    title.extend(repo_badge(app, issue));
     if pinned {
         title.push(Span::styled("⊙ pin ", Style::new().fg(ORANGE_400)));
     } else {
@@ -951,6 +953,9 @@ fn render_deps_window(
         ));
         title.push(Span::raw(" "));
     }
+    // Name the repos/worktrees this agent owns, so a re-rooted/multi-repo coin
+    // shows what it spans (ENG-536). Keyed on the deps root the title shows.
+    title.extend(repo_badge(app, &root));
     if let Some(s) = status {
         let (mark, mstyle) = theme::agent_marker(s, app.frame);
         title.push(Span::styled(mark, mstyle));
@@ -1374,6 +1379,7 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
 fn render_help(app: &mut App, frame: &mut Frame) {
     let direct = |action| app.keymap.label_for(action);
     let verb = |action| app.keymap.verb_label(action);
+    let global = |action| app.keymap.global_label(action);
     let prefix = app.prefix_label();
 
     let rows: Vec<(String, std::borrow::Cow<'static, str>)> = vec![
@@ -1451,6 +1457,10 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         (
             format!("{} {}", verb(Action::FocusLeft), verb(Action::FocusRight)),
             "focus the window left / right".into(),
+        ),
+        (
+            format!("{} {}", global(Action::CyclePrev), global(Action::CycleNext)),
+            "switch / cycle windows — no prefix, wraps, works inside a chat".into(),
         ),
         (
             verb(Action::FocusNav),
@@ -2127,6 +2137,31 @@ fn status_label(status: Status) -> &'static str {
 /// Truncate to a display-*width* budget (cells), not a char count, so wide
 /// (CJK / emoji) characters don't overflow the column. Reserves one cell for the
 /// ellipsis.
+/// A compact title badge naming the repos/worktrees an agent owns (ENG-536), so a
+/// multi-repo agent is no longer indistinguishable from a single-repo one in the
+/// header. Primary first (the order the supervisor reports on `AgentSpawned`), each
+/// sibling prefixed with `+`; the whole list is width-bounded so it can't crowd out
+/// the issue title. Empty (no spans) until the supervisor reports a set — a resuming
+/// card stays quiet rather than guessing.
+fn repo_badge(app: &App, issue: &str) -> Vec<Span<'static>> {
+    let Some(repos) = app.agent_repos.get(issue).filter(|r| !r.is_empty()) else {
+        return Vec::new();
+    };
+    let mut label = String::new();
+    for (i, handle) in repos.iter().enumerate() {
+        if i == 0 {
+            label.push_str(handle);
+        } else {
+            label.push_str(" +");
+            label.push_str(handle);
+        }
+    }
+    vec![
+        Span::styled("⊞ ", Style::new().fg(VIOLET_400)),
+        Span::styled(format!("{} ", truncate(&label, 32)), Style::new().fg(VIOLET_200)),
+    ]
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if UnicodeWidthStr::width(s) <= max {
         return s.to_string();

@@ -697,6 +697,21 @@ impl WindowSet {
         self.focus = (self.focus + 1).min(self.windows.len() - 1);
     }
 
+    /// Move focus one window forward/back, *wrapping* the ends (Alt-→/←). Forward
+    /// past the last window lands on the Spine (index 0); back from the Spine lands
+    /// on the last window — so the two keys cycle the whole row from any focus.
+    pub fn cycle_focus(&mut self, forward: bool) {
+        let n = self.windows.len();
+        if n <= 1 {
+            return;
+        }
+        self.focus = if forward {
+            (self.focus + 1) % n
+        } else {
+            (self.focus + n - 1) % n
+        };
+    }
+
     /// Jump focus straight home to the Spine in one hop — the dedicated
     /// "back to nav" gesture (so you never step through the deps pane to return).
     /// Clears zoom too: a zoomed coin hides the Spine entirely, so "back to nav"
@@ -944,6 +959,35 @@ mod tests {
             !ws.layout_manual,
             "mosaic → auto (adaptive layout restored)"
         );
+    }
+
+    #[test]
+    fn cycle_focus_wraps_both_ways_across_the_whole_row() {
+        // Spine + two pinned coins = a three-window row [0,1,2].
+        let graph = demo::graph();
+        let mut ws = WindowSet::new();
+        ws.ensure_preview("ZAP-204", CoinMode::Chat, &graph);
+        ws.focus_preview();
+        ws.pin_preview();
+        ws.ensure_preview("ZAP-210", CoinMode::Chat, &graph);
+        ws.focus_preview();
+        ws.pin_preview();
+        assert_eq!(ws.windows.len(), 3, "spine + two pinned coins");
+
+        ws.focus = 0;
+        ws.cycle_focus(true);
+        assert_eq!(ws.focus, 1, "forward steps off the spine");
+        ws.cycle_focus(true);
+        assert_eq!(ws.focus, 2);
+        ws.cycle_focus(true);
+        assert_eq!(ws.focus, 0, "forward past the last wraps home to the spine");
+        ws.cycle_focus(false);
+        assert_eq!(ws.focus, 2, "back from the spine wraps to the last window");
+
+        // A lone spine has nothing to cycle to — stays put, no panic on len 1.
+        let mut solo = WindowSet::new();
+        solo.cycle_focus(true);
+        assert_eq!(solo.focus, 0);
     }
 
     #[test]
