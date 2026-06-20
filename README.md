@@ -51,11 +51,11 @@ a `Bearer` OAuth token).
 ## How it reads
 
 The **spine** — the permanent left column — lists every issue in the project as a
-**readiness schedule**: one scroll banded top→bottom **NEEDS-YOU · RUNNING ·
+**readiness schedule**: one scroll banded top→bottom **NEEDS-YOU · WORKING · IDLE ·
 READY · BLOCKED · DONE**, so "what should I look at right now" is always at the
 top and the dispatchable work — the **READY** lane, marked with a `▸` rail — reads
 at a glance. Within each band, highest-downstream-impact first (then priority).
-Press <kbd>r</kbd> to toggle to plain id order. Press <kbd>d</kbd> to open a
+Press <kbd>d</kbd> to open a
 **dependency window**: a
 **lens** on the selected issue:
 
@@ -82,7 +82,6 @@ When the **spine** is focused:
 | <kbd>g</kbd> | open the layered top-down overview (Fleet) window |
 | <kbd>/</kbd> | fuzzy-find issues by id or title |
 | <kbd>f</kbd> | filter: all / has-deps |
-| <kbd>r</kbd> | sort: readiness schedule / id |
 | <kbd>c</kbd> | jump through issues that sit on a cycle |
 | <kbd>n</kbd> | jump to the next issue whose agent needs you |
 | <kbd>i</kbd> | summary card for the selected issue (details + deps) |
@@ -91,7 +90,7 @@ When the **spine** is focused:
 
 When a **dependency window** is focused: <kbd>↑</kbd>/<kbd>↓</kbd> move,
 <kbd>←</kbd>/<kbd>→</kbd> (or <kbd>h</kbd>/<kbd>l</kbd>) switch the active tree
-(upstream ↔ downstream), <kbd>Enter</kbd> re-root onto the selected node,
+(blocked-by ↔ blocks), <kbd>Enter</kbd> re-root onto the selected node,
 <kbd>Space</kbd> collapse / expand, <kbd>b</kbd>/<kbd>Backspace</kbd> back to the
 previous root. <kbd>Tab</kbd> flips a docked agent window between its chat and
 deps faces.
@@ -100,8 +99,8 @@ Window management (focus, zoom, pin, close, layout) lives behind the
 
 ### What the marks mean
 
-- Status: `●` done · `◐` in progress · `○` todo/backlog · `◇` triage · `⊘` canceled
-- Priority: `▲` urgent · `△` high · `◦` medium · `▽` low
+- Status: `●` done · `◐` in progress · `○` todo · `·` backlog · `◇` triage · `⊗` canceled
+- Priority: `‼` urgent · `!` high · `◻` medium · `▫` low
 - `▸` (left rail) ready to dispatch — unblocked, unresolved, no live agent
 - `⊘` blocked (an unresolved blocker) · `↺` on a dependency cycle
 - `⇗ … [ext]` a cross-project blocker, shown as a terminal leaf
@@ -111,9 +110,10 @@ Window management (focus, zoom, pin, close, layout) lives behind the
 
 When the active Linear project is registered in `~/.lindep/registry.toml` (see
 [Managed workspaces](#managed-workspaces-v16) below), lindep doubles as a
-**cockpit that launches and supervises real `claude` (Claude Code) agents** — one
-per issue, each in its own git worktree + branch, in a workspace lindep clones and
-owns (you can run it from anywhere, not just inside a checkout). Linear stays the
+**cockpit that launches and supervises real `claude` (Claude Code) agents** —
+usually one per issue, plus optional ad-hoc `ask-*` agents, each in its own git
+worktree + branch in a workspace lindep clones and owns (you can run it from
+anywhere, not just inside a checkout). Linear stays the
 source of truth; lindep is the visibility + orchestration layer (it spawns the
 real `claude`, it does not reimplement it). Open a project that isn't registered
 yet and lindep walks you through connecting it to a repo (see
@@ -122,7 +122,7 @@ read-only graph viewer.
 
 The cockpit is a **tiling window manager**: a horizontal strip of focusable
 columns — the permanent **spine** (the readiness-banded issue schedule), live
-**agent** PTYs (one per issue), and **dependency** windows. The focused window takes every
+**agent** PTYs (issue-backed or ad-hoc), and **dependency** windows. The focused window takes every
 keystroke; **`Ctrl-A` is the prefix** that escapes to window commands (press it
 twice to send a literal `Ctrl-A` through to the agent).
 
@@ -135,6 +135,11 @@ twice to send a literal `Ctrl-A` through to the agent).
 | <kbd>Ctrl-A</kbd> <kbd>p</kbd> | Pin / unpin the focused window — pinned windows persist and auto-resume on restart |
 | <kbd>Ctrl-A</kbd> <kbd>w</kbd> | Close = undock the focused window (the agent keeps running) |
 | <kbd>Ctrl-A</kbd> <kbd>x</kbd> | Kill the focused agent (confirmed) |
+| <kbd>Ctrl-A</kbd> <kbd>r</kbd> | Restart the on-screen issue's agent (reclaim a dead one + relaunch) |
+| <kbd>Ctrl-A</kbd> <kbd>j</kbd> | Walk to the next live agent |
+| <kbd>Ctrl-A</kbd> <kbd>g</kbd> | Dispatch every READY issue up to the concurrency cap |
+| <kbd>Ctrl-A</kbd> <kbd>c</kbd> | Launch, choosing which repos the agent spans — opens the repo select even on a single-repo project; <kbd>a</kbd> in the modal adds a registered repo this project doesn't yet list (persisted, no restart) |
+| <kbd>Ctrl-A</kbd> <kbd>?</kbd> | Start an ad-hoc agent with a throwaway worktree |
 | <kbd>Ctrl-A</kbd> <code>&#124;</code> | Pin the layout: rail ⇄ mosaic (otherwise auto, by docked-window count) |
 | <kbd>Ctrl-A</kbd> <kbd>s</kbd> | Switch project (opens the project switcher) |
 | <kbd>Ctrl-A</kbd> <kbd>o</kbd> | (Re)configure this project — re-open the setup wizard (applies on restart) |
@@ -142,17 +147,19 @@ twice to send a literal `Ctrl-A` through to the agent).
 | <kbd>Ctrl-A</kbd> <kbd>e</kbd> | Open the focused agent's workspace in your editor |
 | <kbd>Ctrl-A</kbd> <kbd>d</kbd> | Discard a finished issue's workspace (push branches + remove worktrees) |
 | <kbd>Ctrl-A</kbd> <kbd>m</kbd> | Reclaim disk — free unreferenced mirrors |
-| <kbd>Ctrl-A</kbd> <kbd>g</kbd> | Jump focus home to the spine |
+| <kbd>Ctrl-A</kbd> <kbd>0</kbd> | Jump focus home to the spine |
 | <kbd>Ctrl-A</kbd> <kbd>q</kbd> | Quit the cockpit |
 | <kbd>n</kbd> · <kbd>Ctrl-A</kbd> <kbd>n</kbd> | Jump to the next issue whose agent needs you (works from any focus) |
-| <kbd>r</kbd> · <kbd>f</kbd> | Cycle the spine sort (readiness / id) · filter (all / has-deps) |
+| <kbd>f</kbd> | Cycle the issue filter (all / has-deps) |
+| <kbd>p</kbd> | Pin / unpin the selected issue straight from the spine (toggle — no prefix needed) |
 | <kbd>i</kbd> · <kbd>t</kbd> | Summary card · agent run ledger for the selected issue |
 
 Each issue **row** carries its agent's state two ways: a whole-row colour tint
-plus a marker in a fixed left gutter — `◌` spawning · `⠙` running (an animated
-spinner) · `⚑` needs you (the row breathes) · `◦` idle · `✓` done · `✗` failed;
-the header shows a fleet summary (`3 agents · 1 needs you`). Live agents float to
-the top **NEEDS-YOU** and **RUNNING** bands of the schedule, so the spine *is* the
+plus a marker in a fixed left gutter — `◌` spawning · `⠋` working (an animated
+spinner) · `⚑` needs you (the row breathes) · `◦` idle · `◼` stopped (you
+cancelled it) · `✓` done · `✗` failed; the header shows a fleet summary
+(`3 agents · 1 needs you`). Live agents float to the top **NEEDS-YOU**,
+**WORKING** and **IDLE** bands of the schedule, so the spine *is* the
 agents roster — there's no separate tab. **Dispatch** is just <kbd>Enter</kbd> on
 a **READY** row (it launches the agent); a **BLOCKED** row is refused with its
 blocker named, so you never launch work that can't progress. The Fleet overview
@@ -174,9 +181,16 @@ Agents that raise a permission prompt or go idle light up live via Claude
 lindep persists each agent's `session_id` and `--resume`s it on relaunch, so the
 *process* is disposable but the *conversation* is not. Every agent commit
 **auto-pushes** to its branch's remote (post-commit hook → non-blocking push), so
-work is never invisible. Press <kbd>Ctrl-A</kbd> <kbd>e</kbd> to open the focused
+work is never invisible — and a *rejected* push (a diverged or protected remote)
+raises a standing `⇡ N unpushed` chip rather than reporting a false success, so
+stranded commits are never silently lost. Press <kbd>Ctrl-A</kbd> <kbd>e</kbd> to open the focused
 agent's workspace in your editor (`$VISUAL`/`$EDITOR`, else `code`). With `--demo`
 lindep is just the graph viewer.
+
+`Ctrl-A ?` starts an **ad-hoc** agent that is not tied to a Linear issue. It gets
+a synthetic `ask-*` row, a normal isolated worktree/session, and the same repo
+picker as issue launches; when it exits, lindep removes the throwaway worktree
+without pushing that branch.
 
 ### Managed workspaces (v1.6)
 
@@ -234,7 +248,6 @@ prefix = "ctrl-a"                  # the escape to window commands (default)
 [keys]
 deps = "D"                         # open a dependency window (default d)
 filter = ["f", "ctrl-f"]           # an action may take several keys
-sort = "s"                         # cycle the spine sort (default r)
 
 [verbs]
 kill = "k"                         # Ctrl-A k to kill the focused agent (default x)
@@ -243,12 +256,14 @@ layout = "|"
 open-in-editor = "e"               # Ctrl-A e to open the agent's workspace (default e)
 ```
 
-Direct-key action names: `move-up` `move-down` `switch-side` `enter`
-`toggle-collapse` `back` `deps` `fleet` `jump-cycle` `jump-needs-you`
-`filter` `sort` `search` `help` `summary` `ledger` `context`. Verb names:
+Direct-key action names: `move-up` `move-down` `move-top` `move-bottom`
+`page-up` `page-down` `switch-side` `enter` `toggle-collapse` `back` `deps`
+`fleet` `jump-cycle` `jump-needs-you` `filter` `search` `help` `summary`
+`ledger` `context`. Verb names:
 `focus-left` `focus-right` `focus-nav` `zoom` `pin` `close` `kill` `layout`
 `open` `quit` `jump-needs-you` `context` `switch-project` `open-in-editor`
-`reclaim-mirrors` `discard-workspace` `global-view` `configure-project`.
+`reclaim-mirrors` `discard-workspace` `global-view` `configure-project` `restart`
+`next-agent` `dispatch-ready` `choose-repos` `ask`.
 
 (The overlay/issue actions — `search` `help` `summary` `ledger` — are direct-only
 as of v1.7: the prefix keeps spatial pane verbs. `jump-needs-you` and `context`
@@ -286,6 +301,10 @@ max_concurrent = 16
 - **External** (cross-project) blockers are kept as terminal leaves so the graph
   stays scoped to one project while still showing outside risk.
 - `--snapshot [WxH]` renders one frame as plain text (for screenshots / CI).
+- **Copy / paste**: lindep doesn't capture the mouse, so use your terminal's normal
+  select/copy (often Shift- or Option-drag) to copy issue keys and paths. Pasting a
+  multi-line prompt into a focused agent chat is reassembled as one block (bracketed
+  paste), not submitted line-by-line.
 
 ## Develop
 
@@ -304,7 +323,7 @@ is in [`docs/ENG-392-pty-spike-verdict.md`](docs/ENG-392-pty-spike-verdict.md).
 Modules: `model` (graph + cycle/level algorithms, pure), `linear` (GraphQL
 client), `app` (state + input), `ui` (ratatui rendering), `theme` (palette),
 `demo` (synthetic graph). Cockpit spine: `event` (tokio runtime + `AppEvent`
-channel), `worktree` (one git worktree/branch per issue), `session` (durable
+channel), `worktree` (one git worktree/branch per issue or `ask-*` id), `session` (durable
 per-`(project, issue)` session-id state), `backend` (the `AgentBackend` trait +
 PTY-hosted Claude backend), `notify` (Claude hooks → loopback endpoint → events),
 `supervisor` (launch / cancel / shutdown of the agent fleet), `keymap`

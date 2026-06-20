@@ -203,6 +203,13 @@ pub fn reconcile_and_rehydrate(
                 issue: session.issue.clone(),
                 status,
             });
+            if session.kept_unpushed {
+                let _ = events.send(AppEvent::DiscardKeptWorktree {
+                    project_id: project_id.to_string(),
+                    issue: session.issue.clone(),
+                    reason: "workspace kept on disk — re-discard after fixing cleanup".to_string(),
+                });
+            }
         }
     }
     resumable
@@ -236,21 +243,18 @@ fn materialize_session_repo(
     Ok(())
 }
 
-/// Tear down a finished issue's workspace (ENG-541): for each repo the issue
-/// materialised, **push its branch first** (so committed work is safe on the true
-/// remote — skipped for a local-only repo, whose origin is the synthesised mirror),
-/// then remove the worktree, **keeping the branch**. The L2 clones and the shared
-/// mirror are left intact (reference-counted separately by the reclaim prompt) — only
-/// the per-issue worktrees are reclaimed. Best-effort and warn-never-abort: a repo
-/// whose push is **rejected keeps its worktree** (its work may not be safe yet),
-/// surfaced as a footer, so unpushed work is never silently discarded; the session
-/// record is dropped only when every repo's worktree was reclaimed.
+/// Tear down a finished workspace (ENG-541): for normal issues, push each branch
+/// first (so committed work is safe on the true remote), then remove the worktree,
+/// keeping the branch. Ad-hoc ask agents pass `push = false`, so their throwaway
+/// branches are never published. Best-effort and warn-never-abort: any push/remove
+/// failure keeps the worktree and the session warning.
 fn teardown_issue(
     registry: &Registry,
     store: &Arc<Mutex<SessionStore>>,
     events: &AppEventTx,
     project_id: &str,
     issue: &str,
+    push: bool,
 ) {
     let Ok(descriptor) = registry.project(project_id).cloned() else {
         return;
@@ -274,8 +278,11 @@ fn teardown_issue(
     };
 
     let mut all_removed = true;
+    let mut keep_reasons = Vec::new();
     for handle in &repos {
         let Some(entry) = registry.repo(handle).cloned() else {
+            all_removed = false;
+            keep_reasons.push(format!("{handle}: repo is no longer configured"));
             continue;
         };
         let clone = layout.repo_clone_path(&descriptor.handle, handle);
@@ -284,10 +291,13 @@ fn teardown_issue(
         }
         let worktrees_root = layout.worktrees_dir(&descriptor.handle);
         let Ok(mgr) = WorktreeManager::with_layout(&clone, &prefix, &worktrees_root, handle) else {
+            all_removed = false;
+            keep_reasons.push(format!("{handle}: could not open worktree manager"));
             continue;
         };
         let wt_path = mgr.worktree_path(issue);
-        if crate::mirror::can_push_to_remote(&entry)
+        if push
+            && crate::mirror::can_push_to_remote(&entry)
             && wt_path.is_dir()
             // Serialize against an in-flight auto-push of the same handle (shared
             // per-handle push mutex) so teardown's push can't lose a race on git's
@@ -298,6 +308,7 @@ fn teardown_issue(
                 "teardown {issue}/{handle}: push rejected, keeping worktree ({e})"
             )));
             all_removed = false;
+            keep_reasons.push(format!("{handle}: push rejected ({e})"));
             continue;
         }
         if let Err(e) = mgr.remove(issue) {
@@ -305,6 +316,7 @@ fn teardown_issue(
                 "teardown {issue}/{handle}: {e}"
             )));
             all_removed = false;
+            keep_reasons.push(format!("{handle}: remove failed ({e})"));
         }
     }
 
@@ -329,6 +341,7 @@ fn teardown_issue(
                 record.name
             )));
             all_removed = false;
+            keep_reasons.push(format!("{}: scratch teardown failed ({e})", record.name));
             remaining.push(record);
         }
     }
@@ -340,8 +353,32 @@ fn teardown_issue(
             // Keep the session, but persist the pruned scratch set so a retry doesn't
             // re-run a teardown that already succeeded.
             s.set_scratch(issue, remaining);
+            s.set_kept_unpushed(issue, true);
         }
         let _ = s.save();
+    }
+
+    // Report a TERMINAL outcome so the cockpit tears down the UI only on a real removal,
+    // and never strands unpushed work behind a synchronous "it's gone" (D-HIGH).
+    if all_removed {
+        let _ = events.send(AppEvent::WorkspaceDiscarded {
+            project_id: project_id.to_string(),
+            issue: issue.to_string(),
+        });
+    } else {
+        let reason = if keep_reasons.is_empty() {
+            "workspace kept on disk — re-discard after fixing cleanup".to_string()
+        } else {
+            format!(
+                "{} — re-discard after fixing cleanup",
+                keep_reasons.join("; ")
+            )
+        };
+        let _ = events.send(AppEvent::DiscardKeptWorktree {
+            project_id: project_id.to_string(),
+            issue: issue.to_string(),
+            reason,
+        });
     }
 }
 
@@ -465,6 +502,13 @@ fn reemit_statuses(store: &Arc<Mutex<SessionStore>>, events: &AppEventTx, projec
                 issue: session.issue.clone(),
                 status: session.status,
             });
+            if session.kept_unpushed {
+                let _ = events.send(AppEvent::DiscardKeptWorktree {
+                    project_id: project_id.to_string(),
+                    issue: session.issue.clone(),
+                    reason: "workspace kept on disk — re-discard after fixing cleanup".to_string(),
+                });
+            }
         }
     }
 }
@@ -736,6 +780,9 @@ enum WorkspaceCommand {
         /// Up-front-selected repo handles beyond the primary (ENG-536); empty for a
         /// single-repo launch.
         repos: Vec<String>,
+        /// Ad-hoc ask agents reuse the normal launch path, but their final cleanup
+        /// skips branch publication because the branch is intentionally throwaway.
+        adhoc: bool,
     },
     Cancel {
         project_id: String,
@@ -747,6 +794,7 @@ enum WorkspaceCommand {
     Teardown {
         project_id: String,
         issue: String,
+        push: bool,
     },
     /// Materialise a confirmed lazy-pull (ENG-542): clone + worktree an extra repo
     /// into a running issue's workspace, then update its repo set. Re-fenced to the
@@ -801,6 +849,27 @@ impl WorkspaceHandle {
             title,
             size,
             repos,
+            adhoc: false,
+        });
+    }
+
+    /// Launch an ad-hoc "ask" agent. It uses the same worktree/session/PTY path as
+    /// issue agents, keyed by a synthetic `ask-*` id; only teardown differs.
+    pub fn launch_ask(
+        &self,
+        project_id: String,
+        issue: String,
+        title: String,
+        size: Option<(u16, u16)>,
+        repos: Vec<String>,
+    ) {
+        let _ = self.cmd_tx.send(WorkspaceCommand::Launch {
+            project_id,
+            issue,
+            title,
+            size,
+            repos,
+            adhoc: true,
         });
     }
 
@@ -816,9 +885,20 @@ impl WorkspaceHandle {
     /// then remove its per-issue worktrees (keeping branches). Only meaningful for a
     /// non-live agent — the cockpit gates it on that.
     pub fn teardown(&self, project_id: String, issue: String) {
-        let _ = self
-            .cmd_tx
-            .send(WorkspaceCommand::Teardown { project_id, issue });
+        let _ = self.cmd_tx.send(WorkspaceCommand::Teardown {
+            project_id,
+            issue,
+            push: true,
+        });
+    }
+
+    /// Tear down an ad-hoc agent workspace without pushing the throwaway branch.
+    pub fn teardown_ask(&self, project_id: String, issue: String) {
+        let _ = self.cmd_tx.send(WorkspaceCommand::Teardown {
+            project_id,
+            issue,
+            push: false,
+        });
     }
 
     /// Materialise a confirmed lazy-pull (ENG-542): clone + worktree `repo_handle`
@@ -908,9 +988,21 @@ impl Workspace {
                     title,
                     size,
                     repos,
+                    adhoc,
                 } => {
                     if let Some(handle) = self.ensure_plane(&project_id).await {
-                        handle.launch_with_repos(issue, title, size, repos);
+                        if adhoc {
+                            handle.launch_ask(issue, title, size, repos);
+                        } else {
+                            handle.launch_with_repos(issue, title, size, repos);
+                        }
+                    } else {
+                        let _ = self.builder.events.send(AppEvent::LaunchRejected {
+                            issue: issue.clone(),
+                            reason: format!(
+                                "launch {issue} failed: workspace for project {project_id} is unavailable"
+                            ),
+                        });
                     }
                 }
                 WorkspaceCommand::Cancel { project_id, issue } => {
@@ -920,7 +1012,11 @@ impl Workspace {
                         plane.handle.cancel(issue);
                     }
                 }
-                WorkspaceCommand::Teardown { project_id, issue } => {
+                WorkspaceCommand::Teardown {
+                    project_id,
+                    issue,
+                    push,
+                } => {
                     // Push + remove the issue's worktrees off the command loop (it
                     // shells out to git). Fire-and-forget — the cockpit already
                     // undocked the window; a footer surfaces any per-repo problem.
@@ -933,7 +1029,7 @@ impl Workspace {
                         let registry = self.registry.clone();
                         let events = self.builder.events.clone();
                         tokio::task::spawn_blocking(move || {
-                            teardown_issue(&registry, &store, &events, &project_id, &issue);
+                            teardown_issue(&registry, &store, &events, &project_id, &issue, push);
                         });
                     }
                 }
@@ -1521,8 +1617,8 @@ mod tests {
         ws.launch("proj-b".into(), "ENG-1".into(), "three".into(), None);
         let at_capacity = eventually(|| {
             while let Ok(ev) = rx.try_recv() {
-                if let AppEvent::Notification(m) = ev
-                    && m.contains("at capacity")
+                if let AppEvent::LaunchRejected { reason, .. } = ev
+                    && reason.contains("at capacity")
                 {
                     return true;
                 }
@@ -1724,7 +1820,7 @@ mod tests {
         }
 
         let (tx, _rx) = crate::event::channel();
-        teardown_issue(&registry, &store, &tx, "proj", "ENG-1");
+        teardown_issue(&registry, &store, &tx, "proj", "ENG-1", true);
 
         // The worktree is gone and the session forgotten, but the branch is KEPT
         // (its commits outlive the disposable checkout — a re-launch resumes it).

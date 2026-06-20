@@ -30,7 +30,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Anything that can go wrong driving `git`.
 #[derive(Debug, thiserror::Error)]
@@ -570,6 +572,42 @@ pub fn validate_issue_id(issue: &str) -> Result<(), WorktreeError> {
     }
 }
 
+static ASK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Mint a path/ref-safe synthetic issue id for an ad-hoc "ask" agent.
+pub fn synthetic_ask_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let counter = ASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("ask-{}-{}", base36(nanos), base36(counter.into()))
+}
+
+pub fn is_synthetic_ask_id(issue: &str) -> bool {
+    issue
+        .strip_prefix("ask-")
+        .is_some_and(|rest| rest.split('-').count() == 2 && validate_issue_id(issue).is_ok())
+}
+
+fn base36(mut value: u128) -> String {
+    if value == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while value > 0 {
+        let digit = (value % 36) as u8;
+        let byte = match digit {
+            0..=9 => b'0' + digit,
+            _ => b'a' + (digit - 10),
+        };
+        out.push(byte);
+        value /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("base36 emits ascii")
+}
+
 /// Whether `prefix` is safe as the leading segment(s) of a branch ref
 /// `<prefix>/<issue>` (the form [`WorktreeManager::branch_name`] builds). Replicates
 /// the `git check-ref-format` rules that bear on a prefix: non-empty, no whitespace
@@ -778,6 +816,16 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_ask_ids_are_safe_and_distinct() {
+        let a = synthetic_ask_id();
+        let b = synthetic_ask_id();
+
+        assert_ne!(a, b);
+        assert!(is_synthetic_ask_id(&a));
+        assert!(validate_issue_id(&a).is_ok());
+    }
+
+    #[test]
     fn valid_branch_prefix_accepts_real_namespaces_and_rejects_bad_refs() {
         for ok in ["felix", "lindep", "team/felix", "a-b_c", "user.name"] {
             assert!(is_valid_branch_prefix(ok), "{ok:?} should be accepted");
@@ -786,8 +834,23 @@ mod tests {
         // `//` segment, and a segment starting `.` / ending `.`/`.lock` would each make
         // `git worktree add -b <prefix>/<issue>` reject the ref for every issue.
         for bad in [
-            "", "has space", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "a..b",
-            "a@{b", "/lead", "trail/", "a//b", ".hidden", "ends.", "x.lock",
+            "",
+            "has space",
+            "a~b",
+            "a^b",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a\\b",
+            "a..b",
+            "a@{b",
+            "/lead",
+            "trail/",
+            "a//b",
+            ".hidden",
+            "ends.",
+            "x.lock",
         ] {
             assert!(!is_valid_branch_prefix(bad), "{bad:?} should be rejected");
         }

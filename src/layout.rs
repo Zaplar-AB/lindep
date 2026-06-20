@@ -40,6 +40,12 @@ pub struct Placement {
     pub rect: Rect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RailOverflow {
+    pub hidden: usize,
+    pub rect: Rect,
+}
+
 /// Which window is the big (live-PTY) pane in the rail layout: the focused window,
 /// or — when the Spine itself is focused — the **active** window (the selection's
 /// pinned coin if it has one, else the transient preview). `None` only when there
@@ -69,9 +75,9 @@ pub fn rail(
     focus: usize,
     active_idx: Option<usize>,
     preview_idx: Option<usize>,
-) -> (Vec<Placement>, Vec<Placement>) {
+) -> (Vec<Placement>, Vec<Placement>, Option<RailOverflow>) {
     if n == 0 || area.area() == 0 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), None);
     }
     let mut full = Vec::new();
 
@@ -82,7 +88,7 @@ pub fn rail(
     });
     // No room past the Spine → just the Spine (everything else is off-screen).
     if spine_w >= area.width {
-        return (full, Vec::new());
+        return (full, Vec::new(), None);
     }
 
     let big = rail_big_index(n, focus, active_idx);
@@ -114,19 +120,33 @@ pub fn rail(
     }
 
     let mut cards = Vec::new();
+    let mut overflow = None;
     if rail_w > 0 {
         let rail_rect = Rect::new(rest_x + big_w, area.y, rail_w, area.height);
-        for (slot, rect) in split_1d(rail_rect, card_indices.len(), true)
-            .into_iter()
-            .enumerate()
-        {
-            cards.push(Placement {
-                index: card_indices[slot],
-                rect,
-            });
+        let slots = usize::from(rail_rect.height);
+        if slots > 0 {
+            let visible = if card_indices.len() > slots {
+                slots.saturating_sub(1)
+            } else {
+                card_indices.len()
+            };
+            let hidden = card_indices.len().saturating_sub(visible);
+            let total_slots = visible + usize::from(hidden > 0);
+            let rects = split_1d(rail_rect, total_slots, true);
+            for (slot, rect) in rects.iter().copied().take(visible).enumerate() {
+                cards.push(Placement {
+                    index: card_indices[slot],
+                    rect,
+                });
+            }
+            if hidden > 0
+                && let Some(rect) = rects.get(visible).copied()
+            {
+                overflow = Some(RailOverflow { hidden, rect });
+            }
         }
     }
-    (full, cards)
+    (full, cards, overflow)
 }
 
 /// Whether window `idx` renders as a live PTY in the rail right now — i.e. it is
@@ -261,7 +281,8 @@ mod tests {
     fn rail_places_the_spine_then_the_big_pane_then_cards_never_the_preview() {
         // windows: [Spine, Preview(1), Pin(2), Pin(3)], focus on Pin(2); the
         // selection is unpinned so active == preview == 1.
-        let (full, cards) = rail(area(), 4, 2, Some(1), Some(1));
+        let (full, cards, overflow) = rail(area(), 4, 2, Some(1), Some(1));
+        assert!(overflow.is_none());
         assert_eq!(full[0].index, 0, "the spine leads");
         assert_eq!(full[0].rect.width, SPINE_WIDTH);
         assert_eq!(full[0].rect.x, 0);
@@ -285,7 +306,8 @@ mod tests {
     fn rail_cards_every_pinned_coin_when_the_spine_is_focused() {
         // Spine focused → the active window (here the preview, 1) is the big pane;
         // both pins (2,3) card.
-        let (full, cards) = rail(area(), 4, 0, Some(1), Some(1));
+        let (full, cards, overflow) = rail(area(), 4, 0, Some(1), Some(1));
+        assert!(overflow.is_none());
         assert_eq!(full[1].index, 1, "the preview is the big pane");
         let carded: Vec<usize> = cards.iter().map(|p| p.index).collect();
         assert_eq!(carded, vec![2, 3]);
@@ -295,7 +317,8 @@ mod tests {
     fn rail_drops_the_card_column_on_a_narrow_terminal() {
         // 80 wide → 36 past the spine: not enough for a readable big pane + rail,
         // so the big pane takes it all and no cards are drawn (still focusable).
-        let (full, cards) = rail(Rect::new(0, 0, 80, 24), 4, 2, Some(1), Some(1));
+        let (full, cards, overflow) = rail(Rect::new(0, 0, 80, 24), 4, 2, Some(1), Some(1));
+        assert!(overflow.is_none());
         assert_eq!(full.len(), 2, "spine + big pane");
         assert!(cards.is_empty(), "the rail is dropped when it won't fit");
         assert_eq!(
@@ -316,7 +339,7 @@ mod tests {
                 for focus in 0..n {
                     let preview = (n > 1).then_some(1usize);
                     let active = preview; // unpinned selection → active == preview
-                    let (full, _cards) =
+                    let (full, _cards, _overflow) =
                         rail(Rect::new(0, 0, width, 24), n, focus, active, preview);
                     // The big pane is the one full placement past the Spine (idx 0).
                     let big = full.iter().map(|p| p.index).find(|&i| i != 0);
@@ -377,7 +400,10 @@ mod tests {
     #[test]
     fn layout_helpers_survive_a_zero_area() {
         let z = Rect::new(0, 0, 0, 0);
-        assert_eq!(rail(z, 3, 0, Some(1), Some(1)), (Vec::new(), Vec::new()));
+        assert_eq!(
+            rail(z, 3, 0, Some(1), Some(1)),
+            (Vec::new(), Vec::new(), None)
+        );
         assert!(mosaic(z, 3).is_empty());
         assert!(split_grid(z, 3).is_empty());
     }
@@ -387,10 +413,27 @@ mod tests {
         // At width ≤ SPINE_WIDTH the renderer draws only the spine and no cards —
         // so no carded agent is "visible" and the poll loop stays quiet.
         for w in [1u16, 20, 44] {
-            let (full, cards) = rail(Rect::new(0, 0, w, 24), 4, 2, Some(1), Some(1));
+            let (full, cards, overflow) = rail(Rect::new(0, 0, w, 24), 4, 2, Some(1), Some(1));
             assert_eq!(full.len(), 1, "only the spine fits");
             assert!(cards.is_empty());
+            assert!(overflow.is_none());
         }
+    }
+
+    #[test]
+    fn rail_uses_a_more_marker_instead_of_zero_height_cards() {
+        let tiny = Rect::new(0, 0, 200, 3);
+        let (full, cards, overflow) = rail(tiny, 8, 0, Some(1), Some(1));
+        assert_eq!(full.len(), 2, "spine + big pane");
+        assert_eq!(
+            cards.len(),
+            2,
+            "height 3 reserves the last slot for overflow"
+        );
+        let overflow = overflow.expect("extra cards collapse into a marker");
+        assert_eq!(overflow.hidden, 4);
+        assert!(cards.iter().all(|p| p.rect.height > 0));
+        assert!(overflow.rect.height > 0);
     }
 
     #[test]

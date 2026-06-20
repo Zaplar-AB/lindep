@@ -19,12 +19,12 @@ use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::backend::{self, AgentBackend, Lifecycle};
-use crate::event::{AppEvent, AppEventTx};
+use crate::event::{AppEvent, AppEventTx, PushOutcome};
 use crate::keymap::{Action, Keymap};
 use crate::layout;
 use crate::ledger::Ledger;
 use crate::linear::{Client, ProjectRef};
-use crate::model::{Direction, Graph, Issue};
+use crate::model::{Direction, Graph, Issue, Priority, Status};
 use crate::picker::{Picker, ReclaimPrompt, RepoChoice, RepoPicker};
 use crate::session::{AgentStatus, CockpitState, PersistedKind, PersistedWindow};
 use crate::window::{
@@ -41,6 +41,7 @@ pub(crate) struct RepoSelect {
     pub issue: String,
     pub title: String,
     pub size: Option<(u16, u16)>,
+    pub adhoc: bool,
 }
 
 /// The open global all-agents screen (ENG-406): every live agent across the whole
@@ -72,6 +73,11 @@ const FLASH_FRAMES: u64 = 4;
 /// never reports) must not pin the loop awake forever; past this the count is
 /// force-cleared so an idle cockpit goes quiet.
 const RESUME_GRACE_FRAMES: u64 = 200;
+/// How long a freshly-quiet agent still renders as WORKING after its last PTY output.
+/// Claude can emit its Stop/Idle hook before the last buffered terminal bytes paint; a
+/// short settle window prevents a visible pane from flipping to IDLE while text is still
+/// arriving.
+const OUTPUT_SETTLE_FRAMES: u64 = 20;
 
 /// A brief, self-extinguishing highlight on an issue's node — the "juice" that
 /// makes a launch or a finish register. Lives for a few animation frames then
@@ -80,6 +86,12 @@ const RESUME_GRACE_FRAMES: u64 = 200;
 pub enum Flash {
     Launched,
     Finished,
+    /// A crashed agent — flashes RED so a failure is never painted with the green
+    /// "Finished" success flash it used to share (H5).
+    Failed,
+    /// A user-killed agent — a brief graphite pulse so a deliberate stop gets the same
+    /// ~400 ms confirmation as a finish/crash (it used to flash nothing).
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,35 +115,6 @@ impl Filter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sort {
-    /// The readiness schedule: issues banded NEEDS-YOU · RUNNING · READY ·
-    /// BLOCKED · DONE (top→bottom), highest downstream impact within each band,
-    /// then priority, then id. The default — the spine draws this one with
-    /// section dividers + a ready rail (see `render_spine`). Unlike `Key` it
-    /// reads the fleet, so the order rebuilds when an agent event moves an issue
-    /// between bands. (v1.7 ENG-563 deleted `Blocked`/`Status`/`Priority`: the
-    /// bands show blocked inline, and priority folded into the within-band tiebreak.)
-    Readiness,
-    /// Plain natural id order — the one residual escape hatch from the schedule.
-    Key,
-}
-
-impl Sort {
-    const fn next(self) -> Self {
-        match self {
-            Sort::Readiness => Sort::Key,
-            Sort::Key => Sort::Readiness,
-        }
-    }
-    pub const fn label(self) -> &'static str {
-        match self {
-            Sort::Readiness => "readiness",
-            Sort::Key => "id",
-        }
-    }
-}
-
 /// The single fused per-issue *state* — the type the cockpit was missing.
 ///
 /// lindep has one noun (the Issue) but, until v1.7, no one place that said what
@@ -143,14 +126,20 @@ impl Sort {
 /// "blocked" / "ready" locally.
 ///
 /// Variants are declared in band / salience order, top→bottom, so the derived
-/// `Ord` *is* the schedule order (`NeedsYou < Running < Ready < Blocked <
+/// `Ord` *is* the schedule order (`NeedsYou < Working < Idle < Ready < Blocked <
 /// Done`): the spine can sort on it directly, with no separate comparator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Readiness {
     /// A live agent is waiting on you — the one thing you must act on.
     NeedsYou,
-    /// A live agent is on it (spawning / running / idle, but not waiting).
-    Running,
+    /// A live agent is actively churning — spawning, or producing output /
+    /// running tools. Work in motion.
+    Working,
+    /// A live agent is alive but resting (it finished a turn, process still up),
+    /// waiting on nothing. Split out from `Working` so an agent that has genuinely
+    /// gone quiet is visibly distinct from one still churning — a stuck-"working"
+    /// agent that actually settled now drops to its own band instead of hiding.
+    Idle,
     /// Unblocked, unresolved, no live agent — the launchpad. The one genuinely
     /// new state; every other band already had a home in the codebase.
     Ready,
@@ -191,12 +180,18 @@ pub struct App {
     pub viewport: Rect,
 
     pub filter: Filter,
-    pub sort: Sort,
     pub search_query: String,
     pub search_active: bool,
     pub show_help: bool,
+    /// Scroll offset (top row) of the `?` help overlay. The overlay is taller than
+    /// most split-pane terminals, so it scrolls instead of clipping its bottom rows
+    /// (H3); reset to 0 each time help opens.
+    pub help_scroll: u16,
     /// Dismissable overlay summarising the selected issue (the `i` button).
     pub show_summary: bool,
+    /// Scroll offset of the `i` summary overlay — it wraps a long title and scrolls a
+    /// long dependency list instead of clipping (A5); reset to 0 each time it opens.
+    pub summary_scroll: u16,
     pub status_msg: Option<String>,
     /// True while `status_msg` holds an unacknowledged "needs you" alert. Routine
     /// high-frequency tool chatter (`AgentAction`) must not bury it; it clears the
@@ -204,9 +199,12 @@ pub struct App {
     /// event replaces the footer.
     needs_you_alert: bool,
     /// Issues with a launch command in flight (sent to the supervisor, not yet
-    /// acknowledged by an `AgentSpawned` or rejected by a `Notification`). Lets
-    /// the cockpit refuse a double-press before the fleet entry materializes.
-    pending_launch: HashSet<String>,
+    /// acknowledged by an `AgentSpawned` or rejected) mapped to the frame at which a
+    /// *wedged* launch — one that never reports back (e.g. a hung `git worktree add`
+    /// before `AgentSpawned`) — is force-dropped, so its "starting…" card self-heals
+    /// instead of stranding forever (M9). Lets the cockpit refuse a double-press
+    /// before the fleet entry materializes.
+    pending_launch: HashMap<String, u64>,
     /// Issues the supervisor has fully reaped (`AgentReaped`) this session — a
     /// tombstone. The agent's hook forwarder is a separate, slower path, so a
     /// final `Notification`/`Stop`/`PostToolUse` hook can land *after* the reap;
@@ -222,6 +220,10 @@ pub struct App {
     /// Backend handles for agents we launched, keyed by issue. Used to render
     /// and drive an agent's PTY.
     pub backends: HashMap<String, Arc<dyn AgentBackend>>,
+    /// Last frame at which each agent produced PTY output. Used only as a short
+    /// visual settle window so an otherwise-idle agent does not read as quiet while
+    /// buffered output is still painting.
+    last_output: HashMap<String, u64>,
     /// An issue whose agent we just launched and are waiting to come up, so the
     /// agent's window opens+focuses the moment it spawns (a user-initiated launch
     /// is the only `AgentSpawned` that steals focus — background/resume spawns
@@ -248,6 +250,9 @@ pub struct App {
     /// A pending fenced-lazy-pull confirmation (ENG-542) raised by an agent's
     /// `request-repo`. While `Some`, the next key pulls (`y`/Enter) or denies.
     pub repo_confirm: Option<RepoConfirm>,
+    /// A pending quit confirmation. Quitting can strand running agents off-screen,
+    /// so the prefix quit verb asks once before tearing the cockpit down.
+    pub quit_confirm: bool,
     /// Docked agents still pending an auto-resume (Phase 6), each mapped to the
     /// frame at which a wedged resume (one that never reports `AgentSpawned`) is
     /// force-dropped. Per-issue — not a bare count + one shared deadline — so a
@@ -270,6 +275,44 @@ pub struct App {
     /// project switch restores it to — without it, [`Self::activate_project`] would
     /// re-enable resume after a switch and silently defeat `--no-resume`.
     auto_resume_enabled: bool,
+    /// True under `--demo`: a read-only graph viewer with no control plane, so the
+    /// launch refusal can name the real reason ("drop --demo") instead of jargon and
+    /// the banner advertises no agent actions (H6). Distinct from a *degraded* run (a
+    /// real project whose control plane failed to arm), which also has
+    /// `workspace == None` but is not demo.
+    pub demo: bool,
+    /// Why the control plane didn't arm on a *non-demo* run (unregistered project,
+    /// declined onboarding, hook-port clash). Persisted so a standing "⚠ agents off"
+    /// header chip and the launch refusal can name the real reason, instead of the
+    /// reason flashing once as a footer the next keystroke wipes (M13).
+    pub degrade_reason: Option<String>,
+    /// Set once a `Ctrl-a o` re-config wrote registry.toml this session. The live
+    /// workspace keeps its old binding (re-rooting a running worktree manager mid-flight
+    /// isn't safe), so a standing "⟳ restart to apply config" chip keeps the divergence
+    /// visible until restart — not just the one-shot footer the next keystroke wipes.
+    pub config_restart_pending: bool,
+    /// Issues whose discard KEPT the worktree on disk (a rejected push left unpushed
+    /// commits) — a standing header chip flags them and the issue stays re-discardable
+    /// once the push can land, so the work is never silently stranded (D-HIGH).
+    pub kept_worktrees: HashSet<String>,
+    /// Per project, the keys (`issue`, or `issue/repo` for a multi-repo issue) whose
+    /// v1.6 auto-push was REJECTED — the commit is stranded on the local clone. A
+    /// standing header chip, and a CROSS-PROJECT surface (keyed by project, like
+    /// [`Self::other_needs_you`]) because a rejected push strands commits whichever
+    /// project owns the committing agent — so the scope guard must not drop it. A
+    /// failed push is thus never papered over by the next "pushed" footer (the
+    /// data-integrity contract). A key clears when a later push of it succeeds (or it
+    /// turns out local-only) or when its issue's workspace is discarded; unlike the
+    /// per-project fleet, it is NOT wiped on a project switch.
+    pub unpushed: HashMap<String, HashSet<String>>,
+    /// Synthetic ad-hoc agent ids (`ask-*`) grafted into the graph for this project.
+    /// They reuse the normal session/worktree path, but their terminal teardown skips
+    /// the issue-branch push because the branch is intentionally throwaway.
+    ask_agents: HashSet<String>,
+    /// Count of agents that finished cleanly (Done) this session — a "shipped today"
+    /// header tally so the cockpit occasionally says you're winning, not just what's
+    /// left (CF-14). Session-volatile; not persisted.
+    pub shipped_today: u32,
     /// Handle to the workspace (every project's fleet), when running with one
     /// (absent in `--demo`, snapshots and unit tests). Launch/cancel route through
     /// it by `(active_project, issue)`.
@@ -295,6 +338,12 @@ pub struct App {
     /// the workspace). Keyed by `project_id`. A project with ≤1 candidate launches
     /// straight away (no modal); >1 opens the select.
     pub project_candidates: HashMap<String, Vec<RepoChoice>>,
+    /// Every registered repo (handle + local-only), sorted, snapshotted from the
+    /// registry when the control plane arms. The at-launch repo picker's "add another
+    /// repo" (CF-20) offers any of these the active project doesn't yet list as a
+    /// candidate; confirming persists the pick into `registry.toml` and into
+    /// `project_candidates` above (so the next launch offers it — no restart).
+    pub registered_repos: Vec<RepoChoice>,
     /// The open disk-reclaim prompt (ENG-540, `Ctrl-a m`), if any. Full modal.
     pub reclaim: Option<ReclaimPrompt>,
     /// True while a reclaim scan/delete is running on the blocking pool, so a
@@ -305,6 +354,10 @@ pub struct App {
     /// prompt can scan mirrors/clones (a quick filesystem walk) on a deliberate user
     /// action. `None` with the control plane off (`--demo`, snapshots, tests).
     pub layout: Option<crate::registry::Layout>,
+    /// Every registered project's id → on-disk handle, snapshotted at boot so a switch
+    /// can re-point the durable ledger to the target project's own file (H3) without
+    /// re-reading the registry on the render thread.
+    pub project_handles: HashMap<String, String>,
     /// Live agent backends for projects you've switched *away* from, keyed by
     /// `project_id` then issue. Stashed on switch (the `Arc`s stay valid while
     /// their agents run) so switching back re-attaches to the real PTYs; the
@@ -384,6 +437,14 @@ pub struct App {
     pub ledger_dirty: bool,
     /// Dismissable overlay listing the selected issue's agent run history (`Ctrl-a t`).
     pub show_ledger: bool,
+    /// Scroll offset of the `Ctrl-a t` ledger overlay — like help/summary it scrolls a
+    /// long history and dismisses only on Esc / `t`, so the three info overlays share
+    /// one convention; reset to 0 each time it opens.
+    pub ledger_scroll: u16,
+    /// Inner height of the *focused* deps coin's active tree, captured at render so
+    /// PageUp/PageDown move one visible screenful of THAT pane (a tiled coin), not the
+    /// whole-terminal `spine_page`. 0 until a deps window has rendered.
+    pub deps_view_h: u16,
 
     pub should_quit: bool,
 }
@@ -414,17 +475,19 @@ impl App {
             preview_size: HashMap::new(),
             viewport: Rect::new(0, 0, 80, 24),
             filter: Filter::All,
-            sort: Sort::Readiness,
             search_query: String::new(),
             search_active: false,
             show_help: false,
+            help_scroll: 0,
             show_summary: false,
+            summary_scroll: 0,
             status_msg: None,
             needs_you_alert: false,
-            pending_launch: HashSet::new(),
+            pending_launch: HashMap::new(),
             reaped: HashSet::new(),
             fleet: HashMap::new(),
             backends: HashMap::new(),
+            last_output: HashMap::new(),
             pending_attach: None,
             frame: 0,
             flash: HashMap::new(),
@@ -432,10 +495,18 @@ impl App {
             kill_confirm: None,
             discard_confirm: None,
             repo_confirm: None,
+            quit_confirm: false,
             resuming: HashMap::new(),
             resume_cap: 0,
             auto_resume: false,
             auto_resume_enabled: false,
+            demo: false,
+            degrade_reason: None,
+            config_restart_pending: false,
+            kept_worktrees: HashSet::new(),
+            unpushed: HashMap::new(),
+            ask_agents: HashSet::new(),
+            shipped_today: 0,
             workspace: None,
             active_project: String::new(),
             project_list: Vec::new(),
@@ -443,9 +514,11 @@ impl App {
             project_switcher: None,
             repo_select: None,
             project_candidates: HashMap::new(),
+            registered_repos: Vec::new(),
             reclaim: None,
             reclaim_busy: false,
             layout: None,
+            project_handles: HashMap::new(),
             stashed_backends: HashMap::new(),
             other_needs_you: HashMap::new(),
             world: HashMap::new(),
@@ -465,18 +538,19 @@ impl App {
             ledger_path: None,
             ledger_dirty: false,
             show_ledger: false,
+            ledger_scroll: 0,
+            deps_view_h: 0,
             should_quit: false,
         };
         app.rebuild_order();
         app
     }
 
-    pub fn focused_issue(&self) -> Option<&Issue> {
-        self.graph.get(&self.root)
-    }
-
-    /// The issue the detail bar / summary overlay describes: the focused coin's
-    /// issue, else the Spine selection. `None` only when nothing is selected.
+    /// The issue every on-screen surface and action shares: the detail bar, the `i`
+    /// summary, AND the dispatch / kill / editor verbs all resolve through this, so
+    /// what you see is always what a verb acts on (H6). A coin on its deps face → its
+    /// roving cursor root; a chat coin → its identity; the Spine/Fleet → the selection.
+    /// `None` only when nothing is selected.
     pub fn detail_key(&self) -> Option<&str> {
         let w = self.windows.focused();
         // A coin on its deps face describes the issue its cursor is *currently*
@@ -516,7 +590,7 @@ impl App {
     /// only sort whose ordering depends on live fleet state) just before drawing.
     pub(crate) fn rebuild_order(&mut self) {
         let needle = self.search_query.to_lowercase();
-        let (filter, sort) = (self.filter, self.sort);
+        let filter = self.filter;
 
         // Own the key list so the per-key sort key can borrow `&self` — the
         // Readiness band reads the fleet, not just the graph — without aliasing
@@ -541,29 +615,26 @@ impl App {
                 let pass_search = needle.is_empty()
                     || issue.key.to_lowercase().contains(&needle)
                     || issue.title.to_lowercase().contains(&needle);
-                (pass_filter && pass_search).then(|| (self.sort_key(&k, sort), k.clone()))
+                (pass_filter && pass_search).then(|| (self.sort_key(&k), k.clone()))
             })
             .collect();
 
         // Within a band+impact tie, the Readiness schedule prefers higher
         // priority (the folded-in priority sort), then a stable natural id.
-        let by_priority = sort == Sort::Readiness;
         decorated.sort_by(|(ka, a), (kb, b)| {
             ka.cmp(kb)
-                .then_with(|| {
-                    if by_priority {
-                        self.priority_rank(a).cmp(&self.priority_rank(b))
-                    } else {
-                        Ordering::Equal
-                    }
-                })
+                .then_with(|| self.priority_rank(a).cmp(&self.priority_rank(b)))
                 .then_with(|| natural_key_cmp(a, b))
         });
         self.order = decorated.into_iter().map(|(_, k)| k).collect();
         // If the active filter/search hid the current selection, re-aim it at the
-        // first visible issue so the list highlight and the detail bar agree.
+        // first visible issue so the list highlight and the detail bar agree — and
+        // re-aim the follower preview too, so its tree/chat doesn't keep showing the
+        // now-hidden issue while you type a search (M4). reaim_preview self-guards
+        // against pinned coins, and this fires only when root actually moved.
         if !self.order.is_empty() && !self.order.contains(&self.root) {
             self.root = self.order[0].clone();
+            self.reaim_preview();
         }
         self.sync_list_selection();
     }
@@ -576,9 +647,10 @@ impl App {
     ///
     /// Precedence is salience, top band first:
     /// 1. **A live agent outranks the graph.** A `NeedsYou` agent → `NeedsYou`;
-    ///    any other live agent (spawning / running / idle) → `Running`. An
-    ///    agent working an issue Linear already marks resolved still reads as
-    ///    `Running` — the live process is the actionable thing, not the label.
+    ///    a churning agent (spawning / running) → `Working`; a resting-but-alive
+    ///    agent (idle) → `Idle`. An agent on an issue Linear already marks
+    ///    resolved still reads as live — the process is the actionable thing,
+    ///    not the label.
     /// 2. **A terminal agent (stopped / done / failed) pins no band** — the
     ///    issue reverts to its graph truth, so a failed launch shows `Ready`
     ///    again (re-dispatchable) and a clean finish shows `Done`.
@@ -594,8 +666,18 @@ impl App {
             if status.needs_you() {
                 return Readiness::NeedsYou;
             }
-            if status.is_live() {
-                return Readiness::Running;
+            if status.is_working() {
+                return Readiness::Working;
+            }
+            if status.is_idle() {
+                // FEAT-B: a settled (Idle) agent whose child is still streaming PTY
+                // output is busy, not resting — band and sort it under WORKING so the
+                // header matches the live spinner `display_agent_status` already shows
+                // in the gutter (no band/row stutter). Self-expires once output stops.
+                if self.recently_active(key) {
+                    return Readiness::Working;
+                }
+                return Readiness::Idle;
             }
             // Terminal: fall through to graph truth below.
         }
@@ -608,19 +690,15 @@ impl App {
         Readiness::Ready
     }
 
-    /// The once-per-node sort key for the active sort mode. Lower sorts first;
-    /// `natural_key_cmp` breaks ties. A method (not a free fn) because the
-    /// Readiness band reads the fleet via [`App::readiness`], not just the graph.
-    fn sort_key(&self, key: &str, sort: Sort) -> (u8, u64) {
-        match sort {
-            // Band (top→bottom), then highest downstream impact within the band;
-            // priority then id break the remaining ties in `rebuild_order`.
-            Sort::Readiness => (
-                self.readiness(key) as u8,
-                u64::MAX - self.graph.transitive(key, Direction::Downstream) as u64,
-            ),
-            Sort::Key => (0, 0),
-        }
+    /// The once-per-node sort key for the readiness schedule — band (top→bottom),
+    /// then highest downstream impact within the band; priority then id break the
+    /// remaining ties in `rebuild_order`. Lower sorts first. A method (not a free
+    /// fn) because the band reads the fleet via [`App::readiness`], not just the graph.
+    fn sort_key(&self, key: &str) -> (u8, u64) {
+        (
+            self.readiness(key) as u8,
+            u64::MAX - self.graph.transitive(key, Direction::Downstream) as u64,
+        )
     }
 
     /// Priority rank (Urgent first … None last) — the within-band tiebreak the
@@ -629,16 +707,16 @@ impl App {
         self.graph.get(key).map_or(u8::MAX, |i| i.priority.rank())
     }
 
-    /// Whether `order` is still sorted exactly as `rebuild_order` would sort it
-    /// under `Sort::Readiness` — by (band, downstream impact), then priority, then
-    /// natural id. Agent events (and a graph refetch) move the fleet/graph under
-    /// `order` without re-sorting, so `render_spine` re-bands when this returns
-    /// false — keeping the section dividers contiguous AND the within-band order
-    /// fresh, not just the band sequence. Must mirror `rebuild_order`'s comparator.
+    /// Whether `order` is still sorted exactly as `rebuild_order` would sort it —
+    /// by (band, downstream impact), then priority, then natural id. Agent events
+    /// (and a graph refetch) move the fleet/graph under `order` without re-sorting,
+    /// so `render_spine` re-bands when this returns false — keeping the section
+    /// dividers contiguous AND the within-band order fresh, not just the band
+    /// sequence. Must mirror `rebuild_order`'s comparator.
     pub fn order_is_banded(&self) -> bool {
         self.order.windows(2).all(|w| {
-            self.sort_key(&w[0], Sort::Readiness)
-                .cmp(&self.sort_key(&w[1], Sort::Readiness))
+            self.sort_key(&w[0])
+                .cmp(&self.sort_key(&w[1]))
                 .then_with(|| self.priority_rank(&w[0]).cmp(&self.priority_rank(&w[1])))
                 .then_with(|| natural_key_cmp(&w[0], &w[1]))
                 != Ordering::Greater
@@ -740,6 +818,13 @@ impl App {
             return;
         }
 
+        // 2d. Quit is also confirmed: a stray prefixed `q` should not tear down a
+        //     cockpit that still has live agents and pending context.
+        if self.quit_confirm {
+            self.on_quit_confirm_key(key);
+            return;
+        }
+
         // 3. The prefix arms; the next key resolves it.
         if self.keymap.is_prefix(key) {
             self.prefix_armed = true;
@@ -753,18 +838,87 @@ impl App {
         //    swallowed by the search buffer.
         if self.search_active {
             if self.windows.focus == 0 {
-                self.on_search_key(key.code);
+                self.on_search_key(key);
                 return;
             }
             self.search_active = false;
         }
 
-        // 5. The help overlay sits above the keymap so a typo can't trap you: any
-        //    key (Esc included) dismisses it.
-        if self.show_help || self.show_summary || self.show_ledger {
-            self.show_help = false;
-            self.show_summary = false;
-            self.show_ledger = false;
+        // 5. The three info overlays share one convention: arrows / page keys scroll,
+        //    the toggle key or Esc closes, and any other key is ignored so a stray key
+        //    can't lose your place mid-read (H3 / A5). Help, summary and ledger all
+        //    scroll — no info overlay closes on an arbitrary key anymore.
+        if self.show_help {
+            if key.code == KeyCode::Esc || self.keymap.action_for(key) == Some(Action::ToggleHelp) {
+                self.show_help = false;
+            } else {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.help_scroll = self.help_scroll.saturating_add(1);
+                    }
+                    KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        self.help_scroll = self.help_scroll.saturating_add(10);
+                    }
+                    KeyCode::Home => self.help_scroll = 0,
+                    KeyCode::End => self.help_scroll = u16::MAX,
+                    _ => {}
+                }
+            }
+            return;
+        }
+        // The summary scrolls a long dependency list and dismisses only on Esc / `i`,
+        // so a stray key while reading can't lose your place (A5).
+        if self.show_summary {
+            if key.code == KeyCode::Esc
+                || self.keymap.action_for(key) == Some(Action::ToggleSummary)
+            {
+                self.show_summary = false;
+            } else {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.summary_scroll = self.summary_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.summary_scroll = self.summary_scroll.saturating_add(1);
+                    }
+                    KeyCode::PageUp => self.summary_scroll = self.summary_scroll.saturating_sub(10),
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        self.summary_scroll = self.summary_scroll.saturating_add(10);
+                    }
+                    KeyCode::Home => self.summary_scroll = 0,
+                    KeyCode::End => self.summary_scroll = u16::MAX,
+                    _ => {}
+                }
+            }
+            return;
+        }
+        // The ledger scrolls a long run-history and dismisses only on Esc / `t`, matching
+        // help and summary so the first arrow reflex never slams an info overlay shut (A5).
+        if self.show_ledger {
+            if key.code == KeyCode::Esc || self.keymap.action_for(key) == Some(Action::ToggleLedger)
+            {
+                self.show_ledger = false;
+            } else {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.ledger_scroll = self.ledger_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.ledger_scroll = self.ledger_scroll.saturating_add(1);
+                    }
+                    KeyCode::PageUp => self.ledger_scroll = self.ledger_scroll.saturating_sub(10),
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        self.ledger_scroll = self.ledger_scroll.saturating_add(10);
+                    }
+                    KeyCode::Home => self.ledger_scroll = 0,
+                    KeyCode::End => self.ledger_scroll = u16::MAX,
+                    _ => {}
+                }
+            }
             return;
         }
 
@@ -785,15 +939,20 @@ impl App {
                 self.needs_you_alert = false;
                 self.forward_to_agent(&issue, key);
             }
-            // A coin's deps face navigates exactly like the old Deps pane.
+            // A coin's deps face navigates exactly like the old Deps pane. Esc pops
+            // the re-root history (the one window where Esc conventionally pops a
+            // stack), so a deep dive-in has a back-out key, not just Backspace/`b`.
             WindowKind::Coin {
                 mode: CoinMode::Deps,
                 ..
             } => {
                 self.acknowledge();
-                if key.code != KeyCode::Esc
-                    && let Some(action) = self.keymap.action_for(key)
-                {
+                if key.code == KeyCode::Esc {
+                    // Route through the same path as Backspace/`b` (not a bare
+                    // `deps_back`), so a preview coin's Spine highlight re-syncs to the
+                    // popped root instead of stranding on the dived-into issue.
+                    self.dispatch_deps(Action::Back);
+                } else if let Some(action) = self.keymap.action_for(key) {
                     self.dispatch_deps(action);
                 }
             }
@@ -813,9 +972,9 @@ impl App {
                     && let Some(action) = self.keymap.action_for(key)
                 {
                     match action {
-                        Action::ToggleHelp => self.show_help = !self.show_help,
-                        Action::ToggleSummary => self.show_summary = !self.show_summary,
-                        Action::ToggleLedger => self.show_ledger = !self.show_ledger,
+                        Action::ToggleHelp => self.toggle_help(),
+                        Action::ToggleSummary => self.toggle_summary(),
+                        Action::ToggleLedger => self.toggle_ledger(),
                         _ => {}
                     }
                 }
@@ -823,27 +982,129 @@ impl App {
         }
     }
 
-    /// A Spine/Deps keypress acknowledges any standing needs-you footer and
-    /// clears the transient status line.
+    /// A Spine/Deps keypress clears the transient status line — but does NOT blanket-drop
+    /// the sticky needs-you guard. The guard is re-derived: it survives navigation and
+    /// the `n` triage jump, and clears only once the agent actually resolves/exits
+    /// (CF-11). The one hard "I'm handling it" signal is typing into the needy agent's
+    /// own chat (handled separately at the Chat-focus path), not browsing the nav.
     fn acknowledge(&mut self) {
         self.status_msg = None;
-        self.needs_you_alert = false;
+        self.clear_needs_you_alert_if_resolved();
+    }
+
+    /// Toggle the `?` help overlay, rewinding it to the top each time it opens so a
+    /// previous scroll position never hides the first rows (H3).
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+        if self.show_help {
+            self.help_scroll = 0;
+        }
+    }
+
+    /// Toggle the `i` summary overlay, rewinding its scroll on open (A5).
+    fn toggle_summary(&mut self) {
+        if !self.show_summary {
+            // Don't open onto nothing (an empty project — `detail_key` is None) or onto
+            // a node that has left the graph (archived/moved): render_summary would paint
+            // nothing, and since the summary now dismisses only on Esc/`i` (A5) the empty
+            // overlay would silently trap every key. Refuse with a footer instead.
+            let target = self.detail_key().map(str::to_string);
+            match target {
+                None => {
+                    self.set_footer("no summary — nothing selected".into());
+                    return;
+                }
+                Some(key) if self.graph.get(&key).is_none() => {
+                    self.set_footer(format!(
+                        "no summary — {key} isn't in this project's graph (archived/moved)"
+                    ));
+                    return;
+                }
+                _ => {}
+            }
+            self.summary_scroll = 0;
+        }
+        self.show_summary = !self.show_summary;
+    }
+
+    /// Toggle the `Ctrl-a t` ledger overlay, rewinding its scroll on open (A5).
+    fn toggle_ledger(&mut self) {
+        self.show_ledger = !self.show_ledger;
+        if self.show_ledger {
+            self.ledger_scroll = 0;
+        }
     }
 
     /// Resolve a key pressed after the prefix.
     fn on_prefix_key(&mut self, key: KeyEvent) {
+        // A window verb must never fire *underneath* a still-painted info overlay.
+        // The prefix is consumed above the band-5 overlay-dismiss, so without this a
+        // `Ctrl-a x`/`Ctrl-a d` armed its red confirm behind a ~40-row help card and
+        // a reflexive `y` could confirm a kill blind; `Ctrl-a s` floated the switcher
+        // over a still-rendered help card (H1). Dismiss any open overlay first, in
+        // the same gesture — honouring the documented "any key dismisses it" contract.
+        // Capture help's pre-clear state so the M6 `Ctrl-a ?` branch below can *toggle*
+        // it (open AND close) rather than only ever re-opening it.
+        let help_was_open = self.show_help;
+        self.show_help = false;
+        self.show_summary = false;
+        self.show_ledger = false;
+
         // Double-prefix → send the literal prefix chord through to a focused
         // agent (a chosen prefix is never wholly unreachable by the PTY). Covers
         // the context window in Chat mode too (its `agent_issue()` is `Some`).
         if self.keymap.is_prefix(key) {
-            if let Some(issue) = self.windows.focused_kind().agent_issue() {
-                let issue = issue.to_string();
+            let agent = self
+                .windows
+                .focused_kind()
+                .agent_issue()
+                .map(str::to_string);
+            if let Some(issue) = agent {
                 self.forward_to_agent(&issue, self.keymap.prefix_event());
+            } else {
+                // Double-prefix only means anything in a chat (forward the literal
+                // chord to its PTY). Elsewhere, acknowledge it instead of eating both
+                // keystrokes silently and leaving the next key as a raw direct action.
+                self.status_msg = Some(format!(
+                    "{p} {p}: no agent here — {p} then a verb",
+                    p = self.prefix_label()
+                ));
+            }
+            return;
+        }
+        // M6: `Ctrl-a ?` toggles the help overlay from inside a Chat coin (or the
+        // Fleet), where the direct `?` is swallowed by the PTY — so someone driving an
+        // agent can still reach the binding reference. Help isn't a prefix VERB (that
+        // would re-introduce the prefix/direct duplication ENG-562 removed), so it
+        // wouldn't resolve below; while it's open, `Ctrl-a ?` again — or `?`/Esc, which
+        // band 5 handles before focus routing — closes it.
+        if self.keymap.action_for(key) == Some(Action::ToggleHelp)
+            && matches!(
+                self.windows.focused_kind(),
+                WindowKind::Coin {
+                    mode: CoinMode::Chat,
+                    ..
+                } | WindowKind::Fleet
+            )
+        {
+            // True toggle: the clear above already set show_help=false, so flip the
+            // captured pre-clear state.
+            self.show_help = !help_was_open;
+            if self.show_help {
+                self.help_scroll = 0;
             }
             return;
         }
         let Some(verb) = self.keymap.verb_for(key) else {
-            return; // an unbound prefix key is a harmless no-op
+            // M5: acknowledge an unbound prefix key instead of silently eating it and
+            // leaving the next key to land as a raw direct action.
+            self.status_msg = Some(format!(
+                "{} {}: no window command — {} for the list",
+                self.prefix_label(),
+                self.keymap.key_label(key),
+                self.keymap.label_for(Action::ToggleHelp),
+            ));
+            return;
         };
         self.dispatch_verb(verb);
     }
@@ -867,14 +1128,14 @@ impl App {
             Action::KillWindow => self.arm_kill(),
             Action::LayoutToggle => self.toggle_layout(),
             Action::AttachOrSpawn => self.button(),
-            Action::Quit => self.should_quit = true,
+            Action::Quit => self.request_quit(),
             Action::StartSearch => {
-                self.windows.focus = 0;
+                self.windows.focus_nav(); // reveal the Spine (clears zoom) before searching (M1)
                 self.start_search();
             }
-            Action::ToggleHelp => self.show_help = !self.show_help,
-            Action::ToggleSummary => self.show_summary = !self.show_summary,
-            Action::ToggleLedger => self.show_ledger = !self.show_ledger,
+            Action::ToggleHelp => self.toggle_help(),
+            Action::ToggleSummary => self.toggle_summary(),
+            Action::ToggleLedger => self.toggle_ledger(),
             Action::JumpNeedsYou => self.jump_to_needs_you(),
             Action::SwitchProject => self.open_project_switcher(),
             Action::OpenInEditor => self.open_in_editor(),
@@ -882,6 +1143,11 @@ impl App {
             Action::DiscardWorkspace => self.arm_discard(),
             Action::GlobalView => self.open_global(),
             Action::ConfigureProject => self.request_configure(),
+            Action::RestartAgent => self.restart_agent(),
+            Action::NextAgent => self.next_agent(),
+            Action::DispatchReady => self.dispatch_ready(),
+            Action::ChooseRepos => self.dispatch_selection(true),
+            Action::AskAgent => self.ask_spawn(),
             // The rest are direct (Spine/Deps) actions, never prefix verbs.
             _ => {}
         }
@@ -921,13 +1187,8 @@ impl App {
     /// it survives cockpit teardown. A no-op with a footer when the focused issue
     /// has no agent on disk yet — there's nothing to open until an agent has run.
     fn open_in_editor(&mut self) {
-        let issue = self
-            .windows
-            .focused()
-            .issue()
-            .map(str::to_string)
-            .or_else(|| (!self.root.is_empty()).then(|| self.root.clone()));
-        let Some(issue) = issue else {
+        // Open the workspace of the agent the pane shows (H6: matches dispatch/kill).
+        let Some(issue) = self.detail_key().map(str::to_string) else {
             self.set_footer("no agent selected to open".into());
             return;
         };
@@ -1118,6 +1379,13 @@ impl App {
         // re-emit below; everything else starts fresh.
         self.fleet.clear();
         self.reaped.clear();
+        self.kept_worktrees.clear();
+        // `unpushed` is intentionally NOT cleared here — it is a cross-project surface
+        // (a strand stays a strand whichever project you're viewing), maintained
+        // per-project by `note_push_outcome` from both the scope-guard arm (a
+        // backgrounded commit) and the main match (the active one), and cleared only by
+        // a later clean push or a discard.
+        self.ask_agents.clear();
         self.pending_launch.clear();
         self.pending_attach = None;
         self.resuming.clear();
@@ -1125,7 +1393,21 @@ impl App {
         self.preview_size.clear();
         self.search_active = false;
         self.search_query.clear();
+        // Reset the filter too (its own comment promises "everything else starts
+        // fresh"): a has-deps filter carried into a flat-backlog project would hide
+        // most of it on arrival while the footer reported the full count.
+        self.filter = Filter::All;
         self.needs_you_alert = false;
+
+        // Seed the fleet from the restored live backends BEFORE the async re-emit
+        // lands, so a discard/kill on the very next keystroke sees a live agent (and
+        // refuses) instead of an empty fleet for ≥1 iteration — the switch-back
+        // data-loss window (H2). The workspace re-emit overwrites these placeholders
+        // with each issue's true per-issue status moments later.
+        let live_issues: Vec<String> = self.backends.keys().cloned().collect();
+        for issue in live_issues {
+            self.fleet.insert(issue, AgentStatus::Running);
+        }
 
         self.windows = WindowSet::new();
         self.root = most_connected_root(&self.graph);
@@ -1142,7 +1424,7 @@ impl App {
         // superseded land — the user fired a later switch — is taken and discarded, so
         // a same-keyed issue in the wrong project is never landed on). Re-root onto it
         // (overriding most_connected_root) and, if requested, attach to its agent.
-        if let Some((pid, issue, attach, land_gen)) = self.pending_land.take()
+        let landed = if let Some((pid, issue, attach, land_gen)) = self.pending_land.take()
             && pid == project.id
             && land_gen == self.switch_seq
             && self.graph.get(&issue).is_some()
@@ -1151,6 +1433,27 @@ impl App {
             if attach {
                 self.open_agent_window(&issue);
             }
+            true
+        } else {
+            false
+        };
+
+        // On a plain switch-back (no explicit cross-project land), aim the cursor at
+        // a live agent so the "⏎ to open" reassurance actually opens a running agent
+        // (M15/NEW-26). `most_connected_root` is pure topology and almost never a
+        // running issue, so without this Enter would target a dead root — and launch
+        // a *brand-new* agent on it, the opposite of "open". Pick deterministically
+        // (lowest key) and only if it's a real node in this graph.
+        if !landed {
+            let live_issue = self.world.get(&project.id).and_then(|m| {
+                m.iter()
+                    .filter(|(k, s)| s.is_live() && self.graph.get(k.as_str()).is_some())
+                    .map(|(k, _)| k.clone())
+                    .min()
+            });
+            if let Some(issue) = live_issue {
+                self.aim_spine(issue);
+            }
         }
 
         // The saved cockpit layout belongs to the project we booted into; once you
@@ -1158,6 +1461,30 @@ impl App {
         // windows. (Per-project layout persistence is future work.)
         self.cockpit_path = None;
         self.cockpit_dirty = false;
+
+        let mut ledger_note = String::new();
+        // Re-point the durable ledger to the target project's own file (H3) while
+        // keeping the live in-memory ledger workspace-wide. Save dirty project slices,
+        // then merge the target file so its history appears in the overlay without
+        // throwing away background events recorded while another project was active.
+        let target_handle = self.project_handles.get(&project.id).cloned();
+        if let (Some(layout), Some(handle)) = (self.layout.clone(), target_handle) {
+            if self.ledger_dirty {
+                self.save_ledgers();
+            }
+            let path = layout.ledger_path(&handle);
+            match crate::ledger::Ledger::load(&path) {
+                Ok(ledger) => self.ledger.merge_project(&project.id, ledger),
+                Err(crate::session::StateError::Version { .. }) => {
+                    // Do not overwrite a newer file on the next lifecycle event.
+                    self.project_handles.remove(&project.id);
+                    ledger_note = " · ledger newer, not writing".into();
+                }
+                Err(_) => {}
+            }
+            self.ledger_dirty = false;
+            self.ledger_path = Some(path);
+        }
 
         // Bring the target online: build its plane if needed (which reconciles +
         // rehydrates) and re-emit its current fleet statuses. Resume-on-focus
@@ -1170,11 +1497,32 @@ impl App {
         // `--no-resume` (where the policy is off and resume_cap is 0).
         self.auto_resume = self.auto_resume_enabled;
 
-        self.set_footer(format!(
-            "switched to {} · {} issues",
-            project.name,
-            self.graph.len()
-        ));
+        // The switch discarded every docked coin (WindowSet::new above), but the
+        // agents themselves keep running — nudge that they're here and one Enter
+        // re-opens each, so a switch-back isn't a bare Spine with hidden live work
+        // (M15). Count from `world` (the continuously-maintained cross-project tally),
+        // since the on-screen fleet re-emit is asynchronous and hasn't landed yet.
+        let running_here = self
+            .world
+            .get(&project.id)
+            .map(|m| m.values().filter(|s| s.is_live()).count())
+            .unwrap_or(0);
+        self.set_footer(if running_here > 0 {
+            format!(
+                "switched to {} · {} issues · {running_here} agent{} running here — ⏎ to open{}",
+                project.name,
+                self.graph.len(),
+                if running_here == 1 { "" } else { "s" },
+                ledger_note,
+            )
+        } else {
+            format!(
+                "switched to {} · {} issues{}",
+                project.name,
+                self.graph.len(),
+                ledger_note
+            )
+        });
     }
 
     /// Direct keys while the Spine is focused.
@@ -1182,26 +1530,45 @@ impl App {
         match action {
             Action::MoveDown => self.move_selection(1),
             Action::MoveUp => self.move_selection(-1),
+            Action::MoveTop => self.aim_index(0),
+            Action::MoveBottom => self.aim_index(self.order.len().saturating_sub(1)),
+            Action::PageUp => {
+                let cur = self.list_state.selected().unwrap_or(0);
+                self.aim_index(cur.saturating_sub(self.spine_page()));
+            }
+            Action::PageDown => {
+                let cur = self.list_state.selected().unwrap_or(0);
+                self.aim_index(cur + self.spine_page());
+            }
             // Enter / Space are the attach+spawn button on the Spine.
             Action::Enter | Action::ToggleCollapse => self.button(),
             // Tab flips the active coin chat⇄deps while you browse the nav.
             Action::ContextToggle => self.flip_active_coin(),
             Action::OpenDeps => self.open_deps_for_selection(),
             Action::OpenFleet => self.open_fleet(),
+            Action::PinWindow => self.pin_window(),
             Action::JumpCycle => self.jump_to_cycle(),
             Action::JumpNeedsYou => self.jump_to_needs_you(),
             Action::CycleFilter => {
                 self.filter = self.filter.next();
                 self.rebuild_order();
-            }
-            Action::CycleSort => {
-                self.sort = self.sort.next();
-                self.rebuild_order();
+                // Every state-changing direct action leaves a one-line trace, so the
+                // footer is a reliable "that did something" signal (B0d) — and an empty
+                // result self-explains rather than reading as a lost project.
+                self.set_footer(if self.order.is_empty() {
+                    format!(
+                        "filter:{} · 0 of {} — clear to list",
+                        self.filter.label(),
+                        self.graph.len()
+                    )
+                } else {
+                    format!("filter:{}", self.filter.label())
+                });
             }
             Action::StartSearch => self.start_search(),
-            Action::ToggleHelp => self.show_help = !self.show_help,
-            Action::ToggleSummary => self.show_summary = !self.show_summary,
-            Action::ToggleLedger => self.show_ledger = !self.show_ledger,
+            Action::ToggleHelp => self.toggle_help(),
+            Action::ToggleSummary => self.toggle_summary(),
+            Action::ToggleLedger => self.toggle_ledger(),
             _ => {}
         }
     }
@@ -1211,9 +1578,14 @@ impl App {
     fn dispatch_deps(&mut self, action: Action) {
         // Operations needing the graph are split out so the cursor borrow and the
         // `&self.graph` borrow don't overlap.
+        let page = self.deps_page() as i32;
         match action {
             Action::MoveDown => self.with_deps(|c| c.move_selection(1)),
             Action::MoveUp => self.with_deps(|c| c.move_selection(-1)),
+            Action::MoveTop => self.with_deps(|c| c.move_to_edge(false)),
+            Action::MoveBottom => self.with_deps(|c| c.move_to_edge(true)),
+            Action::PageUp => self.with_deps(move |c| c.page(-page)),
+            Action::PageDown => self.with_deps(move |c| c.page(page)),
             Action::SwitchSide => self.with_deps(|c| c.switch_side()),
             Action::Enter => self.deps_enter(),
             Action::ToggleCollapse => self.deps_collapse(),
@@ -1222,9 +1594,10 @@ impl App {
             Action::ContextToggle => self.flip_active_coin(),
             Action::OpenDeps => self.open_deps_for_selection(),
             Action::OpenFleet => self.open_fleet(),
-            Action::ToggleHelp => self.show_help = !self.show_help,
-            Action::ToggleSummary => self.show_summary = !self.show_summary,
-            Action::ToggleLedger => self.show_ledger = !self.show_ledger,
+            Action::PinWindow => self.pin_window(),
+            Action::ToggleHelp => self.toggle_help(),
+            Action::ToggleSummary => self.toggle_summary(),
+            Action::ToggleLedger => self.toggle_ledger(),
             _ => {}
         }
         // The transient preview follows the selection both ways: re-rooting its
@@ -1242,11 +1615,27 @@ impl App {
     /// with it. Only the selection moves — the cursor and its history stay put, so
     /// in-place re-root / Back still work.
     fn sync_spine_to_focused_deps(&mut self) {
-        if let Some(root) = self.windows.focused().deps.as_ref().map(|c| c.root.clone())
-            && root != self.root
-        {
-            self.root = root;
+        if let Some(root) = self.windows.focused().deps.as_ref().map(|c| c.root.clone()) {
+            if root != self.root {
+                self.root = root.clone();
+            }
             self.sync_list_selection();
+            // If the deps cursor landed on an issue that already has a pinned coin,
+            // focus that real coin rather than leaving the preview aimed at a hidden
+            // duplicate. This keeps switch-back / re-root flows attached to the
+            // running agent the user can actually type into.
+            if self.windows.focused().is_preview() && self.windows.has_pinned_coin(&root) {
+                if let Some(removed) = self.windows.clear_preview()
+                    && let Some((issue, CoinMode::Chat)) = removed.kind.coin()
+                {
+                    let issue = issue.to_string();
+                    self.reclaim_if_dead(&issue);
+                }
+                if let Some(i) = self.windows.pinned_coin_index(&root) {
+                    self.windows.focus = i;
+                    self.after_focus_change();
+                }
+            }
         }
     }
 
@@ -1291,12 +1680,72 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: i32) {
-        move_state(&mut self.list_state, self.order.len(), delta);
-        if let Some(i) = self.list_state.selected()
-            && let Some(k) = self.order.get(i).cloned()
+        let len = self.order.len();
+        if len == 0 {
+            return;
+        }
+        let prev = self.list_state.selected();
+        let next = match prev {
+            // From a filter-hidden selection (no highlight), step into the list at the
+            // near end rather than skipping row 0 (down) or flinging to the last row (up).
+            None => {
+                if delta >= 0 {
+                    0
+                } else {
+                    len - 1
+                }
+            }
+            Some(cur) => (cur as i32 + delta).rem_euclid(len as i32) as usize,
+        };
+        self.list_state.select(Some(next));
+        // The wrap is the only fast cross-list traversal, so keep it — but flag the
+        // top↔bottom teleport (there's no scrollbar; a silent full-viewport jump reads
+        // as an accident). Only when the selection actually crossed the boundary —
+        // `cur != next` suppresses a spurious "wrapped" footer on a single-row Spine,
+        // where rem_euclid keeps `next == cur == 0 == len-1`.
+        if let Some(cur) = prev
+            && cur != next
         {
+            if cur == 0 && next == len - 1 {
+                self.set_footer("top of schedule — wrapped to the bottom".into());
+            } else if cur == len - 1 && next == 0 {
+                self.set_footer("bottom of schedule — wrapped to the top".into());
+            }
+        }
+        if let Some(k) = self.order.get(next).cloned() {
             self.root = k; // list navigation re-aims the selection
             self.reaim_preview(); // …and the preview coin that follows it
+        }
+    }
+
+    /// Aim the Spine at an absolute index (clamped), re-aiming the root and the
+    /// follower preview. Unlike [`move_selection`] this never wraps — the top/bottom
+    /// jumps and paging want a hard edge, not a teleport to the far end (M3).
+    fn aim_index(&mut self, i: usize) {
+        if self.order.is_empty() {
+            return;
+        }
+        let i = i.min(self.order.len() - 1);
+        self.list_state.select(Some(i));
+        self.root = self.order[i].clone();
+        self.reaim_preview();
+    }
+
+    /// One screenful of Spine rows, for paging — derived from the last known
+    /// terminal height, with a floor so a tiny pane still advances.
+    fn spine_page(&self) -> usize {
+        (self.viewport.height as usize).saturating_sub(5).max(1)
+    }
+
+    /// One screenful of *deps-tree* rows — the focused deps coin can be a small tiled
+    /// pane, so paging it by the whole-terminal `spine_page` would overshoot. Uses the
+    /// tree height captured at render, falling back to `spine_page` before the first
+    /// deps render; floored so a tiny pane still advances (M3).
+    fn deps_page(&self) -> usize {
+        if self.deps_view_h > 0 {
+            (self.deps_view_h as usize).saturating_sub(1).max(1)
+        } else {
+            self.spine_page()
         }
     }
 
@@ -1308,6 +1757,23 @@ impl App {
             return;
         }
         let root = self.root.clone();
+        // Flip an existing pinned coin for this issue to its Deps face rather than
+        // minting a second coin for the same identity (the one-coin-per-issue
+        // invariant; without this, `d` on a pinned issue duplicated it).
+        if let Some(i) = self.windows.pinned_coin_index(&root) {
+            self.windows.focus = i;
+            if !matches!(
+                self.windows.windows[i].kind,
+                WindowKind::Coin {
+                    mode: CoinMode::Deps,
+                    ..
+                }
+            ) {
+                self.windows.flip_coin_face(i, &self.graph);
+            }
+            self.after_focus_change();
+            return;
+        }
         self.windows
             .ensure_preview(&root, CoinMode::Deps, &self.graph);
         self.windows.focus_preview();
@@ -1331,9 +1797,13 @@ impl App {
             return CoinMode::Deps;
         }
         let live = self.fleet.get(issue).is_some_and(AgentStatus::is_live)
-            || self.pending_launch.contains(issue)
+            || self.pending_launch.contains_key(issue)
             || self.resuming.contains_key(issue);
         if live { CoinMode::Chat } else { CoinMode::Deps }
+    }
+
+    fn is_starting(&self, issue: &str) -> bool {
+        self.pending_launch.contains_key(issue) || self.resuming.contains_key(issue)
     }
 
     /// Re-aim the preview coin at the current Spine selection (the chat-first
@@ -1377,7 +1847,11 @@ impl App {
     fn flip_active_coin(&mut self) {
         let idx = if matches!(self.windows.focused_kind(), WindowKind::Coin { .. }) {
             self.windows.focus
-        } else if let Some(p) = self.windows.preview_index() {
+        // From the Spine, flip the coin that's actually the big pane: the selection's
+        // pinned coin, else its preview. (`preview_index` alone was None for a pinned
+        // selection — `reaim_preview` clears the preview there — so Tab was a dead key
+        // in exactly the case where a coin is provably on screen.)
+        } else if let Some(p) = self.active_index() {
             p
         } else {
             return;
@@ -1403,24 +1877,149 @@ impl App {
             .cloned()
     }
 
-    /// The active project's capacity-gate load: agents that hold a genuinely-live
-    /// process. A terminal agent (Done/Failed/Stopped) whose EXITED card is still
-    /// windowed keeps a `self.backends` entry but is NOT live, so counting
-    /// `backends.len()` would falsely refuse a launch when nothing is actually
-    /// running. The supervisor's shared `live_count` stays the authoritative
-    /// workspace-wide enforcer; this is the cockpit's local pre-check.
+    /// The workspace-wide capacity-gate load: agents that hold a genuinely-live
+    /// process across the active project and any backgrounded project. A terminal
+    /// agent (Done/Failed/Stopped) whose EXITED card is still windowed keeps a
+    /// backend but is NOT live, so counting `backends.len()` would falsely refuse a
+    /// launch when nothing is actually running.
     fn live_agent_count(&self) -> usize {
-        self.fleet.values().filter(|s| s.is_live()).count()
+        self.workspace_summary().0
+    }
+
+    fn ensure_ask_issue(&mut self, key: &str, title: &str) -> bool {
+        let added = self.graph.get(key).is_none();
+        if added {
+            self.graph.add_issue(Issue {
+                key: key.to_string(),
+                title: title.to_string(),
+                status: Status::Started,
+                priority: Priority::None,
+                assignee: None,
+                external: false,
+            });
+        }
+        self.ask_agents.insert(key.to_string());
+        added
+    }
+
+    fn reveal_ask_issue(&mut self, key: &str) {
+        self.filter = Filter::All;
+        self.search_active = false;
+        self.search_query.clear();
+        self.root = key.to_string();
+        self.rebuild_order();
+    }
+
+    /// Re-arm a synthetic ad-hoc agent's `ask_agents` membership and Spine node when
+    /// a live hook arrives for it and the node was pruned (e.g. by a reconcile on a
+    /// project switch-back). Called at the top of the live status handlers, BEFORE
+    /// their reaped/terminal guards — so it must enforce the same tombstone itself:
+    /// a late in-flight hook for a *killed* (reaped) or already-*terminal* ask agent
+    /// must NOT resurrect it into the Spine. `ensure_ask_issue` is unconditional, so
+    /// without this guard a stray post-cancel `AgentNeedsYou`/`AgentAction` would
+    /// re-inject a dead row. The legitimate restore path is a still-live ask agent
+    /// (neither reaped nor terminal), which both guards leave untouched.
+    fn restore_ask_issue_if_needed(&mut self, key: &str) {
+        if self.reaped.contains(key) || self.is_terminal(key) {
+            return;
+        }
+        if crate::worktree::is_synthetic_ask_id(key) && self.ensure_ask_issue(key, "Ad-hoc agent") {
+            self.rebuild_order();
+        }
+    }
+
+    fn ask_spawn(&mut self) {
+        let load = self.live_agent_count() + self.resuming.len();
+        if self.resume_cap > 0 && load >= self.resume_cap {
+            self.set_footer(format!(
+                "fleet at capacity ({load}/{}) — finish or stop an agent first",
+                self.resume_cap
+            ));
+            return;
+        }
+
+        let Some(workspace) = self.workspace.clone() else {
+            self.status_msg = Some(if self.demo {
+                "read-only demo — ask agents need a real project; drop --demo".into()
+            } else {
+                self.degrade_reason
+                    .as_ref()
+                    .map(|r| format!("agent control plane unavailable: {r}"))
+                    .unwrap_or_else(|| "agent control plane unavailable".into())
+            });
+            return;
+        };
+
+        let key = crate::worktree::synthetic_ask_id();
+        let title = "Ad-hoc agent".to_string();
+        let size = self.agent_spawn_size();
+        self.ensure_ask_issue(&key, &title);
+        self.reveal_ask_issue(&key);
+
+        let choices = self
+            .project_candidates
+            .get(&self.active_project)
+            .cloned()
+            .unwrap_or_default();
+        if choices.len() > 1 {
+            self.repo_select = Some(RepoSelect {
+                picker: RepoPicker::new(choices),
+                issue: key.clone(),
+                title,
+                size,
+                adhoc: true,
+            });
+            self.open_agent_window(&key);
+            self.set_footer(
+                "select repos for ad-hoc agent · space toggles · ⏎ launch · esc cancel".into(),
+            );
+            return;
+        }
+
+        workspace.launch_ask(
+            self.active_project.clone(),
+            key.clone(),
+            title,
+            size,
+            Vec::new(),
+        );
+        self.pending_launch
+            .insert(key.clone(), self.frame + RESUME_GRACE_FRAMES);
+        self.pending_attach = Some(key.clone());
+        self.open_agent_window(&key);
+        self.set_footer(format!("opening ad-hoc agent {key}…"));
     }
 
     fn button(&mut self) {
-        let Some(issue) = self.focused_issue() else {
+        self.dispatch_selection(false);
+    }
+
+    /// Dispatch the on-screen selection (the `Enter` / `Ctrl-a Enter` button, and the
+    /// `Ctrl-a c` "choose repos" verb). `force_repo_select` opens the repo multi-select
+    /// even on a single-candidate project — the on-demand entry that lets you give one
+    /// agent more than one repo (and add a registered repo the project doesn't yet
+    /// list); the plain button leaves it `false`, keeping the fast single-repo path.
+    fn dispatch_selection(&mut self, force_repo_select: bool) {
+        // Ctrl-a Enter / Enter dispatches the SELECTION from any focus — but in a
+        // re-rooted deps coin the perceived selection is the cursor root the pane shows
+        // (H6), not the stale Spine root. A chat coin (or the Spine/Fleet) is not a
+        // selection move, so it dispatches the Spine selection exactly as before — which
+        // is what lets you browse the nav while focused in a chat and launch the row.
+        let target = match self.windows.focused_kind() {
+            WindowKind::Coin { .. } => self.detail_key().map(str::to_string),
+            _ => (!self.root.is_empty()).then(|| self.root.clone()),
+        };
+        let Some(key) = target else {
             self.status_msg = Some("no issue selected".into());
             return;
         };
+        let Some(issue) = self.graph.get(&key) else {
+            self.status_msg = Some(format!("{key} isn't a dispatchable issue here"));
+            return;
+        };
         if issue.external {
-            let key = issue.key.clone();
-            self.status_msg = Some(format!("{key} is external — launch it in its own project"));
+            let k = issue.key.clone();
+            self.status_msg = Some(format!("{k} is external — launch it in its own project"));
             return;
         }
         let (key, title) = (issue.key.clone(), issue.title.clone());
@@ -1433,7 +2032,7 @@ impl App {
         }
         // A launch already in flight (double-press before it spawns): focus the
         // starting card rather than spinning up a second.
-        if self.pending_launch.contains(&key) {
+        if self.pending_launch.contains_key(&key) {
             self.open_agent_window(&key);
             self.set_footer(format!("already opening an agent on {key}…"));
             return;
@@ -1473,41 +2072,205 @@ impl App {
                 // Up-front repo select (ENG-536): a project with more than one
                 // candidate repo lets the user pick which the issue needs before
                 // launch. One candidate (the common single-repo case) launches
-                // straight away — no modal — so the default path is unchanged.
+                // straight away — no modal — so the default path is unchanged. The
+                // `Ctrl-a c` verb forces the modal open even on a single candidate
+                // (CF-20), the on-demand way to add a second repo to one agent.
                 let choices = self
                     .project_candidates
                     .get(&self.active_project)
                     .cloned()
                     .unwrap_or_default();
-                if choices.len() > 1 {
+                if choices.len() > 1 || (force_repo_select && !choices.is_empty()) {
                     self.repo_select = Some(RepoSelect {
                         picker: RepoPicker::new(choices),
                         issue: key.clone(),
                         title,
                         size,
+                        adhoc: false,
                     });
                     self.set_footer(format!(
-                        "select repos for {key} · space toggles · ⏎ launch · esc cancel"
+                        "select repos for {key} · space toggles · a add repo · ⏎ launch · esc cancel"
                     ));
                     return;
                 }
                 workspace.launch(self.active_project.clone(), key.clone(), title, size);
-                self.pending_launch.insert(key.clone());
+                self.pending_launch
+                    .insert(key.clone(), self.frame + RESUME_GRACE_FRAMES);
                 self.pending_attach = Some(key.clone());
                 self.open_agent_window(&key);
                 self.set_footer(format!("opening agent on {key}…"));
             }
-            None => self.status_msg = Some("agent control plane unavailable".into()),
+            None => {
+                self.status_msg = Some(if self.demo {
+                    "read-only demo — agents need a real project; drop --demo".into()
+                } else {
+                    // Reuse the real degrade reason instead of opaque jargon (M13).
+                    self.degrade_reason
+                        .clone()
+                        .unwrap_or_else(|| "agent control plane unavailable".into())
+                });
+            }
         }
+    }
+
+    /// Restart the on-screen issue's agent in one press (`Ctrl-a r`): reclaim a dead
+    /// backend, then relaunch — collapsing the kill→reselect→Enter ritual that made
+    /// re-dispatching a crash harder than causing it (CF-14). A still-live agent is
+    /// refused (its worktree is in use), so this never silently kills running work.
+    fn restart_agent(&mut self) {
+        let Some(issue) = self.detail_key().map(str::to_string) else {
+            self.status_msg = Some("no agent here to restart".into());
+            return;
+        };
+        if self.fleet.get(&issue).is_some_and(AgentStatus::is_live) || self.has_live_backend(&issue)
+        {
+            self.set_footer(format!(
+                "{issue} is still live — stop it ({}) before restarting",
+                self.keymap.verb_label(Action::KillWindow)
+            ));
+            return;
+        }
+        // The agent is dead (a live one was refused above): close its window + drop the
+        // backend (and any kill tombstone) so `button` relaunches (resuming the session)
+        // instead of re-opening the corpse card. `reclaim_if_dead` won't free a *windowed*
+        // backend, so undock first; aim the Spine so the relaunch targets this issue.
+        self.undock_issue(&issue);
+        self.backends.remove(&issue);
+        self.reaped.remove(&issue);
+        self.aim_spine(issue);
+        self.button();
+    }
+
+    /// Walk to the next live agent (any state), wrapping, focusing its chat (`Ctrl-a j`)
+    /// — "how are my agents doing" without hunting the Spine. Mirrors `jump_to_needs_you`
+    /// but over the whole live fleet, not just the needy ones (CF-14).
+    fn next_agent(&mut self) {
+        let mut members: Vec<String> = self
+            .fleet
+            .iter()
+            .filter(|(_, s)| s.is_live())
+            .map(|(k, _)| k.clone())
+            .collect();
+        members.sort_by(|a, b| natural_key_cmp(a, b));
+        if members.is_empty() {
+            self.status_msg = Some("no live agents to walk".into());
+            return;
+        }
+        let next = members
+            .iter()
+            .position(|k| *k == self.root)
+            .map_or(0, |i| (i + 1) % members.len());
+        let (key, n, total) = (members[next].clone(), next + 1, members.len());
+        self.set_jump_status("agent", &key, n, total);
+        // Land in the agent's conversation when it's docked; otherwise the follower
+        // preview (re-aimed by set_jump_status) already shows it.
+        if !self.focus_pinned_chat(&key) {
+            self.windows.focus_preview();
+            self.after_focus_change();
+        }
+    }
+
+    /// Launch every READY issue up to the concurrency cap in one press (`Ctrl-a g`) —
+    /// turning the "I cleared the blockers, go" moment into one intentional action with
+    /// a partial-success trace, instead of a row of identical Enters that abort silently
+    /// at capacity (CF-14). (The over-cap remainder stays READY to re-press; a persistent
+    /// auto-draining queue is a noted follow-up.)
+    fn dispatch_ready(&mut self) {
+        if self.workspace.is_none() {
+            self.status_msg = Some(
+                self.degrade_reason
+                    .clone()
+                    .unwrap_or_else(|| "agents need a real project".into()),
+            );
+            return;
+        }
+        let mut ready: Vec<String> = self
+            .graph
+            .keys()
+            .iter()
+            .filter(|k| {
+                self.graph.get(k).is_some_and(|i| !i.external)
+                    && self.readiness(k) == Readiness::Ready
+                    && !self.backends.contains_key(*k)
+                    && !self.pending_launch.contains_key(*k)
+            })
+            .cloned()
+            .collect();
+        ready.sort_by(|a, b| {
+            self.sort_key(a)
+                .cmp(&self.sort_key(b))
+                .then_with(|| self.priority_rank(a).cmp(&self.priority_rank(b)))
+                .then_with(|| natural_key_cmp(a, b))
+        });
+        if ready.is_empty() {
+            self.set_footer("nothing READY to dispatch".into());
+            return;
+        }
+        let budget = if self.resume_cap == 0 {
+            ready.len()
+        } else {
+            self.resume_cap
+                .saturating_sub(self.live_agent_count() + self.resuming.len())
+        };
+        let take = budget.min(ready.len());
+        for key in ready.iter().take(take) {
+            self.launch_issue(key);
+        }
+        let left = ready.len() - take;
+        self.set_footer(if left == 0 {
+            format!(
+                "dispatched {take} READY {}",
+                if take == 1 { "issue" } else { "issues" }
+            )
+        } else {
+            format!("launched {take} · {left} still ready — fleet at capacity, finish some to launch more")
+        });
+    }
+
+    /// The bare launch path `button` runs after its readiness/capacity gates, minus the
+    /// repo-select modal and the focus-grabbing window open — so batch dispatch can fire
+    /// many at once silently (each issue's row shows the spawning marker). A multi-repo
+    /// issue launches its primary repo only here.
+    fn launch_issue(&mut self, key: &str) {
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        let title = self
+            .graph
+            .get(key)
+            .map(|i| i.title.clone())
+            .unwrap_or_default();
+        let size = self.agent_spawn_size();
+        workspace.launch(self.active_project.clone(), key.to_string(), title, size);
+        self.pending_launch
+            .insert(key.to_string(), self.frame + RESUME_GRACE_FRAMES);
     }
 
     /// Drive the open repo multi-select (ENG-536): space toggles the cursor's repo,
     /// ↑↓ move, Enter launches with the checked set, Esc/Ctrl-C cancels (no launch
-    /// was sent yet, so cancelling is clean).
+    /// was sent yet, so cancelling is clean). `a` opens the "add another repo"
+    /// sub-list (CF-20), which then captures movement/confirm until it closes.
     fn on_repo_select_key(&mut self, key: KeyEvent) {
-        let Some(select) = self.repo_select.as_mut() else {
+        if self.repo_select.is_none() {
             return;
-        };
+        }
+        // While the add-list is open, keys drive IT: ↑↓ move, Enter pulls the repo into
+        // the checklist, Esc backs out to the main checklist (not the whole modal).
+        if self
+            .repo_select
+            .as_ref()
+            .is_some_and(|s| s.picker.is_adding())
+        {
+            let picker = &mut self.repo_select.as_mut().expect("Some").picker;
+            match key.code {
+                KeyCode::Esc => picker.cancel_add(),
+                KeyCode::Down => picker.move_by(1),
+                KeyCode::Up => picker.move_by(-1),
+                KeyCode::Enter => picker.confirm_add(),
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 let issue = self.repo_select.take().map(|s| s.issue).unwrap_or_default();
@@ -1517,34 +2280,107 @@ impl App {
                 self.repo_select = None;
                 self.set_footer("launch cancelled".into());
             }
-            KeyCode::Char(' ') => select.picker.toggle(),
-            KeyCode::Down => select.picker.move_by(1),
-            KeyCode::Up => select.picker.move_by(-1),
+            KeyCode::Char(' ') => self.repo_select.as_mut().expect("Some").picker.toggle(),
+            KeyCode::Char('a') => {
+                // Open the add-list over registered repos this project doesn't yet list.
+                // Disjoint fields (`repo_select` mut, `registered_repos` shared), so this
+                // borrow pair is fine; footer the empty case after releasing the borrow.
+                let opened = self
+                    .repo_select
+                    .as_mut()
+                    .expect("Some")
+                    .picker
+                    .open_add(&self.registered_repos);
+                if !opened {
+                    self.set_footer("no other registered repos to add".into());
+                }
+            }
+            KeyCode::Down => self.repo_select.as_mut().expect("Some").picker.move_by(1),
+            KeyCode::Up => self.repo_select.as_mut().expect("Some").picker.move_by(-1),
             KeyCode::Enter => {
                 let RepoSelect {
                     picker,
                     issue,
                     title,
                     size,
+                    adhoc,
                 } = self.repo_select.take().expect("repo_select is Some here");
                 let repos = picker.selected_handles();
+                // Persist any repo the human added beyond the project's candidates — a
+                // deliberate widening of the trust boundary that sticks (CF-20).
+                self.persist_added_candidates(&repos);
                 let Some(workspace) = self.workspace.clone() else {
                     self.status_msg = Some("agent control plane unavailable".into());
                     return;
                 };
-                workspace.launch_with_repos(
-                    self.active_project.clone(),
-                    issue.clone(),
-                    title,
-                    size,
-                    repos,
-                );
-                self.pending_launch.insert(issue.clone());
+                if adhoc {
+                    workspace.launch_ask(
+                        self.active_project.clone(),
+                        issue.clone(),
+                        title,
+                        size,
+                        repos,
+                    );
+                } else {
+                    workspace.launch_with_repos(
+                        self.active_project.clone(),
+                        issue.clone(),
+                        title,
+                        size,
+                        repos,
+                    );
+                }
+                self.pending_launch
+                    .insert(issue.clone(), self.frame + RESUME_GRACE_FRAMES);
                 self.pending_attach = Some(issue.clone());
                 self.open_agent_window(&issue);
-                self.set_footer(format!("opening agent on {issue}…"));
+                let label = if adhoc { "ad-hoc agent" } else { "agent" };
+                self.set_footer(format!("opening {label} on {issue}…"));
             }
             _ => {}
+        }
+    }
+
+    /// Persist every handle in `chosen` that the active project doesn't yet list as a
+    /// candidate — the repos the human added via the picker's "add another repo" (CF-20).
+    /// Two effects, both so the next launch needs no restart: append it to the in-session
+    /// `project_candidates` (so a plain `Enter` next time offers it), and write it into
+    /// `registry.toml` (so it survives, and the agent may `request-repo` it later). A
+    /// registry write failure footers but never blocks the launch already in flight.
+    fn persist_added_candidates(&mut self, chosen: &[String]) {
+        let active = self.active_project.clone();
+        let existing: std::collections::HashSet<String> = self
+            .project_candidates
+            .get(&active)
+            .map(|c| c.iter().map(|r| r.handle.clone()).collect())
+            .unwrap_or_default();
+        for handle in chosen {
+            if existing.contains(handle) {
+                continue;
+            }
+            // In-session: make it a candidate now (carry the local-only flag the picker
+            // shows). Skipped if it isn't a known registered repo — nothing to surface.
+            if let Some(meta) = self
+                .registered_repos
+                .iter()
+                .find(|r| &r.handle == handle)
+                .cloned()
+            {
+                let candidates = self.project_candidates.entry(active.clone()).or_default();
+                if !candidates.iter().any(|c| &c.handle == handle) {
+                    candidates.push(RepoChoice {
+                        handle: meta.handle,
+                        local: meta.local,
+                        primary: false,
+                    });
+                }
+            }
+            // Durable: widen the project's candidate set in registry.toml.
+            if let Some(layout) = self.layout.clone()
+                && let Err(e) = crate::registry::add_candidate(&layout, &active, handle)
+            {
+                self.set_footer(format!("couldn't persist repo {handle}: {e}"));
+            }
         }
     }
 
@@ -1704,9 +2540,36 @@ impl App {
     // ── Window-manager verbs ───────────────────────────────────────────────────
 
     fn pin_window(&mut self) {
-        if self.windows.focus == 0 {
-            self.status_msg = Some("the spine is always pinned".into());
-            return;
+        // From the Spine, pin graduates the previewed coin for the current
+        // selection — pin *that issue's view* without Tab-ing into it first (A2);
+        // focus then returns to the Spine so you keep browsing.
+        let from_spine = self.windows.focus == 0;
+        if from_spine {
+            if self.root.is_empty() {
+                self.status_msg = Some("nothing selected to pin".into());
+                return;
+            }
+            if self.windows.has_pinned_coin(&self.root) {
+                // `p` from the nav is a toggle: a second press on an
+                // already-pinned selection *unpins* it (undock by identity).
+                // undock_issue reaims the preview so the issue stays on screen
+                // and a live agent keeps running, and it never touches focus, so
+                // you stay on the Spine and keep browsing.
+                let issue = self.root.clone();
+                let running = self.fleet.get(&issue).is_some_and(AgentStatus::is_live);
+                self.undock_issue(&issue);
+                self.cockpit_dirty = true;
+                self.set_footer(if running {
+                    format!("unpinned {issue} · still running — ⏎ to re-open")
+                } else {
+                    format!("unpinned {issue}")
+                });
+                return;
+            }
+            // Aim the preview at the selection, then focus it so the graduate path
+            // below treats it exactly like pinning from inside the issue's window.
+            self.reaim_preview();
+            self.windows.focus_preview();
         }
         // Pinning the preview *graduates* it to a permanent coin, then a fresh
         // preview re-arms for the current selection.
@@ -1726,6 +2589,9 @@ impl App {
                 .unwrap_or("window")
                 .to_string();
             self.reaim_preview();
+            if from_spine {
+                self.windows.focus = 0; // back to the Spine to keep browsing
+            }
             self.cockpit_dirty = true;
             self.set_footer(match outcome {
                 GraduateOutcome::Merged(_) => format!("{label} is already pinned"),
@@ -1734,7 +2600,7 @@ impl App {
             return;
         }
         // An already-pinned coin / Fleet → unpin = undock (close it; a live agent
-        // keeps running, refind via the roster).
+        // keeps running — re-open it by selecting its Spine row and pressing Enter).
         self.close_window();
     }
 
@@ -1759,37 +2625,73 @@ impl App {
         }
         self.preview_size.remove(&closed.id);
         if let Some(issue) = closed.issue().map(str::to_string) {
-            // Close = undock: a *live* agent keeps running (refind via the
-            // roster), so only reclaim its backend once it's actually dead.
+            // Close = undock: a *live* agent keeps running, so only reclaim its
+            // backend once it's actually dead. Re-open it later by selecting its
+            // Spine row and pressing Enter — Enter re-attaches the retained backend.
             let running = self.fleet.get(&issue).is_some_and(AgentStatus::is_live);
             self.reclaim_if_dead(&issue);
             self.set_footer(if running {
-                format!("closed {issue} · still running — r to refind")
+                format!("closed {issue} · still running — select it & ⏎ to re-open")
             } else {
                 format!("closed {issue}")
             });
         } else {
             self.status_msg = Some("closed window".into()); // the Fleet overview
         }
+        // Re-seed the follower preview for the current selection so the thing you're
+        // looking at never vanishes: unpinning the *selected* issue's coin demotes it
+        // back to the preview (it stays on screen) instead of closing to an empty big
+        // pane. Mirrors `undock_issue`, which already reaims after a close-by-identity.
+        self.reaim_preview();
     }
 
     /// Arm a confirmed kill of the focused agent (`Ctrl-a x`). Kill is destructive
     /// and separate from close, so it's never a single keystroke.
+    /// True when `issue` has a restored/live backend `Arc` whose process hasn't
+    /// exited — ground truth even in the switch-back window where the fleet entry
+    /// hasn't been re-emitted yet, so a discard/kill can never act on a live agent
+    /// through an empty-fleet gap (H2).
+    fn has_live_backend(&self, issue: &str) -> bool {
+        self.backends
+            .get(issue)
+            .is_some_and(|b| !matches!(b.status(), Lifecycle::Exited(_)))
+    }
+
     fn arm_kill(&mut self) {
         // A coin carries its agent on either face, so kill works from chat or deps.
         // From the Spine/roster (no agent window focused) it targets the selected
         // issue, so you can stop an agent straight from the navbar.
-        let issue = self
-            .windows
-            .focused()
-            .issue()
-            .map(str::to_string)
-            .or_else(|| (!self.root.is_empty()).then(|| self.root.clone()));
-        let Some(issue) = issue else {
-            self.status_msg = Some("no agent here to kill — Ctrl-a w closes a window".into());
+        // Kill the agent the pane shows (a re-rooted deps coin's cursor root, a chat
+        // coin's identity, else the selection) — not the coin's stale identity (H6).
+        let Some(issue) = self.detail_key().map(str::to_string) else {
+            self.status_msg = Some(format!(
+                "no agent here to kill — {} closes a window",
+                self.keymap.verb_label(Action::CloseWindow)
+            ));
             return;
         };
-        if !self.fleet.get(&issue).is_some_and(AgentStatus::is_live) {
+        if !(self.fleet.get(&issue).is_some_and(AgentStatus::is_live)
+            || self.has_live_backend(&issue))
+        {
+            // A wedged fresh launch has no fleet entry yet (AgentSpawned never came),
+            // so the normal kill is refused — but the user must still be able to abort
+            // it. Cancel the in-flight launch directly so a hung start is recoverable
+            // without restarting the cockpit (M9).
+            if self.pending_launch.contains_key(&issue) {
+                if let Some(workspace) = self.workspace.clone() {
+                    workspace.cancel(self.active_project.clone(), issue.clone());
+                }
+                self.pending_launch.remove(&issue);
+                if self.pending_attach.as_deref() == Some(issue.as_str()) {
+                    self.pending_attach = None;
+                }
+                // Tear down the "◌ starting agent…" card the button launch opened, so the
+                // view matches the "cancelled" footer instead of still claiming the agent
+                // is starting (the card paints purely on no-backend + no-fleet) (M9).
+                self.undock_issue(&issue);
+                self.set_footer(format!("cancelled the pending launch on {issue}"));
+                return;
+            }
             self.status_msg = Some(format!("agent on {issue} is not running"));
             return;
         }
@@ -1803,24 +2705,30 @@ impl App {
     /// ENG-541): push each repo's branch then remove its worktrees. Refused while the
     /// agent is still live — its checkout is in use, so stop it first.
     fn arm_discard(&mut self) {
-        let issue = self
-            .windows
-            .focused()
-            .issue()
-            .map(str::to_string)
-            .or_else(|| (!self.root.is_empty()).then(|| self.root.clone()));
-        let Some(issue) = issue else {
+        // Target the issue the pane is *showing* (CF-9 / H6): a re-rooted deps coin
+        // describes its cursor root, not its fixed identity. `detail_key()` is the single
+        // on-screen-target source the detail bar, dispatch and kill already resolve
+        // through — discard (the one destructive verb CF-9 missed) must agree, or
+        // confirming pushes + tears down the *wrong* issue's worktree (NEW-04).
+        let Some(issue) = self.detail_key().map(str::to_string) else {
             self.status_msg = Some("no issue selected to discard".into());
             return;
         };
-        if self.fleet.get(&issue).is_some_and(AgentStatus::is_live) {
+        if self.fleet.get(&issue).is_some_and(AgentStatus::is_live) || self.has_live_backend(&issue)
+        {
             self.status_msg = Some(format!(
-                "{issue} is still running — stop it (Ctrl-a x) before discarding"
+                "{issue} is still running — stop it ({}) before discarding",
+                self.keymap.verb_label(Action::KillWindow)
             ));
             return;
         }
+        let action = if crate::worktree::is_synthetic_ask_id(&issue) {
+            "remove throwaway worktrees"
+        } else {
+            "push branches + remove worktrees"
+        };
         self.status_msg = Some(format!(
-            "discard {issue}'s workspace — push branches + remove worktrees? y to confirm, any key to cancel"
+            "discard {issue}'s workspace — {action}? y to confirm, any key to cancel"
         ));
         self.discard_confirm = Some(issue);
     }
@@ -1839,14 +2747,15 @@ impl App {
         }
         match self.workspace.clone() {
             Some(workspace) => {
-                workspace.teardown(self.active_project.clone(), issue.clone());
-                // The agent is gone (gated non-live), so drop its fleet entry and
-                // undock its window — the worktrees are reclaimed in the background.
-                // Tombstone it (like the reap path) so any late hook for the discarded
-                // issue is dropped by the resurrection guards rather than re-inserting it.
-                self.fleet.remove(&issue);
-                self.reaped.insert(issue.clone());
-                self.undock_issue(&issue);
+                if crate::worktree::is_synthetic_ask_id(&issue) {
+                    workspace.teardown_ask(self.active_project.clone(), issue.clone());
+                } else {
+                    workspace.teardown(self.active_project.clone(), issue.clone());
+                }
+                // Don't tear down the UI yet — wait for teardown to report whether the
+                // worktree was actually removed (`WorkspaceDiscarded`) or KEPT after a
+                // push/remove/scratch failure (`DiscardKeptWorktree`). Dropping the UI
+                // now would strand local work with no on-screen trace.
                 self.set_footer(format!("discarding {issue}'s workspace…"));
             }
             None => self.status_msg = Some("agent control plane unavailable".into()),
@@ -1878,6 +2787,39 @@ impl App {
         }
     }
 
+    fn request_quit(&mut self) {
+        let (live, needs) = self.workspace_summary();
+        if live == 0 {
+            // Nothing is at stake — quit immediately, no confirmation friction
+            // (the kill-confirm shape is only there to guard a live fleet teardown).
+            self.should_quit = true;
+            return;
+        }
+        self.quit_confirm = true;
+        self.status_msg = Some(format!(
+            "quit with {live} live agent{}{}? y to confirm, esc to cancel",
+            if live == 1 { "" } else { "s" },
+            if needs > 0 {
+                format!(" ({needs} needs you)")
+            } else {
+                String::new()
+            }
+        ));
+    }
+
+    fn on_quit_confirm_key(&mut self, key: KeyEvent) {
+        let confirm = matches!(
+            key.code,
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+        );
+        self.quit_confirm = false;
+        if confirm {
+            self.should_quit = true;
+        } else {
+            self.status_msg = Some("quit cancelled".into());
+        }
+    }
+
     fn on_kill_confirm_key(&mut self, key: KeyEvent) {
         let Some(issue) = self.kill_confirm.take() else {
             return;
@@ -1893,6 +2835,13 @@ impl App {
         match self.workspace.clone() {
             Some(workspace) => {
                 workspace.cancel(self.active_project.clone(), issue.clone());
+                // Eagerly tombstone the killed issue (CF-4): a NeedsYou / working
+                // AgentAction / live AgentStatusChanged hook already in flight before the
+                // cancel must be dropped by the resurrection guards — not re-promote the
+                // dying agent to WORKING or re-raise "needs you" until the graded Stopped
+                // lands. Reuses the shared `reaped` set discard already seeds; a real
+                // relaunch (AgentSpawned) clears it.
+                self.reaped.insert(issue.clone());
                 // Kill also undocks the agent's window — pinned coins included.
                 // Close is "undock, agent keeps running"; kill is "stop it and put
                 // it away", so a killed agent never lingers as a dead EXITED card
@@ -1931,13 +2880,25 @@ impl App {
     }
 
     fn toggle_layout(&mut self) {
-        self.windows.force_layout(self.windows.layout.toggled());
+        // While zoomed the renderer always draws the single big pane, so a layout flip
+        // is invisible (and used to silently latch manual mode) — refuse with a hint
+        // instead of changing state behind a curtain.
+        if self.windows.zoomed {
+            self.set_footer(format!(
+                "un-zoom ({}) to change layout",
+                self.keymap.verb_label(Action::ZoomToggle)
+            ));
+            return;
+        }
+        // Tri-state cycle (auto → rail → mosaic → auto) so a peek at the other layout
+        // isn't a one-way door out of the adaptive layout (M2).
+        self.windows.cycle_layout();
         self.cockpit_dirty = true;
         // Every window's Rect moves under the new layout; forget the cached sizes
         // so the next render reflows each live agent to where it now sits. This
         // (and zoom) are the *only* moments a live PTY reflows — browsing never does.
         self.preview_size.clear();
-        self.set_footer(format!("layout: {}", self.windows.layout.label()));
+        self.set_footer(format!("layout: {}", self.windows.layout_label()));
     }
 
     /// Forward a key to a specific agent's PTY.
@@ -1947,13 +2908,57 @@ impl App {
             return;
         }
         let Some(backend) = self.backends.get(issue) else {
+            // The backend was already reclaimed (the agent exited and its card was
+            // closed/pruned) — say so once instead of silently swallowing the keystroke
+            // into the void, which read as a frozen prompt (D-MED).
+            self.set_footer(if self.is_starting(issue) {
+                format!("agent on {issue} is still starting — input will work when it is ready")
+            } else {
+                format!("agent on {issue} is no longer accepting input")
+            });
             return;
         };
+        if matches!(backend.status(), Lifecycle::Exited(_)) {
+            self.set_footer(format!("agent on {issue} is no longer accepting input"));
+            return;
+        }
         if backend.send_input(&bytes).is_err() {
             // The PTY is gone — the agent exited out from under us. Surface it; the
             // window stays (as an EXITED card) until you close it.
             self.set_footer(format!("agent on {issue} is no longer accepting input"));
         }
+    }
+
+    /// Forward a bracketed paste to a focused chat agent verbatim, re-wrapped in the
+    /// terminal's paste markers (`ESC[200~`…`ESC[201~`) so the child `claude`
+    /// reassembles it as one block rather than submitting at every newline (the
+    /// line-by-line paste bug). Returns true when a chat coin consumed it (so the
+    /// caller repaints); a paste with no chat focused is dropped, like a keystroke.
+    pub fn forward_paste(&mut self, text: &str) -> bool {
+        let WindowKind::Coin {
+            issue,
+            mode: CoinMode::Chat,
+        } = self.windows.focused_kind().clone()
+        else {
+            return false;
+        };
+        let clean = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+        let mut bytes = Vec::with_capacity(text.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(clean.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        match self.backends.get(&issue) {
+            Some(backend) if matches!(backend.status(), Lifecycle::Exited(_)) => {
+                self.set_footer(format!("agent on {issue} is no longer accepting input"));
+            }
+            Some(backend) if backend.send_input(&bytes).is_ok() => {}
+            _ => self.set_footer(if self.is_starting(&issue) {
+                format!("agent on {issue} is still starting — paste when it is ready")
+            } else {
+                format!("agent on {issue} is no longer accepting input")
+            }),
+        }
+        true
     }
 
     // ── Focus bookkeeping / visibility ─────────────────────────────────────────
@@ -1965,6 +2970,13 @@ impl App {
     fn after_focus_change(&mut self) {
         if self.search_active && self.windows.focus != 0 {
             self.search_active = false; // commit: end input mode, keep the query
+        }
+        // Any path that lands focus on the Spine must reveal it. A zoomed coin hides the
+        // Spine entirely, so FocusLeft/Right stepping onto index 0 (like the dedicated
+        // FocusNav) has to clear zoom — otherwise focused_kind()==Spine routes j/k/⏎ to
+        // an off-screen Spine and Enter could spawn an agent the user can't see (M1).
+        if self.windows.focus == 0 {
+            self.windows.zoomed = false;
         }
         self.maybe_resume_focused();
     }
@@ -2030,7 +3042,7 @@ impl App {
                     .find(|p| p.index == idx)
                     .map(|p| p.rect),
                 LayoutMode::Rail => {
-                    let (full, _) =
+                    let (full, _, _) =
                         layout::rail(area, n, focus, active, self.windows.preview_index());
                     full.into_iter().find(|p| p.index == idx).map(|p| p.rect)
                 }
@@ -2107,6 +3119,23 @@ impl App {
             windows,
             focus,
             ..CockpitState::default()
+        }
+    }
+
+    /// Persist ledger history to the right per-project files. The in-memory ledger
+    /// sees events from every project before the active-project scoping guard; saving
+    /// the whole thing to `ledger_path` would leak background project history into
+    /// whichever project happened to be active when the app booted.
+    pub fn save_ledgers(&self) {
+        if let Some(layout) = &self.layout {
+            for project_id in self.ledger.project_ids() {
+                if let Some(handle) = self.project_handles.get(&project_id) {
+                    let path = layout.ledger_path(handle);
+                    let _ = self.ledger.save_project(&path, &project_id);
+                }
+            }
+        } else if let Some(path) = self.ledger_path.as_deref() {
+            let _ = self.ledger.save(path);
         }
     }
 
@@ -2264,7 +3293,7 @@ impl App {
         else {
             return;
         };
-        if self.backends.contains_key(&issue) || self.pending_launch.contains(&issue) {
+        if self.backends.contains_key(&issue) || self.pending_launch.contains_key(&issue) {
             return; // already up, or already resuming
         }
         // "Was-live" survives rehydration as a live fleet status (Idle/NeedsYou).
@@ -2278,7 +3307,7 @@ impl App {
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
-        if self.pending_launch.contains(issue) {
+        if self.pending_launch.contains_key(issue) {
             return;
         }
         // Don't fire a resume the supervisor can only reject as "at capacity": it
@@ -2303,7 +3332,8 @@ impl App {
             .pinned_coin_index(issue)
             .and_then(|i| self.window_pane_size(i));
         workspace.launch(self.active_project.clone(), issue.to_string(), title, size);
-        self.pending_launch.insert(issue.to_string());
+        self.pending_launch
+            .insert(issue.to_string(), self.frame + RESUME_GRACE_FRAMES);
         // Each resume carries its own grace deadline, so a wedged spawn self-
         // clears here (in `tick_frame`) without later resumes pushing it out —
         // the spinner can't pin the loop awake past the grace, eager or lazy.
@@ -2326,6 +3356,24 @@ impl App {
         // events — so the workspace roll-up, the global screen and the cross-project
         // jump see agents in projects you aren't currently inside.
         self.update_world(&ev);
+        // FEAT-B step 3: stamp the quiet-running overlay for a LIVE issue's PTY burst.
+        // Gating on `is_live()` keeps a terminal/absent issue's late output out of the
+        // map (the read-side `recently_active` already ignores it, but this keeps the map
+        // bounded and honest). A *fresh* activation — an Idle agent that wasn't
+        // recently-active until this burst — forces one repaint even off-screen, so its
+        // band/marker flips to WORKING at once instead of on the next animation frame.
+        let mut newly_active = false;
+        if let AppEvent::AgentOutput { project_id, issue } = &ev
+            && (self.active_project.is_empty()
+                || project_id.as_ref() == self.active_project.as_str())
+        {
+            let key: &str = issue;
+            if self.fleet.get(key).is_some_and(|s| s.is_live()) {
+                newly_active =
+                    self.fleet.get(key) == Some(&AgentStatus::Idle) && !self.recently_active(key);
+                self.last_output.insert(key.to_string(), self.frame);
+            }
+        }
         // While the cockpit is inside one project, an agent event from another
         // (backgrounded) project isn't for the fleet on screen — drop it. ENG-401
         // shards the fleet by project and files these instead of dropping. An
@@ -2370,8 +3418,9 @@ impl App {
                         .or_default()
                         .insert(issue.clone());
                     if newly {
-                        // Toast once, but never bury a *local* standing alert.
-                        if !self.needs_you_alert {
+                        // Toast once, but never bury a *local* standing alert or an armed
+                        // confirmation's prompt (H4).
+                        if !self.needs_you_alert && !self.confirm_pending() {
                             let name = self.project_name(&project_id);
                             let switch = self.keymap.verb_label(Action::SwitchProject);
                             self.status_msg = Some(format!(
@@ -2411,12 +3460,38 @@ impl App {
                     issue,
                     repo_handle,
                 } => {
-                    if !self.needs_you_alert {
+                    if !self.needs_you_alert && !self.confirm_pending() {
                         let name = self.project_name(&project_id);
                         self.status_msg = Some(format!(
                             "agent on {issue} in {name} requests repo `{repo_handle}` — switch in to confirm"
                         ));
                     }
+                    repaint = true;
+                }
+                // A commit in a backgrounded project: maintain the CROSS-PROJECT
+                // `unpushed` chip here (its active footer never runs), so a rejected
+                // push there is never silently dropped — the data-integrity contract
+                // can't be evaded by the scope guard. A newly stranded one toasts once.
+                AppEvent::AgentCommitted {
+                    project_id,
+                    issue,
+                    repo_handle,
+                    outcome,
+                    ..
+                } => {
+                    let newly = self.note_push_outcome(&project_id, &issue, &repo_handle, &outcome);
+                    if newly && !self.needs_you_alert && !self.confirm_pending() {
+                        let name = self.project_name(&project_id);
+                        self.status_msg = Some(format!(
+                            "⚠ {issue} in {name}: auto-push failed — commits stranded"
+                        ));
+                    }
+                    repaint = true;
+                }
+                // A discard finishing in a backgrounded project clears its strand chip
+                // too, so a removed issue can't keep a cross-project chip alive.
+                AppEvent::WorkspaceDiscarded { project_id, issue } => {
+                    self.forget_unpushed(&project_id, &issue);
                     repaint = true;
                 }
                 _ => {}
@@ -2425,8 +3500,17 @@ impl App {
         }
         match ev {
             AppEvent::Notification(text) => {
-                self.pending_launch.clear();
                 self.set_footer(text);
+                true
+            }
+            // A launch the supervisor refused (capacity / already-running / still-
+            // stopping): drop ONLY the rejected issue's double-press guard — a bare
+            // Notification used to clear every issue's `pending_launch`, so an
+            // unrelated toast removed a different issue's in-flight guard (M10). A
+            // wedged guard with no rejection still self-heals on its deadline (M9).
+            AppEvent::LaunchRejected { issue, reason } => {
+                self.pending_launch.remove(&issue);
+                self.set_footer(reason);
                 true
             }
             // First-materialisation clone progress for the project being entered (the
@@ -2438,8 +3522,10 @@ impl App {
                 phase,
                 percent,
             } => {
-                let name = self.project_name(&project_id);
-                self.status_msg = Some(format!("materialising {name} · {phase} {percent}%"));
+                if !self.confirm_pending() {
+                    let name = self.project_name(&project_id);
+                    self.status_msg = Some(format!("materialising {name} · {phase} {percent}%"));
+                }
                 true
             }
             // The first clone finished — replace the terminal "… 100%" tick with a
@@ -2447,8 +3533,10 @@ impl App {
             // (a launch queued during the clone stays pending) or touch a needs-you
             // alert, so it sets the footer directly rather than via `set_footer`.
             AppEvent::MaterializeDone { project_id } => {
-                let name = self.project_name(&project_id);
-                self.status_msg = Some(format!("materialised {name}"));
+                if !self.confirm_pending() {
+                    let name = self.project_name(&project_id);
+                    self.status_msg = Some(format!("materialised {name}"));
+                }
                 true
             }
             // A disk-reclaim scan/delete finished on the blocking pool: open,
@@ -2477,9 +3565,33 @@ impl App {
                 }
                 true
             }
+            AppEvent::WorkspaceDiscarded { project_id, issue } => {
+                // Teardown confirmed the worktrees are gone — now it's safe to drop the
+                // fleet entry + window and tombstone late hooks (the cleanup the confirm
+                // used to do synchronously, before knowing the discard actually finished).
+                self.kept_worktrees.remove(&issue);
+                self.forget_unpushed(&project_id, &issue);
+                self.ask_agents.remove(&issue);
+                self.fleet.remove(&issue);
+                self.reaped.insert(issue.clone());
+                self.undock_issue(&issue);
+                self.set_footer(format!("discarded {issue}'s workspace"));
+                true
+            }
+            AppEvent::DiscardKeptWorktree { issue, reason, .. } => {
+                // The worktree is still on disk. Keep a standing chip + leave the issue
+                // in place so a re-discard after fixing cleanup finishes the job.
+                if crate::worktree::is_synthetic_ask_id(&issue) {
+                    self.ask_agents.insert(issue.clone());
+                }
+                self.kept_worktrees.insert(issue.clone());
+                self.set_footer(format!("{issue}: {reason}"));
+                true
+            }
             // `project_id` is ignored while the cockpit is single-project; ENG-401
             // shards the fleet by project and binds it here.
             AppEvent::AgentSpawned { issue, backend, .. } => {
+                self.restore_ask_issue_if_needed(&issue);
                 // Clear the double-launch guard (set by the button AND by a resume).
                 self.pending_launch.remove(&issue);
                 // A real relaunch revives the issue — clear any reaped tombstone.
@@ -2503,12 +3615,21 @@ impl App {
                 true
             }
             // Repaint only when this agent's screen is visible right now.
-            AppEvent::AgentOutput { issue, .. } => self.is_agent_visible(&issue),
+            AppEvent::AgentOutput { issue, .. } => self.is_agent_visible(&issue) || newly_active,
             AppEvent::AgentExited { issue, code, .. } => {
-                self.set_footer(match code {
+                let note = match code {
                     Some(0) | None => format!("agent on {issue} finished"),
                     Some(c) => format!("agent on {issue} exited ({c})"),
-                });
+                };
+                // An unrelated agent's autonomous exit must drop the sticky needs-you
+                // alert only when *no* agent still needs you — mirror AgentReaped, not
+                // set_footer's blanket clear, so a sibling's exit can't strip another
+                // agent's standing prompt guard (M11). Then show the exit note only if
+                // it won't bury a still-standing alert (or an armed confirm, H4).
+                self.clear_needs_you_alert_if_resolved();
+                if !self.needs_you_alert && !self.confirm_pending() {
+                    self.status_msg = Some(note);
+                }
                 // Its geometry is meaningless once it's dead; drop it so a relaunch
                 // reflows from scratch.
                 self.drop_preview_sizes_for(&issue);
@@ -2520,26 +3641,60 @@ impl App {
                 true
             }
             AppEvent::AgentNeedsYou { issue, reason, .. } => {
+                self.restore_ask_issue_if_needed(&issue);
                 if self.is_terminal(&issue) || self.reaped.contains(&issue) {
                     return false;
                 }
                 self.fleet.insert(issue.clone(), AgentStatus::NeedsYou);
-                self.status_msg = Some(format!("⚑ {issue} needs you — {reason}"));
                 self.needs_you_alert = true; // sticky until acknowledged
+                // Never overwrite an armed kill/discard/repo prompt: a "⚑ needs you" line
+                // under the red "confirm kill" hint would make a reflexive `y` destroy the
+                // agent under a misleading message (H4). The alert stays sticky (the header
+                // badge + flag still show it), so it isn't lost — it just doesn't seize the
+                // prompt slot while a confirmation owns `status_msg` and its `y`.
+                if !self.confirm_pending() {
+                    self.status_msg = Some(format!("⚑ {issue} needs you — {reason}"));
+                }
                 true
             }
             AppEvent::AgentStatusChanged { issue, status, .. } => {
-                if self.reaped.contains(&issue) {
+                self.restore_ask_issue_if_needed(&issue);
+                // A reaped (killed/discarded) agent drops a *live* re-emit — a NeedsYou /
+                // working hook in flight before the cancel must not re-promote a dying
+                // agent (CF-4). But a *terminal* status (the supervisor's graded `Stopped`
+                // for a kill) must still land, so the deliberate kill gets its
+                // `Flash::Stopped` pulse (CF-14) and the fleet bands the row terminal
+                // instead of leaving a stale live status until `AgentReaped`. Resurrection
+                // stays guarded by the `is_live()` check below and the durable
+                // `set_status` terminal guard.
+                if self.reaped.contains(&issue) && status.is_live() {
                     return false;
                 }
                 if status.is_live() && self.is_terminal(&issue) {
                     return false;
                 }
-                if matches!(status, AgentStatus::Done | AgentStatus::Failed) {
+                // A clean finish flashes green (Finished); a crash flashes RED
+                // (Failed) so a failed run never reads as a success (H5).
+                let outcome_flash = match status {
+                    AgentStatus::Done => Some(Flash::Finished),
+                    AgentStatus::Failed => Some(Flash::Failed),
+                    AgentStatus::Stopped => Some(Flash::Stopped),
+                    _ => None,
+                };
+                if let Some(kind) = outcome_flash {
                     self.flash
-                        .insert(issue.clone(), (Flash::Finished, self.frame + FLASH_FRAMES));
+                        .insert(issue.clone(), (kind, self.frame + FLASH_FRAMES));
                 }
-                self.fleet.insert(issue, status);
+                // CF-14: tally a genuine clean finish (Done over a non-terminal status,
+                // not a re-emit of an already-terminal one) for the "shipped" chip.
+                if status == AgentStatus::Done && !self.is_terminal(&issue) {
+                    self.shipped_today += 1;
+                }
+                let teardown_ask = status.is_terminal() && self.ask_agents.remove(&issue);
+                self.fleet.insert(issue.clone(), status);
+                if teardown_ask && let Some(workspace) = self.workspace.clone() {
+                    workspace.teardown_ask(self.active_project.clone(), issue.clone());
+                }
                 // Clear the sticky alert only when *no* agent needs you anymore —
                 // resolving one of several needy agents must not silence the rest
                 // (the old per-event clear dropped the global flag on the first to
@@ -2553,15 +3708,23 @@ impl App {
                 working,
                 ..
             } => {
+                self.restore_ask_issue_if_needed(&issue);
                 if self.is_terminal(&issue) || self.reaped.contains(&issue) {
                     return false;
                 }
-                let was_needs_you = self.fleet.get(&issue) == Some(&AgentStatus::NeedsYou);
-                // A working signal (a tool ran, the user answered) promotes even a
-                // needs-you agent back to Running — this is what resolves a prompt
-                // once you answer and it resumes. Ambient chatter (the idle nudge)
-                // leaves a needs-you agent alone so it can't silence a real prompt.
-                if working || !was_needs_you {
+                let prev = self.fleet.get(&issue).copied();
+                let was_needs_you = prev == Some(AgentStatus::NeedsYou);
+                // A *working* action promotes a live, non-idle agent to Running (a
+                // tool ran, or a prompt was answered → it's churning), including a
+                // NeedsYou agent — that's what resolves a prompt once you answer and
+                // it resumes. It must NOT revive an *Idle* agent: only a genuine new
+                // turn does (UserPromptSubmit, routed as a status change), so a late
+                // or out-of-order mid-turn PostToolUse can't flip a settled agent back
+                // to WORKING (A4). A non-working action (the ~60 s idle nudge) never
+                // promotes, so it can neither silence a NeedsYou prompt nor un-idle a
+                // resting agent.
+                let promotable = prev.is_some_and(|s| s.is_live() && !s.is_idle());
+                if working && promotable {
                     self.fleet.insert(issue.clone(), AgentStatus::Running);
                 }
                 // The needy agent itself just resumed: drop the sticky footer alert
@@ -2571,19 +3734,28 @@ impl App {
                     self.clear_needs_you_alert_if_resolved();
                 }
                 // Don't let routine chatter bury a standing alert — but the agent
-                // that just resumed may speak (its alert is the one we cleared).
-                if resumed || !self.needs_you_alert {
+                // that just resumed may speak (its alert is the one we cleared). And
+                // never overwrite an armed confirmation's prompt (H4).
+                if (resumed || !self.needs_you_alert) && !self.confirm_pending() {
                     self.status_msg = Some(format!("{issue}: {action}"));
                 }
                 true
             }
             AppEvent::AgentReaped { issue, .. } => {
+                let teardown_ask = self.ask_agents.remove(&issue);
                 self.reaped.insert(issue.clone());
                 self.fleet.remove(&issue);
+                // FEAT-B step 9: drop the quiet-running overlay stamp with the fleet
+                // entry so a reaped issue can never resurface as "recently active"
+                // (tick_frame also ages it out, but the reap clears it immediately).
+                self.last_output.remove(&issue);
                 self.drop_preview_sizes_for(&issue);
                 // Keep the backend only while a window still shows it.
                 if !self.windows.references_agent(&issue) {
                     self.backends.remove(&issue);
+                }
+                if teardown_ask && let Some(workspace) = self.workspace.clone() {
+                    workspace.teardown_ask(self.active_project.clone(), issue.clone());
                 }
                 // A needy agent that's now gone leaves nothing to act on — drop the
                 // sticky alert (unless another agent still needs you). Without this
@@ -2591,26 +3763,42 @@ impl App {
                 self.clear_needs_you_alert_if_resolved();
                 true
             }
-            // v1.6 auto-push: an agent committed and its branch was pushed (or the
-            // push is pending). A passive footer only — a commit is never "needs
-            // you", and it never buries a standing alert. The repo handle scopes
-            // the line for a multi-repo issue (where several repos can push).
+            // v1.6 auto-push: an agent committed and its branch was pushed — or the
+            // push was REJECTED. This is the ACTIVE project's path (a backgrounded one
+            // is handled by the scope-guard arm above); `note_push_outcome` maintains
+            // the standing cross-project `unpushed` chip, and here we additionally
+            // paint THIS project's transient footer from the `outcome`,
+            // so a rejected push reads as a failure, never a blanket "pushed". A commit
+            // is never "needs you" and must never bury a standing alert or a pending
+            // confirmation's prompt, so the footer defers to them (the chip, set above,
+            // is the durable surface). The repo handle scopes the line for a multi-repo
+            // issue (where several repos can push independently).
             AppEvent::AgentCommitted {
+                project_id,
                 issue,
                 repo_handle,
                 branch,
-                ..
+                outcome,
             } => {
-                if !self.needs_you_alert {
+                self.note_push_outcome(&project_id, &issue, &repo_handle, &outcome);
+                if !self.needs_you_alert && !self.confirm_pending() {
                     let where_ = if repo_handle.is_empty() {
                         issue
                     } else {
                         format!("{issue}/{repo_handle}")
                     };
-                    self.status_msg = Some(if branch.is_empty() {
-                        format!("{where_}: pushed")
-                    } else {
-                        format!("{where_}: pushed {branch}")
+                    self.status_msg = Some(match &outcome {
+                        PushOutcome::Pushed if branch.is_empty() => format!("{where_}: pushed"),
+                        PushOutcome::Pushed => format!("{where_}: pushed {branch}"),
+                        PushOutcome::LocalOnly if branch.is_empty() => {
+                            format!("{where_}: committed (local-only)")
+                        }
+                        PushOutcome::LocalOnly => {
+                            format!("{where_}: committed {branch} (local-only)")
+                        }
+                        PushOutcome::Rejected(reason) => {
+                            format!("{where_}: auto-push failed — {reason}")
+                        }
                     });
                 }
                 true
@@ -2630,13 +3818,12 @@ impl App {
                 // Likewise don't clobber an already-pending repo_confirm. The agent's
                 // `request-repo` returns immediately, so a dropped request can be
                 // re-issued — surface a passive footer and bail.
-                if self.kill_confirm.is_some()
-                    || self.discard_confirm.is_some()
-                    || self.repo_confirm.is_some()
-                {
-                    self.set_footer(format!(
-                        "agent on {issue} requests repo `{repo_handle}` — finish the current prompt first"
-                    ));
+                if self.confirm_pending() || self.full_modal_open() {
+                    // A confirmation is armed (owns `status_msg` + its `y`), or a full
+                    // modal owns the keyboard (so a "y to pull" would never reach this
+                    // confirm and would leak to a later key). The agent's `request-repo`
+                    // returns immediately and is re-issued next turn, so drop it rather
+                    // than raise a prompt no one can answer here (H4 / M7).
                     return true;
                 }
                 self.set_footer(format!(
@@ -2652,11 +3839,103 @@ impl App {
         }
     }
 
+    /// Whether a keyboard-capturing confirmation is armed (kill / discard / repo
+    /// pull). While true its prompt owns `status_msg` and its `y`, so a background
+    /// footer writer must not overwrite the visible text — that would make a
+    /// reflexive `y` act under a misleading message (H4).
+    fn confirm_pending(&self) -> bool {
+        self.kill_confirm.is_some()
+            || self.discard_confirm.is_some()
+            || self.repo_confirm.is_some()
+            || self.quit_confirm
+    }
+
+    /// Whether a full-screen modal currently owns the keyboard (project switcher,
+    /// global all-agents, repo multi-select, or disk-reclaim). These resolve in
+    /// `on_key` ahead of the prefix and `repo_confirm`, so a confirmation raised while
+    /// one is open would never see its `y` — it would leak to a later keystroke (M7).
+    fn full_modal_open(&self) -> bool {
+        self.project_switcher.is_some()
+            || self.global_view.is_some()
+            || self.repo_select.is_some()
+            || self.reclaim.is_some()
+    }
+
     /// Set the transient footer line, superseding (and acknowledging) any
-    /// standing needs-you alert — used by deliberate, low-frequency events.
+    /// standing needs-you alert — used by deliberate, low-frequency events. A no-op
+    /// while a confirmation is armed, so routine chatter can't shadow its prompt (H4).
+    /// Fold one auto-push [`PushOutcome`] into the cross-project `unpushed` chip,
+    /// keyed by `project_id` then `issue` (or `issue/<repo>` for a multi-repo issue).
+    /// A reject raises the key (commits stranded); a clean push or a local-only commit
+    /// clears it. Returns `true` only when a NEW strand was recorded — the caller
+    /// toasts a backgrounded one, since its footer never runs. A late reject for an
+    /// already-reaped issue in the *active* project is ignored, so a torn-down issue's
+    /// in-flight push can't resurrect a chip (the tombstone discipline every sibling
+    /// re-emit handler follows).
+    fn note_push_outcome(
+        &mut self,
+        project_id: &str,
+        issue: &str,
+        repo_handle: &str,
+        outcome: &PushOutcome,
+    ) -> bool {
+        let key = if repo_handle.is_empty() {
+            issue.to_string()
+        } else {
+            format!("{issue}/{repo_handle}")
+        };
+        match outcome {
+            PushOutcome::Rejected(_) => {
+                if project_id == self.active_project.as_str() && self.reaped.contains(issue) {
+                    return false;
+                }
+                self.unpushed
+                    .entry(project_id.to_string())
+                    .or_default()
+                    .insert(key)
+            }
+            PushOutcome::Pushed | PushOutcome::LocalOnly => {
+                if let Some(set) = self.unpushed.get_mut(project_id) {
+                    set.remove(&key);
+                    if set.is_empty() {
+                        self.unpushed.remove(project_id);
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Drop any standing "unpushed" chip entries for `(project_id, issue)` — both the
+    /// bare `issue` key (single-repo) and every `issue/<repo>` key (multi-repo) — when
+    /// its workspace is discarded, so a removed issue can't keep a stranded-commit chip
+    /// alive. The trailing-`/` guard keeps `ZAP-9` from also clearing `ZAP-90`.
+    fn forget_unpushed(&mut self, project_id: &str, issue: &str) {
+        if let Some(set) = self.unpushed.get_mut(project_id) {
+            set.retain(|k| {
+                k != issue && !k.strip_prefix(issue).is_some_and(|rest| rest.starts_with('/'))
+            });
+            if set.is_empty() {
+                self.unpushed.remove(project_id);
+            }
+        }
+    }
+
+    /// Total stranded commit-sets across all projects — behind the header's
+    /// "⇡N unpushed" chip. Mirrors [`Self::elsewhere_needs_you`].
+    pub fn unpushed_count(&self) -> usize {
+        self.unpushed.values().map(HashSet::len).sum()
+    }
+
     fn set_footer(&mut self, text: String) {
+        if self.confirm_pending() {
+            return;
+        }
         self.status_msg = Some(text);
-        self.needs_you_alert = false;
+        // A deliberate footer no longer blanket-drops the sticky needs-you guard — it
+        // re-derives it (CF-11), so a nav action's trace (e.g. a filter cycle) can't
+        // bury an un-answered "needs you" alert while an agent still needs you.
+        self.clear_needs_you_alert_if_resolved();
     }
 
     /// Drop the sticky needs-you footer alert iff no agent in the on-screen fleet
@@ -2837,12 +4116,26 @@ impl App {
                 if blocked(self, project_id, issue) {
                     return;
                 }
-                self.world
-                    .entry(project_id.clone())
-                    .or_default()
-                    .insert(issue.clone(), AgentStatus::Running);
+                // Mirror apply_event's A4 promotion rule: a working action promotes only
+                // a pre-existing live, non-idle entry — it must NOT create one (an action
+                // before AgentSpawned) nor un-idle a settled agent. Only a genuine new
+                // turn (UserPromptSubmit, routed as AgentStatusChanged{Running}) revives
+                // Idle. Without this, `world` would diverge from `fleet` and inflate the
+                // cross-project roll-up with a phantom live agent once you switch away.
+                if let Some(s) = self
+                    .world
+                    .get_mut(project_id)
+                    .and_then(|m| m.get_mut(issue))
+                    && s.is_live()
+                    && !s.is_idle()
+                {
+                    *s = AgentStatus::Running;
+                }
             }
-            AppEvent::AgentReaped { project_id, issue } => {
+            AppEvent::AgentReaped { project_id, issue }
+            | AppEvent::AgentExited {
+                project_id, issue, ..
+            } => {
                 if let Some(m) = self.world.get_mut(project_id) {
                     m.remove(issue);
                     if m.is_empty() {
@@ -2880,6 +4173,29 @@ impl App {
             }
         }
         (live, needs)
+    }
+
+    /// FEAT-B quiet-running overlay: an *Idle* agent counts as "recently active"
+    /// while its child kept streaming PTY output within the settle window. Gated to
+    /// Idle on purpose — Running/NeedsYou already render live, and a terminal/absent
+    /// agent must never read as active, so a late `AgentOutput` (the stamp at
+    /// [`Self::record_ledger`]'s sibling arm fires for any issue) can't resurrect a
+    /// dead row's band. The window is measured in animation frames, so the
+    /// [`Self::is_animating`] clause that keeps the clock alive lets it expire.
+    pub fn recently_active(&self, issue: &str) -> bool {
+        self.fleet.get(issue) == Some(&AgentStatus::Idle)
+            && self
+                .last_output
+                .get(issue)
+                .is_some_and(|&frame| self.frame.wrapping_sub(frame) < OUTPUT_SETTLE_FRAMES)
+    }
+
+    pub fn display_agent_status(&self, issue: &str, status: AgentStatus) -> AgentStatus {
+        if status == AgentStatus::Idle && self.recently_active(issue) {
+            AgentStatus::Running
+        } else {
+            status
+        }
     }
 
     /// Per-project `(live, needs-you)` counts for the switcher rows (ENG-406): active
@@ -2922,7 +4238,16 @@ impl App {
                     .map(|(issue, status)| (pid.clone(), issue.clone(), *status)),
             );
         }
-        rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| natural_key_cmp(&a.1, &b.1)));
+        // Sort by the *displayed* project name (not the invisible UUID), so clusters
+        // appear in a legible, stable order rather than arbitrary id order.
+        rows.sort_by(|a, b| {
+            self.project_name(&a.0)
+                .cmp(&self.project_name(&b.0))
+                // Two projects can share a display name — keep their clusters distinct and
+                // stable by project id rather than interleaving them by issue key.
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| natural_key_cmp(&a.1, &b.1))
+        });
         rows
     }
 
@@ -2935,11 +4260,17 @@ impl App {
     }
 
     /// Whether anything on screen is animating — a live agent's spinner/pulse, an
-    /// unexpired node flash, or an in-flight auto-resume. The render loop arms its
-    /// animation tick only when this holds.
+    /// unexpired node flash, an in-flight auto-resume, or a launch still coming up.
+    /// The render loop arms its animation tick only when this holds; a pending launch
+    /// must keep it ticking so a wedged one reaches its grace deadline (M9).
     pub fn is_animating(&self) -> bool {
         !self.resuming.is_empty()
+            || !self.pending_launch.is_empty()
             || self.flash.values().any(|&(_, until)| self.frame < until)
+            || self
+                .fleet
+                .iter()
+                .any(|(issue, status)| *status == AgentStatus::Idle && self.recently_active(issue))
             || self.fleet.values().any(AgentStatus::is_animating)
     }
 
@@ -2956,7 +4287,8 @@ impl App {
     /// wedged-resume bug where the guard was never released.
     #[cfg(test)]
     pub fn mark_resuming_for_test(&mut self, issue: &str) {
-        self.pending_launch.insert(issue.to_string());
+        self.pending_launch
+            .insert(issue.to_string(), self.frame + RESUME_GRACE_FRAMES);
         self.resuming
             .insert(issue.to_string(), self.frame + RESUME_GRACE_FRAMES);
     }
@@ -2968,6 +4300,8 @@ impl App {
         self.frame = self.frame.wrapping_add(1);
         let now = self.frame;
         self.flash.retain(|_, &mut (_, until)| now < until);
+        self.last_output
+            .retain(|_, frame| now.wrapping_sub(*frame) < OUTPUT_SETTLE_FRAMES);
         // Drop each wedged resume on its own grace bound, so a stuck spawn can't
         // pin the loop awake — independently of how many other resumes arrive.
         // Also release the matching `pending_launch` guard `resume_one` armed: a
@@ -2976,17 +4310,45 @@ impl App {
         // behind a guard that `maybe_resume_focused`/`resume_one` early-return on
         // forever — it could never be revived once a slot frees. A normal spawn
         // still clears both via AgentSpawned; this only fires for entries that
-        // outlived their grace. (A button launch arms no `resuming` entry, so its
-        // own `pending_launch` is untouched.)
+        // outlived their grace.
         let expired: Vec<String> = self
             .resuming
             .iter()
             .filter(|&(_, &deadline)| now >= deadline)
             .map(|(issue, _)| issue.clone())
             .collect();
+        // A wedged *button* launch arms no `resuming` entry, so it self-heals on its
+        // own `pending_launch` deadline: drop the stuck "starting…" card and invite a
+        // retry instead of stranding it forever (M9). Computed before the resuming
+        // retain so a resume-wedge (handled silently just below) isn't double-reported.
+        let timed_out: Vec<String> = self
+            .pending_launch
+            .iter()
+            .filter(|&(issue, &deadline)| now >= deadline && !self.resuming.contains_key(issue))
+            .map(|(issue, _)| issue.clone())
+            .collect();
         self.resuming.retain(|_, &mut deadline| now < deadline);
         for issue in expired {
             self.pending_launch.remove(&issue);
+        }
+        for issue in timed_out {
+            self.pending_launch.remove(&issue);
+            if self.pending_attach.as_deref() == Some(issue.as_str()) {
+                self.pending_attach = None;
+            }
+            // Drop the stranded "◌ starting agent…" card so it stops claiming a launch
+            // that never arrived; a fresh preview re-aims at the selection (M9).
+            self.undock_issue(&issue);
+            // This fires autonomously from the animation timer, so use the same guard as
+            // the other background writers (M11/H4): never clobber a standing needs-you
+            // alert or an armed confirmation's prompt. Word the retry as the gesture that
+            // works once the card is closed (select the row + ⏎), not "Enter here" — the
+            // focused empty card would have swallowed Enter to a non-existent PTY.
+            if !self.needs_you_alert && !self.confirm_pending() {
+                self.status_msg = Some(format!(
+                    "launch on {issue} timed out — select it & ⏎ to retry"
+                ));
+            }
         }
     }
 
@@ -3037,7 +4399,10 @@ impl App {
         // If this needy issue is already a pinned coin, go straight to it (chat
         // face) so you can respond; otherwise the preview follows the selection.
         // Runs after `set_jump_status` (which aims the spine) so this focus wins.
-        self.focus_pinned_chat(&key);
+        if !self.focus_pinned_chat(&key) {
+            self.windows.focus_preview();
+            self.after_focus_change();
+        }
     }
 
     /// Cross-project leg of the needs-you jump (ENG-406): when no agent in the active
@@ -3149,18 +4514,32 @@ impl App {
         ));
     }
 
-    /// A status suffix flagging that a jump landed on an issue the active
-    /// filter/search hides — so the empty list highlight reads as deliberate.
-    fn hidden_note(&self) -> &'static str {
+    /// A status suffix flagging that a jump landed on a selection with no Spine row
+    /// — so the empty list highlight reads as deliberate, not a glitch.
+    fn hidden_note(&self) -> String {
+        // An agent can sit on an issue that has left this project's graph (archived /
+        // moved, its session surviving reconcile): it's reachable via `n` and counted,
+        // yet has no Spine row. Point at the global screen that *does* list it (M14).
+        if !self.root.is_empty() && self.graph.get(&self.root).is_none() {
+            let global = self.keymap.verb_label(Action::GlobalView);
+            return format!(" · agent on an issue not in this project ({global} for ALL AGENTS)");
+        }
         if self.root_is_hidden() {
-            " · hidden by filter (clear it to list)"
+            " · hidden by filter (clear it to list)".to_string()
         } else {
-            ""
+            String::new()
         }
     }
 
-    fn on_search_key(&mut self, code: KeyCode) {
-        match code {
+    fn on_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl-C cancels like Esc: drop the in-progress query rather than
+                // committing it as a sticky filter.
+                self.search_active = false;
+                self.search_query.clear();
+                self.rebuild_order();
+            }
             KeyCode::Esc => {
                 self.search_active = false;
                 self.search_query.clear();
@@ -3171,7 +4550,12 @@ impl App {
                 self.search_query.pop();
                 self.rebuild_order();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && self.search_query.len() < 64 =>
+            {
                 self.search_query.push(c);
                 self.rebuild_order();
             }
@@ -3256,6 +4640,7 @@ mod tests {
     use super::*;
     use crate::backend::fake::FakeBackend;
     use crate::demo;
+    use crate::model::Issue;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn app() -> App {
@@ -3327,8 +4712,93 @@ mod tests {
         a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(a.repo_select.is_none(), "confirming closes the modal");
         assert!(
-            a.pending_launch.contains(&key),
+            a.pending_launch.contains_key(&key),
             "the agent launch is now in flight"
+        );
+    }
+
+    #[test]
+    fn ask_agent_mints_a_synthetic_row_and_launches() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.filter = Filter::HasDeps;
+        a.search_active = true;
+        a.search_query = "nothing".into();
+        a.rebuild_order();
+
+        verb(&mut a, KeyCode::Char('?'));
+
+        let key = a
+            .pending_launch
+            .keys()
+            .next()
+            .expect("ask launch is in flight")
+            .clone();
+        assert!(crate::worktree::is_synthetic_ask_id(&key));
+        assert!(a.graph.get(&key).is_some(), "ask agent has a graph row");
+        assert!(a.ask_agents.contains(&key), "ask id is tracked");
+        assert_eq!(a.root, key, "the synthetic row becomes the selection");
+        assert_eq!(a.filter, Filter::All, "ask launch reveals the row");
+        assert!(a.search_query.is_empty(), "ask launch clears hiding search");
+    }
+
+    #[test]
+    fn ask_agent_uses_the_repo_select_for_multi_repo_projects() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.project_candidates
+            .insert("proj".into(), vec![repo("api", true), repo("web", false)]);
+
+        verb(&mut a, KeyCode::Char('?'));
+
+        let select = a
+            .repo_select
+            .as_ref()
+            .expect("ask launch opens repo select");
+        assert!(select.adhoc, "repo select remembers this is an ask launch");
+        let key = select.issue.clone();
+        assert!(crate::worktree::is_synthetic_ask_id(&key));
+        assert!(
+            a.pending_launch.is_empty(),
+            "ask launch waits for repo confirmation"
+        );
+
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.repo_select.is_none(), "confirming closes the modal");
+        assert!(
+            a.pending_launch.contains_key(&key),
+            "confirmed ask launch is now in flight"
+        );
+    }
+
+    #[test]
+    fn a_bare_notification_keeps_launch_guards_and_a_rejection_is_scoped() {
+        // M10: a bare Notification (cross-issue chatter) must not clear in-flight
+        // launch guards; only a typed LaunchRejected for a specific issue drops that
+        // one issue's guard, leaving siblings' double-press protection intact.
+        let mut a = app();
+        a.pending_launch.insert("ENG-1".into(), 999);
+        a.pending_launch.insert("ENG-2".into(), 999);
+
+        a.apply_event(AppEvent::Notification("ENG-9: scratch skipped".into()));
+        assert!(
+            a.pending_launch.contains_key("ENG-1") && a.pending_launch.contains_key("ENG-2"),
+            "a cross-issue toast keeps every launch guard"
+        );
+
+        a.apply_event(AppEvent::LaunchRejected {
+            issue: "ENG-1".into(),
+            reason: "ENG-1 already has a running agent".into(),
+        });
+        assert!(
+            !a.pending_launch.contains_key("ENG-1"),
+            "the rejection drops only its own issue's guard"
+        );
+        assert!(
+            a.pending_launch.contains_key("ENG-2"),
+            "an unrelated issue's guard is untouched"
         );
     }
 
@@ -3347,7 +4817,76 @@ mod tests {
             a.repo_select.is_none(),
             "a single candidate launches straight away — no modal"
         );
-        assert!(a.pending_launch.contains(&key));
+        assert!(a.pending_launch.contains_key(&key));
+    }
+
+    #[test]
+    fn choose_repos_opens_the_select_even_for_a_single_candidate_project() {
+        // CF-20: `Ctrl-a c` forces the modal open where plain Enter would fast-launch —
+        // the on-demand entry to give one agent more than one repo.
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.aim_spine("ZAP-188".into()); // a Ready issue (the ENG-559 gate)
+        a.project_candidates
+            .insert("proj".into(), vec![repo("only", true)]);
+
+        verb(&mut a, KeyCode::Char('c'));
+        assert!(
+            a.repo_select.is_some(),
+            "choose-repos opens the select on a single candidate"
+        );
+        assert!(a.pending_launch.is_empty(), "nothing launched yet");
+    }
+
+    #[test]
+    fn adding_a_repo_in_the_picker_persists_it_as_a_candidate_and_launches_with_both() {
+        // CF-20 end-to-end: open the select via `Ctrl-a c` on a single-candidate
+        // project, press `a` to add a registered repo the project didn't list, confirm
+        // it in, then launch — the new repo rides this launch AND becomes a durable
+        // candidate (here: the in-session `project_candidates`; the registry.toml write
+        // is exercised by registry::add_candidate's own tests since this App has no layout).
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.aim_spine("ZAP-188".into());
+        let key = a.root.clone();
+        a.project_candidates
+            .insert("proj".into(), vec![repo("api", true)]);
+        a.registered_repos = vec![repo("api", false), repo("web", false)];
+
+        verb(&mut a, KeyCode::Char('c'));
+        assert!(a.repo_select.is_some());
+
+        press(&mut a, KeyCode::Char('a')); // open the "add another repo" sub-list
+        assert!(
+            a.repo_select.as_ref().unwrap().picker.is_adding(),
+            "`a` opens the add-list"
+        );
+        press(&mut a, KeyCode::Enter); // add the only addable repo (web)
+        assert!(
+            !a.repo_select.as_ref().unwrap().picker.is_adding(),
+            "adding closes the sub-list"
+        );
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.selected_handles(),
+            vec!["api", "web"],
+            "both repos are now checked"
+        );
+
+        press(&mut a, KeyCode::Enter); // confirm the launch
+        assert!(a.repo_select.is_none(), "confirming closes the modal");
+        assert!(a.pending_launch.contains_key(&key), "the launch is in flight");
+
+        let cands: Vec<&str> = a.project_candidates["proj"]
+            .iter()
+            .map(|c| c.handle.as_str())
+            .collect();
+        assert_eq!(
+            cands,
+            vec!["api", "web"],
+            "the added repo is now a durable candidate (no restart)"
+        );
     }
 
     #[test]
@@ -3452,7 +4991,11 @@ mod tests {
     // ── Discard workspace (ENG-541, Ctrl-a d) ────────────────────────────────
 
     #[test]
-    fn discard_confirms_and_drops_a_finished_issue() {
+    fn discard_confirms_then_drops_the_issue_on_the_terminal_signal() {
+        // CF-12: confirming no longer drops the UI synchronously — it waits for teardown
+        // to report. `WorkspaceDiscarded` (worktrees actually removed) drops the fleet;
+        // a `DiscardKeptWorktree` would instead flag it and keep it, so local work is
+        // never silently stranded.
         let mut a = app();
         a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
         a.active_project = "proj".into();
@@ -3463,8 +5006,45 @@ mod tests {
         a.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert!(a.discard_confirm.is_none(), "the confirm resolves");
         assert!(
+            a.fleet.contains_key(&key),
+            "the fleet entry is NOT dropped until teardown confirms the removal"
+        );
+        a.apply_event(AppEvent::WorkspaceDiscarded {
+            project_id: "proj".into(),
+            issue: key.clone(),
+        });
+        assert!(
             !a.fleet.contains_key(&key),
-            "the discarded issue's fleet entry is dropped"
+            "WorkspaceDiscarded drops the discarded issue's fleet entry"
+        );
+    }
+
+    #[test]
+    fn confirming_a_kill_tombstones_so_a_late_hook_is_dropped() {
+        // CF-4: a hook in flight before the cancel must be dropped by the resurrection
+        // guards, not re-raise "needs you" / re-promote the dying agent.
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        register(&mut a, "ZAP-204");
+        a.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        a.aim_spine("ZAP-204".into());
+        a.windows.focus = 0;
+        verb(&mut a, KeyCode::Char('x')); // arm kill
+        a.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)); // confirm
+        assert!(
+            a.reaped.contains("ZAP-204"),
+            "the killed issue is tombstoned"
+        );
+        a.needs_you_alert = false;
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ZAP-204".into(),
+            reason: "permission".into(),
+        });
+        assert!(
+            !a.needs_you_alert,
+            "a late needs-you hook for a killed agent is dropped"
         );
     }
 
@@ -3537,6 +5117,164 @@ mod tests {
             a.kill_confirm.is_some(),
             "the kill confirmation is untouched"
         );
+    }
+
+    #[test]
+    fn background_chatter_never_overwrites_an_armed_confirmation_prompt() {
+        // H4: a kill is armed — its red prompt and `y` are live against the visible
+        // text. Routine background events (a tool ran, a push, a materialise tick, a
+        // deliberate footer) must not overwrite that prompt, or a reflexive `y` would
+        // confirm a kill under a misleading message.
+        let mut a = app();
+        a.active_project = "proj".into();
+        let prompt = "kill agent on ENG-1? y to confirm, any key to cancel".to_string();
+        a.kill_confirm = Some("ENG-1".into());
+        a.status_msg = Some(prompt.clone());
+
+        // An unrelated agent's working AgentAction.
+        a.fleet.insert("ENG-2".into(), AgentStatus::Running);
+        a.apply_event(AppEvent::AgentAction {
+            project_id: "proj".into(),
+            issue: "ENG-2".into(),
+            action: "ran Bash".into(),
+            working: true,
+        });
+        assert_eq!(
+            a.status_msg.as_deref(),
+            Some(prompt.as_str()),
+            "AgentAction must not shadow the armed kill prompt"
+        );
+
+        // A push and a materialise tick.
+        a.apply_event(AppEvent::MaterializeProgress {
+            project_id: "proj".into(),
+            phase: "clone".into(),
+            percent: 40,
+        });
+        // A deliberate set_footer (e.g. AgentExited / Notification) is suppressed too.
+        a.set_footer("ENG-3 exited".into());
+        assert_eq!(
+            a.status_msg.as_deref(),
+            Some(prompt.as_str()),
+            "neither a progress tick nor set_footer may shadow the kill prompt"
+        );
+        assert!(a.kill_confirm.is_some(), "the kill stays armed throughout");
+    }
+
+    #[test]
+    fn a_full_modal_defers_a_repo_request() {
+        // M7: a repo-pull request arriving while a full modal owns the keyboard must
+        // NOT raise repo_confirm — its "y to pull" would never reach the confirm and
+        // would leak to a later key. The agent re-issues request-repo, so the deferral
+        // is safe.
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.global_view = Some(GlobalView {
+            rows: Vec::new(),
+            state: ListState::default(),
+        });
+        assert!(a.full_modal_open());
+        a.apply_event(AppEvent::RepoRequested {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            repo_handle: "web".into(),
+        });
+        assert!(
+            a.repo_confirm.is_none(),
+            "a full modal defers the repo request rather than leaking its y"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_question_opens_help_from_the_fleet() {
+        // M6: a focused Chat coin forwards `?` to its PTY, so the prefix form must be
+        // able to summon help from a pane that can't reach the direct key. The Fleet
+        // is the simplest such focus to drive in a test.
+        let mut a = app();
+        a.open_fleet();
+        assert!(matches!(a.windows.focused_kind(), WindowKind::Fleet));
+        a.prefix_armed = true;
+        a.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(a.show_help, "Ctrl-a ? opens help from the Fleet");
+    }
+
+    #[test]
+    fn ctrl_a_question_also_closes_help_from_the_fleet() {
+        // M6 follow-up: the prefix help gesture must TOGGLE — pressing it again from the
+        // same pane closes help, not re-open it (the top-of-on_prefix_key overlay clear
+        // would otherwise make it open-only).
+        let mut a = app();
+        a.open_fleet();
+        a.show_help = true; // already open
+        a.prefix_armed = true;
+        a.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(!a.show_help, "Ctrl-a ? again closes help from the Fleet");
+    }
+
+    #[test]
+    fn a_single_row_spine_does_not_emit_a_spurious_wrapped_footer() {
+        // A 1-row Spine can't move, so j/k must stay silent — rem_euclid keeps
+        // next == cur == 0 == len-1, which used to trip the top↔bottom wrap message.
+        let mut a = app();
+        a.order = vec!["ZAP-201".into()];
+        a.root = "ZAP-201".into();
+        a.list_state.select(Some(0));
+        a.status_msg = None;
+        a.dispatch_spine(Action::MoveDown);
+        assert!(
+            a.status_msg.is_none(),
+            "j on a 1-row spine is silent, got {:?}",
+            a.status_msg
+        );
+        a.dispatch_spine(Action::MoveUp);
+        assert!(
+            a.status_msg.is_none(),
+            "k on a 1-row spine is silent, got {:?}",
+            a.status_msg
+        );
+    }
+
+    #[test]
+    fn a_background_needs_you_does_not_overwrite_an_armed_kill_prompt() {
+        // H4 (extended): with a kill armed, an UNRELATED agent firing needs-you must not
+        // overwrite the red "confirm kill" prompt — a reflexive `y` would then kill the
+        // armed issue under a message naming a different one. The needs-you is still
+        // recorded (fleet + sticky flag), it just doesn't seize the prompt slot.
+        let mut a = app();
+        a.active_project = "proj".into();
+        let prompt = "kill agent on ZAP-1? y to confirm, any key to cancel".to_string();
+        a.kill_confirm = Some("ZAP-1".into());
+        a.status_msg = Some(prompt.clone());
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ZAP-9".into(),
+            reason: "permission?".into(),
+        });
+        assert_eq!(
+            a.status_msg.as_deref(),
+            Some(prompt.as_str()),
+            "the armed kill prompt must survive a background needs-you"
+        );
+        assert_eq!(
+            a.fleet.get("ZAP-9"),
+            Some(&AgentStatus::NeedsYou),
+            "the needs-you is still recorded"
+        );
+        assert!(a.kill_confirm.is_some(), "the kill stays armed");
+    }
+
+    #[test]
+    fn focus_left_onto_the_spine_clears_zoom() {
+        // M1: FocusLeft/Right landing on the Spine (index 0) must clear zoom, mirroring
+        // FocusNav — else direct keys route to an off-screen Spine (blind dispatch).
+        let mut a = app();
+        a.open_fleet(); // a non-spine window, now focused
+        assert!(a.windows.focus != 0, "the fleet is focused, not the spine");
+        a.windows.zoomed = true;
+        while a.windows.focus != 0 {
+            a.dispatch_verb(Action::FocusLeft);
+        }
+        assert!(!a.windows.zoomed, "landing focus on the Spine cleared zoom");
     }
 
     #[test]
@@ -3733,6 +5471,369 @@ mod tests {
     }
 
     #[test]
+    fn a_discard_right_after_switch_back_is_refused_for_a_live_agent() {
+        // H2: the switch-back window must not let `Ctrl-a d` discard a live agent's
+        // worktree. The fleet is seeded from the restored live Arc, so the discard is
+        // refused on the very next keystroke instead of acting on an empty fleet.
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        let fake = FakeBackend::new("ZAP-9") as Arc<dyn AgentBackend>;
+        a.stashed_backends
+            .entry("proj-b".into())
+            .or_default()
+            .insert("ZAP-9".into(), fake);
+        a.activate_project(project("proj-b", "Beta"), demo::graph());
+        assert!(
+            a.backends.contains_key("ZAP-9"),
+            "the live backend is restored"
+        );
+        a.root = "ZAP-9".into();
+        a.arm_discard();
+        assert!(
+            a.discard_confirm.is_none(),
+            "discard is refused for a live agent right after switch-back"
+        );
+        assert!(
+            a.status_msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("still running"),
+            "and it says why: {:?}",
+            a.status_msg
+        );
+    }
+
+    #[test]
+    fn a_kill_right_after_switch_back_arms_instead_of_mis_answering_not_running() {
+        // The same empty-fleet window made `Ctrl-a x` wrongly report "not running" for
+        // a live agent — now the seeded fleet (and the backend ground truth) arm it.
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        let fake = FakeBackend::new("ZAP-9") as Arc<dyn AgentBackend>;
+        a.stashed_backends
+            .entry("proj-b".into())
+            .or_default()
+            .insert("ZAP-9".into(), fake);
+        a.activate_project(project("proj-b", "Beta"), demo::graph());
+        a.root = "ZAP-9".into();
+        a.arm_kill();
+        assert_eq!(
+            a.kill_confirm.as_deref(),
+            Some("ZAP-9"),
+            "kill arms on the live agent"
+        );
+        assert!(
+            !a.status_msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("not running"),
+            "it must not mis-answer 'not running': {:?}",
+            a.status_msg
+        );
+    }
+
+    #[test]
+    fn switching_projects_repoints_the_ledger_to_the_target_file() {
+        // H3: the ledger must follow the active project, not stay pinned to the boot
+        // project's file (which would silently collect every project's run history).
+        let mut a = app();
+        let layout = crate::registry::Layout::new("/tmp/lindep-ledger-repoint-test");
+        a.layout = Some(layout.clone());
+        a.active_project = "proj-a".into();
+        a.project_handles.insert("proj-a".into(), "handle-a".into());
+        a.project_handles.insert("proj-b".into(), "handle-b".into());
+        a.ledger_path = Some(layout.ledger_path("handle-a"));
+        a.activate_project(project("proj-b", "Beta"), demo::graph());
+        assert_eq!(
+            a.ledger_path,
+            Some(layout.ledger_path("handle-b")),
+            "the ledger re-points to the target project's own file"
+        );
+    }
+
+    #[test]
+    fn switching_into_a_newer_format_ledger_never_clobbers_it() {
+        // NEW-24: the version guard is protected at BOOT but was unprotected on SWITCH —
+        // switching into a project whose ledger.json is a future format, then running an
+        // agent, would overwrite it with an empty downgraded v1 file. The fix drops the
+        // project's handle when its ledger fails the version load, so the per-project
+        // `save_ledgers` (handle-gated) skips it forever after. This guards that no
+        // subsequent lifecycle event downgrades the newer file.
+        let dir = "/tmp/lindep-ledger-new24-clobber-test";
+        let _ = std::fs::remove_dir_all(dir);
+        let layout = crate::registry::Layout::new(dir);
+        let newer = layout.ledger_path("handle-b");
+        std::fs::create_dir_all(newer.parent().unwrap()).unwrap();
+        let original = br#"{"version":999,"issues":[]}"#;
+        std::fs::write(&newer, original).unwrap();
+
+        let mut a = app();
+        a.layout = Some(layout.clone());
+        a.active_project = "proj-a".into();
+        a.project_handles.insert("proj-a".into(), "handle-a".into());
+        a.project_handles.insert("proj-b".into(), "handle-b".into());
+        a.ledger_path = Some(layout.ledger_path("handle-a"));
+        a.ledger_dirty = false; // a clean switch — no outgoing slice to flush first
+
+        a.activate_project(project("proj-b", "Beta"), demo::graph());
+        assert!(
+            !a.project_handles.contains_key("proj-b"),
+            "the newer-format project is de-handled so save_ledgers can't write it"
+        );
+
+        // The next agent run records a proj-b episode and flips the dirty flag…
+        a.ledger.begin("proj-b", "ENG-1", "sid".into(), 100);
+        a.ledger_dirty = true;
+        a.save_ledgers();
+
+        // …but proj-b's file is untouched: still the future format, not a downgraded v1.
+        assert!(
+            matches!(
+                crate::ledger::Ledger::load(&newer),
+                Err(crate::session::StateError::Version { found: 999, .. })
+            ),
+            "the newer-format ledger.json is preserved, not clobbered to v1"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_kept_worktree_discard_flags_it_and_does_not_drop_the_issue() {
+        // D-HIGH: a rejected-push discard keeps the worktree — the cockpit must flag it,
+        // not silently drop the fleet entry (which would strand the unpushed work).
+        let mut a = app();
+        a.fleet.insert("ZAP-9".into(), AgentStatus::Done);
+        a.apply_event(AppEvent::DiscardKeptWorktree {
+            project_id: String::new(),
+            issue: "ZAP-9".into(),
+            reason: "unpushed work kept".into(),
+        });
+        assert!(
+            a.kept_worktrees.contains("ZAP-9"),
+            "the kept worktree is flagged"
+        );
+        assert!(
+            a.fleet.contains_key("ZAP-9"),
+            "the issue is NOT dropped — still re-discardable after pushing"
+        );
+    }
+
+    #[test]
+    fn a_clean_discard_drops_the_fleet_entry_and_clears_the_flag() {
+        let mut a = app();
+        a.fleet.insert("ZAP-9".into(), AgentStatus::Done);
+        a.kept_worktrees.insert("ZAP-9".into()); // a prior kept worktree, now removed
+        a.apply_event(AppEvent::WorkspaceDiscarded {
+            project_id: String::new(),
+            issue: "ZAP-9".into(),
+        });
+        assert!(
+            !a.fleet.contains_key("ZAP-9"),
+            "a confirmed removal drops the fleet entry"
+        );
+        assert!(
+            !a.kept_worktrees.contains("ZAP-9"),
+            "and clears any kept-worktree flag"
+        );
+        assert!(
+            a.reaped.contains("ZAP-9"),
+            "and tombstones late hooks for the discarded issue"
+        );
+    }
+
+    /// Whether `key` (an `issue` or `issue/repo`) is flagged unpushed in ANY project.
+    fn is_unpushed(a: &App, key: &str) -> bool {
+        a.unpushed.values().any(|s| s.contains(key))
+    }
+
+    fn commit_event(project_id: &str, issue: &str, outcome: PushOutcome) -> AppEvent {
+        AppEvent::AgentCommitted {
+            project_id: project_id.into(),
+            issue: issue.into(),
+            repo_handle: "api".into(),
+            branch: "feat".into(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn a_rejected_auto_push_raises_the_unpushed_chip_and_never_reports_pushed() {
+        // HIGH data-integrity: the reject and a blanket "pushed" used to drain in one
+        // render tick with "pushed" winning, so a stranded commit read as a clean
+        // success. The outcome now rides the single event: a reject footers the
+        // failure AND raises a standing chip that no later overwrite can hide.
+        let mut a = app();
+        a.apply_event(commit_event(
+            "",
+            "ZAP-9",
+            PushOutcome::Rejected("remote rejected (non-fast-forward)".into()),
+        ));
+        assert!(
+            is_unpushed(&a, "ZAP-9/api"),
+            "a rejected push raises the standing unpushed chip"
+        );
+        let footer = a.status_msg.clone().unwrap_or_default();
+        assert!(
+            footer.contains("auto-push failed") && footer.contains("non-fast-forward"),
+            "the footer reports the failure, not a clean push: {footer:?}"
+        );
+        assert!(
+            !footer.contains("pushed feat"),
+            "a rejected push never reports as pushed: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn a_later_clean_push_clears_the_unpushed_chip_for_that_key() {
+        let mut a = app();
+        a.apply_event(commit_event("", "ZAP-9", PushOutcome::Rejected("x".into())));
+        assert!(is_unpushed(&a, "ZAP-9/api"));
+        a.apply_event(commit_event("", "ZAP-9", PushOutcome::Pushed));
+        assert!(
+            !is_unpushed(&a, "ZAP-9/api"),
+            "a clean push of the same key clears its stranded-commit chip"
+        );
+        assert_eq!(a.status_msg.as_deref(), Some("ZAP-9/api: pushed feat"));
+    }
+
+    #[test]
+    fn a_clean_push_of_one_repo_leaves_another_repos_strand_intact() {
+        // The masking must not return through over-broad clearing: a Pushed for one
+        // key must clear ONLY that key, never a sibling repo's standing strand.
+        let mut a = app();
+        a.apply_event(commit_event("", "ZAP-9", PushOutcome::Rejected("x".into())));
+        a.apply_event(AppEvent::AgentCommitted {
+            project_id: String::new(),
+            issue: "ZAP-9".into(),
+            repo_handle: "web".into(),
+            branch: "feat".into(),
+            outcome: PushOutcome::Pushed,
+        });
+        assert!(
+            is_unpushed(&a, "ZAP-9/api"),
+            "ZAP-9/api stays stranded after a clean push of ZAP-9/web"
+        );
+        assert_eq!(a.unpushed_count(), 1);
+    }
+
+    #[test]
+    fn a_local_only_commit_reads_as_committed_not_pushed_and_raises_no_chip() {
+        let mut a = app();
+        a.apply_event(commit_event("", "ZAP-9", PushOutcome::LocalOnly));
+        assert_eq!(a.unpushed_count(), 0, "local-only is a clean state, no chip");
+        assert_eq!(
+            a.status_msg.as_deref(),
+            Some("ZAP-9/api: committed feat (local-only)"),
+            "a local-only commit is reported as committed, never pushed"
+        );
+    }
+
+    #[test]
+    fn the_unpushed_chip_survives_a_needs_you_alert_even_when_the_footer_defers() {
+        // The footer must not bury a needs-you alert, but the chip is the durable
+        // surface and must be raised regardless — else the failure would be invisible
+        // while an unrelated alert is up.
+        let mut a = app();
+        a.needs_you_alert = true;
+        a.status_msg = Some("2 agents need you".into());
+        a.apply_event(commit_event(
+            "",
+            "ZAP-9",
+            PushOutcome::Rejected("auth failed".into()),
+        ));
+        assert!(
+            is_unpushed(&a, "ZAP-9/api"),
+            "the chip is raised even under a needs-you alert"
+        );
+        assert_eq!(
+            a.status_msg.as_deref(),
+            Some("2 agents need you"),
+            "the transient footer still defers to the standing alert"
+        );
+    }
+
+    #[test]
+    fn a_rejected_push_in_a_backgrounded_project_still_raises_the_chip_and_toasts() {
+        // HIGH regression guard: the scope guard drops a backgrounded project's
+        // AgentCommitted, so the chip mutation must run AHEAD of it (cross-project) —
+        // else a stranded commit in another project is invisible (the masking, moved).
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        a.apply_event(commit_event(
+            "proj-b",
+            "ZAP-9",
+            PushOutcome::Rejected("non-fast-forward".into()),
+        ));
+        assert!(
+            is_unpushed(&a, "ZAP-9/api"),
+            "a backgrounded project's strand is still flagged"
+        );
+        assert_eq!(a.unpushed_count(), 1);
+        let footer = a.status_msg.clone().unwrap_or_default();
+        assert!(
+            footer.contains("auto-push failed") && footer.contains("ZAP-9"),
+            "a backgrounded strand toasts once: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn a_late_rejected_push_does_not_resurrect_a_reaped_issues_chip() {
+        // A discarded/killed issue's in-flight push that lands late must not re-raise a
+        // chip for a torn-down issue (the tombstone discipline siblings enforce).
+        let mut a = app();
+        a.reaped.insert("ZAP-9".into());
+        a.apply_event(commit_event(
+            "",
+            "ZAP-9",
+            PushOutcome::Rejected("late".into()),
+        ));
+        assert_eq!(
+            a.unpushed_count(),
+            0,
+            "a reaped issue's late reject is ignored, no leaked chip"
+        );
+    }
+
+    #[test]
+    fn a_single_repo_commit_with_no_handle_keys_the_chip_by_bare_issue() {
+        let mut a = app();
+        a.apply_event(AppEvent::AgentCommitted {
+            project_id: String::new(),
+            issue: "ZAP-9".into(),
+            repo_handle: String::new(),
+            branch: String::new(),
+            outcome: PushOutcome::Rejected("x".into()),
+        });
+        assert!(
+            is_unpushed(&a, "ZAP-9"),
+            "an empty repo handle keys the chip by the bare issue"
+        );
+        assert_eq!(a.status_msg.as_deref(), Some("ZAP-9: auto-push failed — x"));
+    }
+
+    #[test]
+    fn discarding_an_issue_clears_its_unpushed_chip_without_touching_a_sibling() {
+        let mut a = app();
+        a.unpushed.entry(String::new()).or_default().extend([
+            "ZAP-9".to_string(),
+            "ZAP-9/api".to_string(),
+            "ZAP-90/api".to_string(), // a prefix sibling that must survive
+        ]);
+        a.apply_event(AppEvent::WorkspaceDiscarded {
+            project_id: String::new(),
+            issue: "ZAP-9".into(),
+        });
+        assert!(
+            !is_unpushed(&a, "ZAP-9") && !is_unpushed(&a, "ZAP-9/api"),
+            "discard clears the issue's bare and per-repo chip keys"
+        );
+        assert!(
+            is_unpushed(&a, "ZAP-90/api"),
+            "the trailing-slash guard spares the ZAP-90 sibling"
+        );
+    }
+
+    #[test]
     fn switching_back_drops_a_backend_that_exited_while_backgrounded() {
         let mut a = app();
         a.active_project = "proj-a".into();
@@ -3744,6 +5845,28 @@ mod tests {
         assert!(
             !a.backends.contains_key("ENG-1"),
             "a backend whose agent exited while backgrounded is not re-attached"
+        );
+    }
+
+    #[test]
+    fn switching_back_seeds_the_fleet_from_a_live_backend_so_a_discard_is_refused() {
+        // CF-5 / H2: on switch the fleet is seeded Running from the restored live backends
+        // BEFORE the async status re-emit, so a discard/kill on the very next keystroke
+        // sees a live agent (and the destructive-verb guard refuses) instead of an empty
+        // fleet for ≥1 iteration — the switch-back data-loss window.
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        let _agent = register(&mut a, "ENG-1"); // a still-live FakeBackend on proj-a
+        a.activate_project(project("proj-b", "Beta"), demo::graph()); // stashes proj-a
+        a.activate_project(project("proj-a", "Alpha"), demo::graph()); // restores it live
+        assert_eq!(
+            a.fleet.get("ENG-1"),
+            Some(&AgentStatus::Running),
+            "the restored live backend seeds a Running fleet entry immediately on switch-back"
+        );
+        assert!(
+            a.has_live_backend("ENG-1"),
+            "and the destructive-verb guard sees it as live, so a discard/kill is refused"
         );
     }
 
@@ -3866,6 +5989,31 @@ mod tests {
             working: true,
         });
         assert_eq!(a.elsewhere_needs_you(), 0, "resumed work clears the tally");
+    }
+
+    #[test]
+    fn switching_back_aims_the_cursor_at_a_running_agent() {
+        // NEW-26: the "N agents running here — ⏎ to open" reassurance must land Enter
+        // on a real running agent. most_connected_root is pure topology and almost
+        // never a running issue, so activate_project re-aims onto a live agent it
+        // finds in `world` — otherwise Enter would target a dead root and launch a
+        // brand-new agent on it (the opposite of "open").
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        let topo_root = most_connected_root(&demo::graph());
+        assert_ne!(
+            topo_root, "ZAP-210",
+            "precondition: the live issue is not already the topology root"
+        );
+        a.world
+            .entry("proj-b".into())
+            .or_default()
+            .insert("ZAP-210".into(), AgentStatus::Running);
+        a.activate_project(project("proj-b", "Beta"), demo::graph());
+        assert_eq!(
+            a.root, "ZAP-210",
+            "the cursor lands on the running agent, not the topology root"
+        );
     }
 
     #[test]
@@ -4038,6 +6186,25 @@ mod tests {
         assert!(app.order.len() > 1);
     }
 
+    #[test]
+    fn search_ctrl_c_cancels_without_committing_the_query() {
+        // NEW-06: Ctrl-C cancels like Esc — it must drop the in-progress needle and
+        // restore the full order, never leave the typed query applied as a filter.
+        let mut app = app();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "210".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.order, vec!["ZAP-210".to_string()]);
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.search_active, "Ctrl-C closes search");
+        assert!(app.search_query.is_empty(), "Ctrl-C drops the query");
+        assert!(
+            app.order.len() > 1,
+            "the full order is restored, not left filtered to the typed needle"
+        );
+    }
+
     // ── The attach/spawn button + agent windows ─────────────────────────────
 
     #[test]
@@ -4076,6 +6243,54 @@ mod tests {
         press(&mut app, KeyCode::Char('q'));
         assert!(!app.should_quit);
         assert_eq!(fake.inputs.lock().unwrap().last().unwrap(), b"q");
+    }
+
+    #[test]
+    fn a_paste_into_a_chat_is_wrapped_so_claude_does_not_submit_each_line() {
+        // CF-8: a multi-line paste must reach claude as one bracketed-paste block, not
+        // as N newline-terminated submits.
+        let mut app = app();
+        let fake = register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // focus the agent's chat
+        assert!(
+            app.forward_paste("line one\nline two"),
+            "a focused chat consumes the paste"
+        );
+        assert_eq!(
+            fake.inputs.lock().unwrap().last().unwrap(),
+            b"\x1b[200~line one\nline two\x1b[201~",
+            "the paste is wrapped in bracketed-paste markers, not split on the newline"
+        );
+    }
+
+    #[test]
+    fn a_paste_with_no_chat_focused_is_dropped() {
+        // Off a chat (here the Spine), a paste is dropped like a stray keystroke.
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        assert!(!app.forward_paste("hello"), "a paste off a chat is dropped");
+    }
+
+    #[test]
+    fn typing_into_a_reclaimed_chat_says_so_instead_of_swallowing_it() {
+        // D-MED: a dead chat whose backend was reclaimed used to swallow keystrokes
+        // silently (a frozen prompt); now it says it's not accepting input.
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // focus the chat
+        app.backends.remove("ZAP-204"); // its backend was reclaimed
+        app.forward_to_agent(
+            "ZAP-204",
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert!(
+            app.status_msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("no longer accepting input"),
+            "a reclaimed chat says so: {:?}",
+            app.status_msg
+        );
     }
 
     #[test]
@@ -4136,6 +6351,73 @@ mod tests {
             app.backends.contains_key("ZAP-204"),
             "a live agent keeps running (its backend is kept for re-find)"
         );
+        // …and the issue you were looking at stays on screen: close demotes the
+        // selected issue's coin back to the follower preview (never an empty pane).
+        assert_eq!(
+            app.windows.preview().map(|(issue, _)| issue),
+            Some("ZAP-204".to_string()),
+            "unpinning the selected issue re-seeds its preview"
+        );
+    }
+
+    #[test]
+    fn unpinning_the_selected_issues_coin_demotes_it_to_a_preview() {
+        // The thing you're looking at must never vanish (Felix / B0b): unpinning the
+        // pinned coin of the *currently selected* issue demotes it back to the
+        // follower preview, not an empty big pane.
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // active window → chat coin on the selection
+        verb(&mut app, KeyCode::Char('p')); // pin = graduate to a permanent tab
+        assert!(
+            app.windows.pinned_coin_index("ZAP-204").is_some(),
+            "precondition: the selected issue has a pinned coin"
+        );
+        verb(&mut app, KeyCode::Char('w')); // Ctrl-a w = unpin / close
+        assert!(
+            app.windows.pinned_coin_index("ZAP-204").is_none(),
+            "the coin is undocked"
+        );
+        assert_eq!(
+            app.windows.preview().map(|(issue, _)| issue),
+            Some("ZAP-204".to_string()),
+            "the issue you were looking at is demoted to the preview, not gone"
+        );
+        assert!(
+            app.active_index().is_some(),
+            "something represents the selection, so the big pane isn't empty"
+        );
+    }
+
+    #[test]
+    fn direct_p_on_the_spine_toggles_pin_then_unpin() {
+        // R6 + Felix: a bare `p` from the nav is a *toggle*. The first press pins
+        // the previewed selection; a second press on the now-pinned selection
+        // unpins it (demoted back to a follower preview so it never vanishes), and
+        // either way focus stays on the Spine (0) so you keep browsing. This drives
+        // the DIRECT `p` key (press), not the `Ctrl-a p` prefix (verb).
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        assert_eq!(app.windows.focus, 0, "precondition: focused on the Spine");
+        // First direct `p`: pin the previewed selection (no Tab/prefix needed).
+        press(&mut app, KeyCode::Char('p'));
+        assert!(
+            app.windows.pinned_coin_index("ZAP-204").is_some(),
+            "direct p from the nav pins the previewed issue"
+        );
+        assert_eq!(app.windows.focus, 0, "pin from the nav keeps you on the Spine");
+        // Second direct `p` on the same, now-pinned selection: toggle → unpin.
+        press(&mut app, KeyCode::Char('p'));
+        assert!(
+            app.windows.pinned_coin_index("ZAP-204").is_none(),
+            "a second direct p unpins (undocks) the issue"
+        );
+        assert_eq!(
+            app.windows.preview().map(|(issue, _)| issue),
+            Some("ZAP-204".to_string()),
+            "the unpinned issue is demoted to the preview, not gone"
+        );
+        assert_eq!(app.windows.focus, 0, "unpin from the nav keeps you on the Spine");
     }
 
     #[test]
@@ -4312,12 +6594,12 @@ mod tests {
             "ZAP-204 is now a permanent tab"
         );
         app.aim_spine("ZAP-205".into());
-        // The prefix button opens ZAP-205 from any focus; pinned ZAP-204 survives.
+        // The preview follows the browsed row while the pinned ZAP-204 coin survives.
         verb(&mut app, KeyCode::Enter);
         assert!(app.windows.pinned_coin_index("ZAP-204").is_some());
         assert_eq!(
             app.windows.preview().unwrap(),
-            ("ZAP-205".into(), CoinMode::Chat)
+            ("ZAP-205".into(), CoinMode::Deps)
         );
     }
 
@@ -4337,8 +6619,28 @@ mod tests {
         let mut app = app();
         press(&mut app, KeyCode::Char('q')); // a bare q does nothing on the spine
         assert!(!app.should_quit);
-        verb(&mut app, KeyCode::Char('q')); // Ctrl-a q quits
-        assert!(app.should_quit);
+        assert!(!app.quit_confirm);
+    }
+
+    #[test]
+    fn an_idle_cockpit_quits_immediately_but_a_live_fleet_asks_first() {
+        // R7: no friction when nothing is at stake — Ctrl-a q on an agent-less
+        // cockpit quits straight away. With a live agent it arms a confirmation
+        // (Q sits right above A, so a fat-fingered prefix-then-q shouldn't tear
+        // down a running fleet); y/⏎ confirms.
+        let mut idle = app();
+        verb(&mut idle, KeyCode::Char('q'));
+        assert!(idle.should_quit, "an idle cockpit quits without a prompt");
+        assert!(!idle.quit_confirm);
+
+        let mut busy = app();
+        register(&mut busy, "ZAP-204");
+        busy.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        verb(&mut busy, KeyCode::Char('q'));
+        assert!(busy.quit_confirm, "a live fleet arms a confirmation");
+        assert!(!busy.should_quit, "the first Ctrl-a q does not quit");
+        press(&mut busy, KeyCode::Char('y'));
+        assert!(busy.should_quit, "y confirms the quit");
     }
 
     // ── Deps windows (per-window navigation) ─────────────────────────────────
@@ -4436,6 +6738,89 @@ mod tests {
     }
 
     #[test]
+    fn verbs_target_the_re_rooted_deps_node_the_pane_shows_not_the_stale_selection() {
+        // H6: in a pinned deps coin re-rooted onto a blocker, the shared on-screen
+        // target (detail bar / dispatch / kill / editor) must follow the cursor root,
+        // not the Spine selection three screens back.
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('l')); // focus the preview deps
+        verb(&mut app, KeyCode::Char('p')); // pin it
+        let before = app.root.clone();
+        let target = app.windows.focused().deps.as_ref().unwrap().up_rows[0]
+            .key
+            .clone();
+        assert_ne!(target, before);
+        press(&mut app, KeyCode::Enter); // re-root onto the blocker
+        assert_eq!(app.windows.focused().deps.as_ref().unwrap().root, target);
+        assert_eq!(
+            app.detail_key(),
+            Some(target.as_str()),
+            "the detail/dispatch/kill target follows the pane, not the stale selection"
+        );
+        assert_eq!(app.root, before, "the Spine itself stays put");
+    }
+
+    #[test]
+    fn tab_on_the_spine_flips_the_selections_pinned_coin() {
+        // Tab was a dead key when the selection had a pinned coin (its preview is
+        // cleared) — now it flips the pinned coin that IS the big pane.
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // chat coin on ZAP-204
+        verb(&mut app, KeyCode::Char('p')); // pin it
+        verb(&mut app, KeyCode::Char('0')); // FocusNav home to the Spine
+        assert_eq!(app.windows.focus, 0, "back on the Spine");
+        let pinned = app.windows.pinned_coin_index("ZAP-204").unwrap();
+        assert!(
+            matches!(
+                app.windows.windows[pinned].kind,
+                WindowKind::Coin {
+                    mode: CoinMode::Chat,
+                    ..
+                }
+            ),
+            "the pinned coin starts on its chat face"
+        );
+        press(&mut app, KeyCode::Tab); // ContextToggle on the Spine
+        assert!(
+            matches!(
+                app.windows.windows[pinned].kind,
+                WindowKind::Coin {
+                    mode: CoinMode::Deps,
+                    ..
+                }
+            ),
+            "Tab flipped the pinned coin to deps instead of doing nothing"
+        );
+    }
+
+    #[test]
+    fn d_on_a_pinned_issue_flips_it_to_deps_without_duplicating() {
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // chat coin
+        verb(&mut app, KeyCode::Char('p')); // pin it
+        verb(&mut app, KeyCode::Char('0')); // home to the Spine; selection still ZAP-204
+        let n = app.windows.windows.len();
+        press(&mut app, KeyCode::Char('d')); // OpenDeps on the pinned selection
+        assert_eq!(
+            app.windows.windows.len(),
+            n,
+            "no duplicate coin minted for ZAP-204"
+        );
+        assert!(
+            matches!(
+                app.windows.focused_kind(),
+                WindowKind::Coin {
+                    mode: CoinMode::Deps,
+                    ..
+                }
+            ),
+            "the existing pinned coin is flipped to its deps face and focused"
+        );
+    }
+
+    #[test]
     fn the_one_shot_prefix_fires_a_single_verb() {
         // `Ctrl-a l` fires exactly one window verb (focus right). v1.7 (ENG-562)
         // removed command mode, so the prefix is now purely one-shot.
@@ -4483,23 +6868,146 @@ mod tests {
     }
 
     #[test]
-    fn a_dashboard_keypress_acknowledges_the_needs_you_footer() {
+    fn a_nav_keypress_keeps_the_sticky_needs_you_guard_armed() {
+        // CF-11: a stray nav key must NOT drop the sticky needs-you guard while an agent
+        // still needs you — it's the one alert designed to be un-buryable. It clears only
+        // once the agent actually resolves/exits (re-derived from the fleet).
         let mut app = app();
-        app.apply_event(AppEvent::AgentNeedsYou {
-            project_id: String::new(),
+        app.fleet.insert("ZAP-204".into(), AgentStatus::NeedsYou);
+        app.needs_you_alert = true;
+        press(&mut app, KeyCode::Char('f')); // a spine key no longer disarms it
+        assert!(
+            app.needs_you_alert,
+            "the guard survives navigation while the agent still needs you"
+        );
+        // Resolve it (NeedsYou → Running); now the next nav key clears the guard.
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        press(&mut app, KeyCode::Char('k'));
+        assert!(
+            !app.needs_you_alert,
+            "once the agent resolves, nav clears the guard"
+        );
+    }
+
+    #[test]
+    fn the_needs_you_jump_leaves_the_guard_armed() {
+        // Pressing `n` to triage must not disarm the burial guard mid-triage.
+        let mut app = app();
+        app.fleet.insert("ZAP-204".into(), AgentStatus::NeedsYou);
+        app.needs_you_alert = true;
+        press(&mut app, KeyCode::Char('n')); // JumpNeedsYou
+        assert!(
+            app.needs_you_alert,
+            "the dedicated triage key keeps the guard armed"
+        );
+    }
+
+    #[test]
+    fn restart_refuses_a_live_agent_then_relaunches_a_dead_one() {
+        // CF-14: one-press restart — refuse a live agent (never silently kill running
+        // work), reclaim + relaunch a dead one.
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        let fake = register(&mut a, "ZAP-204");
+        a.aim_spine("ZAP-204".into());
+        a.windows.focus = 0;
+        a.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        verb(&mut a, KeyCode::Char('r')); // Ctrl-a r
+        assert!(
+            a.status_msg.as_deref().unwrap_or("").contains("still live"),
+            "restart refuses a live agent: {:?}",
+            a.status_msg
+        );
+        assert!(
+            !a.pending_launch.contains_key("ZAP-204"),
+            "no relaunch while live"
+        );
+        // The agent dies; restart reclaims its (windowed) dead backend so button
+        // relaunches it — instead of just re-opening the corpse card (the reclaim is
+        // restart's distinctive move; the relaunch then follows button's normal gates).
+        fake.finish(Some(1));
+        a.fleet.insert("ZAP-204".into(), AgentStatus::Failed);
+        assert!(
+            a.backends.contains_key("ZAP-204"),
+            "precondition: the dead backend is still up"
+        );
+        verb(&mut a, KeyCode::Char('r'));
+        assert!(
+            !a.backends.contains_key("ZAP-204"),
+            "restart reclaims the dead backend in one press, so it relaunches not re-opens"
+        );
+    }
+
+    #[test]
+    fn next_agent_walks_the_live_fleet_wrapping() {
+        let mut a = app();
+        register(&mut a, "ZAP-201");
+        register(&mut a, "ZAP-205");
+        a.fleet.insert("ZAP-201".into(), AgentStatus::Running);
+        a.fleet.insert("ZAP-205".into(), AgentStatus::Idle);
+        a.windows.focus = 0;
+        a.aim_spine("ZAP-201".into());
+        verb(&mut a, KeyCode::Char('j')); // next-agent
+        assert_eq!(a.root, "ZAP-205", "walks to the next live agent");
+        verb(&mut a, KeyCode::Char('j'));
+        assert_eq!(a.root, "ZAP-201", "wraps back to the first");
+    }
+
+    #[test]
+    fn dispatch_ready_launches_the_ready_lane_in_one_press() {
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.resume_cap = 0; // uncapped → launch every READY issue
+        let ready: Vec<String> = a
+            .order
+            .iter()
+            .filter(|k| a.readiness(k) == Readiness::Ready)
+            .cloned()
+            .collect();
+        assert!(
+            !ready.is_empty(),
+            "precondition: the graph has READY issues"
+        );
+        verb(&mut a, KeyCode::Char('g')); // dispatch-ready
+        let launched = ready
+            .iter()
+            .filter(|k| a.pending_launch.contains_key(*k))
+            .count();
+        assert_eq!(
+            launched,
+            ready.len(),
+            "every READY issue launched in one press"
+        );
+    }
+
+    #[test]
+    fn a_clean_finish_increments_the_shipped_tally_but_a_crash_does_not() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        a.apply_event(AppEvent::AgentStatusChanged {
+            project_id: "proj".into(),
             issue: "ZAP-204".into(),
-            reason: "permission".into(),
+            status: AgentStatus::Done,
         });
-        assert!(app.needs_you_alert);
-        press(&mut app, KeyCode::Char('f')); // a spine key acknowledges
-        assert!(!app.needs_you_alert);
-        app.apply_event(AppEvent::AgentAction {
-            project_id: String::new(),
+        assert_eq!(a.shipped_today, 1, "a clean finish ships");
+        // A re-emit of the same terminal status must not double-count.
+        a.apply_event(AppEvent::AgentStatusChanged {
+            project_id: "proj".into(),
             issue: "ZAP-204".into(),
-            action: "ran Grep".into(),
-            working: true,
+            status: AgentStatus::Done,
         });
-        assert_eq!(app.status_msg.as_deref(), Some("ZAP-204: ran Grep"));
+        assert_eq!(a.shipped_today, 1, "a re-emit doesn't double-count");
+        // A crash isn't a ship.
+        a.fleet.insert("ZAP-205".into(), AgentStatus::Running);
+        a.apply_event(AppEvent::AgentStatusChanged {
+            project_id: "proj".into(),
+            issue: "ZAP-205".into(),
+            status: AgentStatus::Failed,
+        });
+        assert_eq!(a.shipped_today, 1, "a crash doesn't ship");
     }
 
     #[test]
@@ -4552,6 +7060,92 @@ mod tests {
         assert_eq!(
             app.status_msg, alert,
             "ambient chatter must not bury the alert"
+        );
+    }
+
+    #[test]
+    fn a_settled_idle_agent_is_not_revived_by_mid_turn_or_ambient_chatter() {
+        // A4: once an agent goes Idle (its Stop hook fired), a late or out-of-order
+        // mid-turn PostToolUse — or the ~60 s idle nudge — must NOT flip it back to
+        // WORKING. Only a genuine new turn (a Running status change, which is how
+        // UserPromptSubmit is routed) revives it.
+        let mut app = app();
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
+
+        // A mid-turn working tool-run lands late.
+        app.apply_event(AppEvent::AgentAction {
+            project_id: String::new(),
+            issue: "ZAP-204".into(),
+            action: "ran Bash".into(),
+            working: true,
+        });
+        assert_eq!(
+            app.fleet.get("ZAP-204"),
+            Some(&AgentStatus::Idle),
+            "a mid-turn PostToolUse must not un-idle a settled agent"
+        );
+
+        // The ~60 s ambient idle nudge.
+        app.apply_event(AppEvent::AgentAction {
+            project_id: String::new(),
+            issue: "ZAP-204".into(),
+            action: "agent idle".into(),
+            working: false,
+        });
+        assert_eq!(
+            app.fleet.get("ZAP-204"),
+            Some(&AgentStatus::Idle),
+            "the idle nudge must not un-idle a settled agent"
+        );
+
+        // A genuine new turn revives it.
+        app.apply_event(AppEvent::AgentStatusChanged {
+            project_id: String::new(),
+            issue: "ZAP-204".into(),
+            status: AgentStatus::Running,
+        });
+        assert_eq!(
+            app.fleet.get("ZAP-204"),
+            Some(&AgentStatus::Running),
+            "a new turn revives an Idle agent to Running"
+        );
+    }
+
+    #[test]
+    fn the_world_roll_up_mirrors_the_idle_fix() {
+        // The cross-project roll-up (`world`) must apply the same A4 rule as `fleet`, or
+        // a switched-away project would report a phantom *live* agent that is really Idle.
+        let mut app = app();
+        app.active_project = "proj".into();
+        // Idle via a real status change populates both fleet and world.
+        app.apply_event(AppEvent::AgentStatusChanged {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            status: AgentStatus::Idle,
+        });
+        // A mid-turn working action must not un-idle it in EITHER map.
+        app.apply_event(AppEvent::AgentAction {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            action: "ran Bash".into(),
+            working: true,
+        });
+        assert_eq!(app.fleet.get("ENG-1"), Some(&AgentStatus::Idle));
+        assert_eq!(
+            app.world.get("proj").and_then(|m| m.get("ENG-1")),
+            Some(&AgentStatus::Idle),
+            "world must not un-idle a settled agent on mid-turn chatter"
+        );
+        // An action with no prior entry creates nothing in world (no phantom agent).
+        app.apply_event(AppEvent::AgentAction {
+            project_id: "proj".into(),
+            issue: "GHOST".into(),
+            action: "ran Bash".into(),
+            working: true,
+        });
+        assert!(
+            app.world.get("proj").and_then(|m| m.get("GHOST")).is_none(),
+            "a working action before AgentSpawned must not conjure a world entry"
         );
     }
 
@@ -4633,6 +7227,359 @@ mod tests {
             reason: "real".into(),
         }));
         assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::NeedsYou));
+    }
+
+    #[test]
+    fn a_late_hook_cannot_resurrect_a_reaped_ask_agent() {
+        // FEAT-A: `restore_ask_issue_if_needed` runs at the TOP of the live status
+        // handlers — before their reaped/terminal guards — and `ensure_ask_issue` is
+        // unconditional. So a stray post-cancel hook for a *killed* ad-hoc agent must
+        // not re-arm `ask_agents` or re-inject its synthetic Spine node. (The existing
+        // reaped-resurrection test uses a non-synthetic key, so it never exercises the
+        // `is_synthetic_ask_id` restore path that owns this bug.)
+        let ask = crate::worktree::synthetic_ask_id();
+        let mut app = app();
+        app.reaped.insert(ask.clone()); // the ad-hoc agent was killed/discarded
+        assert!(app.graph.get(&ask).is_none(), "no synthetic node before the hook");
+
+        for ev in [
+            AppEvent::AgentNeedsYou {
+                project_id: String::new(),
+                issue: ask.clone(),
+                reason: "late prompt".into(),
+            },
+            AppEvent::AgentAction {
+                project_id: String::new(),
+                issue: ask.clone(),
+                action: "ran grep".into(),
+                working: true,
+            },
+            AppEvent::AgentStatusChanged {
+                project_id: String::new(),
+                issue: ask.clone(),
+                status: AgentStatus::Running,
+            },
+        ] {
+            assert!(
+                !app.apply_event(ev),
+                "a reaped ask agent's late live hook is dropped"
+            );
+            assert!(
+                !app.ask_agents.contains(&ask),
+                "the reaped ad-hoc agent is not re-armed"
+            );
+            assert!(
+                app.graph.get(&ask).is_none(),
+                "the reaped ad-hoc agent's synthetic node is not resurrected into the Spine"
+            );
+            assert!(!app.fleet.contains_key(&ask), "no phantom fleet entry");
+        }
+    }
+
+    #[test]
+    fn a_live_ask_agents_pruned_node_is_restored_on_its_next_hook() {
+        // The legitimate path the guard must leave intact: a still-live ad-hoc agent
+        // whose synthetic node was pruned (e.g. a reconcile on a project switch-back)
+        // gets re-injected into the Spine when its next live hook arrives.
+        let ask = crate::worktree::synthetic_ask_id();
+        let mut app = app();
+        assert!(app.graph.get(&ask).is_none());
+        assert!(app.apply_event(AppEvent::AgentNeedsYou {
+            project_id: String::new(),
+            issue: ask.clone(),
+            reason: "needs you".into(),
+        }));
+        assert!(
+            app.ask_agents.contains(&ask),
+            "a live ad-hoc agent is (re-)armed"
+        );
+        assert!(
+            app.graph.get(&ask).is_some(),
+            "its synthetic Spine node is restored"
+        );
+        assert_eq!(app.fleet.get(&ask), Some(&AgentStatus::NeedsYou));
+    }
+
+    #[test]
+    fn idle_with_recent_pty_output_reads_as_working() {
+        // FEAT-B: a settled Idle agent whose child is still streaming PTY output is
+        // busy, not resting — its readiness band upgrades to WORKING, matching the
+        // live gutter spinner `display_agent_status` shows (so no band/row stutter).
+        let mut app = app();
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
+        assert_eq!(
+            app.readiness("ZAP-204"),
+            Readiness::Idle,
+            "no output yet → honestly resting"
+        );
+        app.apply_event(AppEvent::AgentOutput {
+            project_id: "".into(),
+            issue: "ZAP-204".into(),
+        });
+        assert!(app.recently_active("ZAP-204"), "the PTY stamp is fresh");
+        assert_eq!(
+            app.readiness("ZAP-204"),
+            Readiness::Working,
+            "a quiet-but-producing Idle agent bands under WORKING"
+        );
+        assert_eq!(
+            app.display_agent_status("ZAP-204", AgentStatus::Idle),
+            AgentStatus::Running,
+            "and the gutter glyph shows the live spinner — band + row agree"
+        );
+    }
+
+    #[test]
+    fn quiet_window_expires_back_to_idle() {
+        // The overlay self-expires: once PTY output stops for the settle window the
+        // agent falls back to the honest resting IDLE (proves the frame clock + the
+        // window length cooperate).
+        let mut app = app();
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
+        app.apply_event(AppEvent::AgentOutput {
+            project_id: "".into(),
+            issue: "ZAP-204".into(),
+        });
+        assert_eq!(app.readiness("ZAP-204"), Readiness::Working);
+        for _ in 0..OUTPUT_SETTLE_FRAMES {
+            app.tick_frame();
+        }
+        assert!(!app.recently_active("ZAP-204"), "the window expired");
+        assert_eq!(
+            app.readiness("ZAP-204"),
+            Readiness::Idle,
+            "with no fresh output the band settles back to IDLE"
+        );
+    }
+
+    #[test]
+    fn recently_active_idle_keeps_the_cockpit_animating_then_settles() {
+        // The frame clock must keep ticking while an Idle agent is recently-active —
+        // otherwise the window could never expire on an otherwise-quiet fleet — and
+        // then settle so a quiet child doesn't pin the loop awake forever.
+        let mut app = app();
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
+        assert!(
+            !app.is_animating(),
+            "a resting Idle agent alone doesn't animate"
+        );
+        app.apply_event(AppEvent::AgentOutput {
+            project_id: "".into(),
+            issue: "ZAP-204".into(),
+        });
+        assert!(app.is_animating(), "recent PTY output keeps the loop awake");
+        for _ in 0..OUTPUT_SETTLE_FRAMES {
+            app.tick_frame();
+        }
+        assert!(
+            !app.is_animating(),
+            "once the window expires the cockpit settles — no perpetual wake-up"
+        );
+    }
+
+    #[test]
+    fn pty_output_never_revives_a_terminal_or_absent_agent() {
+        // The overlay only upgrades Idle: a terminal (or never-seen) agent that emits
+        // a late PTY burst must not read as active, and its band stays graph-truth.
+        for status in [AgentStatus::Done, AgentStatus::Stopped, AgentStatus::Failed] {
+            let mut app = app();
+            app.fleet.insert("ZAP-204".into(), status);
+            app.apply_event(AppEvent::AgentOutput {
+                project_id: "".into(),
+                issue: "ZAP-204".into(),
+            });
+            assert_eq!(
+                app.fleet.get("ZAP-204"),
+                Some(&status),
+                "{status:?} fleet entry unchanged"
+            );
+            assert!(
+                !app.recently_active("ZAP-204"),
+                "{status:?} is terminal — never recently-active"
+            );
+            assert_ne!(
+                app.readiness("ZAP-204"),
+                Readiness::Working,
+                "{status:?} never bands under WORKING from PTY output"
+            );
+        }
+        // An issue with no fleet entry conjures nothing from a stray output event.
+        let mut app = app();
+        app.apply_event(AppEvent::AgentOutput {
+            project_id: "".into(),
+            issue: "GHOST".into(),
+        });
+        assert!(!app.recently_active("GHOST"));
+        assert!(!app.fleet.contains_key("GHOST"));
+    }
+
+    #[test]
+    fn pty_output_does_not_touch_a_non_idle_live_agent() {
+        // Spawning/Running/NeedsYou already render live — the Idle-only overlay must not
+        // perturb their band or status.
+        for status in [
+            AgentStatus::Spawning,
+            AgentStatus::Running,
+            AgentStatus::NeedsYou,
+        ] {
+            let mut app = app();
+            app.fleet.insert("ZAP-204".into(), status);
+            let band_before = app.readiness("ZAP-204");
+            app.apply_event(AppEvent::AgentOutput {
+                project_id: "".into(),
+                issue: "ZAP-204".into(),
+            });
+            assert!(!app.recently_active("ZAP-204"), "the overlay is Idle-only");
+            assert_eq!(
+                app.readiness("ZAP-204"),
+                band_before,
+                "{status:?} band is unchanged by PTY output"
+            );
+            assert_eq!(app.fleet.get("ZAP-204"), Some(&status), "{status:?} unchanged");
+        }
+    }
+
+    #[test]
+    fn a_fresh_pty_burst_repaints_an_off_screen_idle_agent_then_quiets() {
+        // FEAT-B step 3: the FIRST PTY burst for an off-screen Idle agent forces a
+        // repaint so its band flips to WORKING immediately; a steady-state burst while
+        // it is already active does not (preserving the off-screen-quiet contract). A
+        // terminal issue's late output is never stamped at all (the is_live stamp gate).
+        let mut app = app();
+        app.fleet.insert("ZAP-9".into(), AgentStatus::Idle); // no window → off-screen
+        assert!(
+            app.apply_event(AppEvent::AgentOutput {
+                project_id: "".into(),
+                issue: "ZAP-9".into(),
+            }),
+            "the first burst flips the band, so it must repaint even off-screen"
+        );
+        assert!(
+            !app.apply_event(AppEvent::AgentOutput {
+                project_id: "".into(),
+                issue: "ZAP-9".into(),
+            }),
+            "steady-state output for an already-active off-screen agent stays quiet"
+        );
+        // A terminal issue's late PTY burst is not stamped into the overlay map.
+        app.fleet.insert("ZAP-9".into(), AgentStatus::Done);
+        app.last_output.remove("ZAP-9");
+        app.apply_event(AppEvent::AgentOutput {
+            project_id: "".into(),
+            issue: "ZAP-9".into(),
+        });
+        assert!(
+            !app.last_output.contains_key("ZAP-9"),
+            "a terminal issue's output is not stamped (the is_live stamp gate)"
+        );
+    }
+
+    #[test]
+    fn overlay_is_pruned_on_reap_and_age() {
+        // The `last_output` map must stay bounded: a reap drops the stamp with the
+        // fleet entry, and `tick_frame` ages out a stale stamp on its own.
+        {
+            let mut app = app();
+            app.fleet.insert("ZAP-204".into(), AgentStatus::Idle);
+            app.apply_event(AppEvent::AgentOutput {
+                project_id: "".into(),
+                issue: "ZAP-204".into(),
+            });
+            assert!(app.last_output.contains_key("ZAP-204"));
+            app.apply_event(AppEvent::AgentReaped {
+                project_id: String::new(),
+                issue: "ZAP-204".into(),
+            });
+            assert!(
+                !app.last_output.contains_key("ZAP-204"),
+                "AgentReaped drops the overlay stamp with the fleet entry"
+            );
+        }
+
+        // Age-prune: a stale stamp is dropped by tick_frame even without a reap.
+        let mut app = app();
+        app.fleet.insert("ZAP-9".into(), AgentStatus::Idle);
+        app.apply_event(AppEvent::AgentOutput {
+            project_id: "".into(),
+            issue: "ZAP-9".into(),
+        });
+        for _ in 0..OUTPUT_SETTLE_FRAMES {
+            app.tick_frame();
+        }
+        assert!(
+            !app.last_output.contains_key("ZAP-9"),
+            "tick_frame ages out a stale stamp so the map stays bounded"
+        );
+    }
+
+    #[test]
+    fn a_killed_agent_flashes_stopped_and_bands_terminal() {
+        // R2 (CF-4 / CF-14): a confirmed kill seeds `reaped` synchronously, THEN the
+        // supervisor's graded terminal `Stopped` arrives. The reaped guard must block
+        // only LIVE re-emits — the terminal Stopped must still land so the graphite
+        // kill pulse (Flash::Stopped, its sole producer) fires and the Spine bands the
+        // row terminal immediately, instead of stale-live until AgentReaped. No test
+        // previously asserted the pulse fires on a kill.
+        let mut app = app();
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        app.reaped.insert("ZAP-204".into()); // kill confirmed → tombstoned up front
+
+        assert!(app.apply_event(AppEvent::AgentStatusChanged {
+            project_id: String::new(),
+            issue: "ZAP-204".into(),
+            status: AgentStatus::Stopped,
+        }));
+        assert!(
+            matches!(app.flash.get("ZAP-204"), Some((Flash::Stopped, _))),
+            "the deliberate kill fires the graphite Stopped pulse"
+        );
+        assert_eq!(
+            app.fleet.get("ZAP-204"),
+            Some(&AgentStatus::Stopped),
+            "the killed row bands terminal at once, not stale-live until reap"
+        );
+
+        // …but a LIVE re-emit for the same reaped issue is still dropped — the kill
+        // must not be resurrected.
+        assert!(!app.apply_event(AppEvent::AgentStatusChanged {
+            project_id: String::new(),
+            issue: "ZAP-204".into(),
+            status: AgentStatus::Running,
+        }));
+        assert_eq!(app.fleet.get("ZAP-204"), Some(&AgentStatus::Stopped));
+    }
+
+    #[test]
+    fn a_reaped_synthetic_ask_agents_terminal_stop_still_flashes_and_bands() {
+        // FEAT-A guard harmlessness: restore_ask_issue_if_needed early-returns for a
+        // reaped SYNTHETIC ask id (skipping node injection), but it must NOT suppress the
+        // deliberate-kill terminal flash/banding — that path runs after and independent of
+        // the restore helper. (The R2 test uses a non-synthetic id; this exercises the
+        // synthetic-id branch of the guard.)
+        let ask = crate::worktree::synthetic_ask_id();
+        let mut app = app();
+        app.ask_agents.insert(ask.clone());
+        app.fleet.insert(ask.clone(), AgentStatus::Running);
+        app.reaped.insert(ask.clone()); // the ad-hoc agent was killed
+
+        assert!(app.apply_event(AppEvent::AgentStatusChanged {
+            project_id: String::new(),
+            issue: ask.clone(),
+            status: AgentStatus::Stopped,
+        }));
+        assert!(
+            matches!(app.flash.get(&ask), Some((Flash::Stopped, _))),
+            "the killed ad-hoc agent still gets its graphite Stopped pulse"
+        );
+        assert_eq!(
+            app.fleet.get(&ask),
+            Some(&AgentStatus::Stopped),
+            "and bands terminal — the restore guard didn't swallow the terminal status"
+        );
+        assert!(
+            app.graph.get(&ask).is_none(),
+            "yet the guard still held — no synthetic node was resurrected by the late hook"
+        );
     }
 
     #[test]
@@ -4791,7 +7738,7 @@ mod tests {
         let mut app = app();
         app.mark_resuming_for_test("WEDGED");
         assert!(
-            app.pending_launch.contains("WEDGED"),
+            app.pending_launch.contains_key("WEDGED"),
             "resume arms the double-launch guard"
         );
         for _ in 0..=RESUME_GRACE_FRAMES {
@@ -4799,7 +7746,7 @@ mod tests {
         }
         assert_eq!(app.resuming_count(), 0, "the spinner cleared on its grace");
         assert!(
-            !app.pending_launch.contains("WEDGED"),
+            !app.pending_launch.contains_key("WEDGED"),
             "the pending_launch guard was released, so the card can resume again"
         );
     }
@@ -5193,18 +8140,16 @@ mod tests {
         // A needs-you agent is the top band, even on a blocked issue.
         a.fleet.insert("blocked".into(), AgentStatus::NeedsYou);
         assert_eq!(a.readiness("blocked"), Readiness::NeedsYou);
-        // Spawning / Running / Idle are all live → Running.
-        for s in [
-            AgentStatus::Spawning,
-            AgentStatus::Running,
-            AgentStatus::Idle,
-        ] {
+        // Spawning / Running churn → Working; Idle rests → Idle.
+        for s in [AgentStatus::Spawning, AgentStatus::Running] {
             a.fleet.insert("ready".into(), s);
-            assert_eq!(a.readiness("ready"), Readiness::Running, "{s:?} is live");
+            assert_eq!(a.readiness("ready"), Readiness::Working, "{s:?} is working");
         }
+        a.fleet.insert("ready".into(), AgentStatus::Idle);
+        assert_eq!(a.readiness("ready"), Readiness::Idle, "idle agent rests");
         // A live agent even outranks a resolved issue.
         a.fleet.insert("done".into(), AgentStatus::Running);
-        assert_eq!(a.readiness("done"), Readiness::Running);
+        assert_eq!(a.readiness("done"), Readiness::Working);
     }
 
     #[test]
@@ -5236,8 +8181,9 @@ mod tests {
     #[test]
     fn readiness_band_order_is_the_schedule_order() {
         // The derived Ord is the top→bottom band order ENG-558 will sort on.
-        assert!(Readiness::NeedsYou < Readiness::Running);
-        assert!(Readiness::Running < Readiness::Ready);
+        assert!(Readiness::NeedsYou < Readiness::Working);
+        assert!(Readiness::Working < Readiness::Idle);
+        assert!(Readiness::Idle < Readiness::Ready);
         assert!(Readiness::Ready < Readiness::Blocked);
         assert!(Readiness::Blocked < Readiness::Done);
     }
@@ -5289,7 +8235,7 @@ mod tests {
         a.aim_spine("ZAP-188".into());
         a.button();
         assert!(
-            a.pending_launch.contains("ZAP-188"),
+            a.pending_launch.contains_key("ZAP-188"),
             "a ready dispatch launches an agent"
         );
     }
@@ -5334,7 +8280,7 @@ mod tests {
         a.aim_spine("ZAP-188".into()); // a READY issue
         a.button();
         assert!(
-            a.pending_launch.contains("ZAP-188"),
+            a.pending_launch.contains_key("ZAP-188"),
             "a terminal EXITED card must not count toward capacity"
         );
     }
@@ -5342,25 +8288,11 @@ mod tests {
     // ── Subtraction acceptance gate (ENG-563) ────────────────────────────────
 
     #[test]
-    fn the_sort_and_filter_cycles_are_the_collapsed_v17_residual() {
-        // v1.7 is net-smaller by construction: the readiness schedule replaced
-        // the old 5 sorts and the BLOCKED filter. Cycling must return to start in
-        // exactly the residual number of stops — a guard against re-growing them.
-        let mut s = Sort::Readiness;
-        let mut sorts = vec![s];
-        loop {
-            s = s.next();
-            if s == Sort::Readiness {
-                break;
-            }
-            sorts.push(s);
-        }
-        assert_eq!(
-            sorts,
-            vec![Sort::Readiness, Sort::Key],
-            "sorts collapsed to {{readiness, id}}"
-        );
-
+    fn the_filter_cycle_is_the_collapsed_v17_residual() {
+        // v1.7 is net-smaller by construction: the readiness schedule replaced the
+        // old 5 sorts outright (the flat id-sort and its `r` binding are gone) and
+        // collapsed the filters. The filter cycle must return to start in exactly
+        // the residual number of stops — a guard against re-growing them.
         let mut f = Filter::All;
         let mut filters = vec![f];
         loop {
@@ -5375,5 +8307,25 @@ mod tests {
             vec![Filter::All, Filter::HasDeps],
             "filters collapsed to {{all, has-deps}}"
         );
+    }
+
+    #[test]
+    fn spine_paging_clamps_to_the_edges_without_wrapping() {
+        // M3: top/bottom + paging are hard-edged, never the wrapping teleport that
+        // single-step j/k uses, so PageDown at the bottom can't fling you to the top.
+        let mut a = app();
+        assert!(a.order.len() >= 2, "need a multi-row order to page through");
+        let first = a.order.first().unwrap().clone();
+        let last = a.order.last().unwrap().clone();
+
+        a.dispatch_spine(Action::MoveBottom);
+        assert_eq!(a.root, last, "MoveBottom selects the last row");
+        a.dispatch_spine(Action::PageDown);
+        assert_eq!(a.root, last, "PageDown at the bottom does not wrap");
+
+        a.dispatch_spine(Action::MoveTop);
+        assert_eq!(a.root, first, "MoveTop selects the first row");
+        a.dispatch_spine(Action::PageUp);
+        assert_eq!(a.root, first, "PageUp at the top does not wrap");
     }
 }

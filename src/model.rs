@@ -488,6 +488,17 @@ impl Graph {
             .collect()
     }
 
+    /// How many nodes are materialized external blockers — the count the header
+    /// subtracts from [`Self::len`] to match the Spine's issue count, without the
+    /// per-render `Vec` allocation [`Self::externals`] would cost on the hot path.
+    pub fn external_count(&self) -> usize {
+        self.order
+            .iter()
+            .filter_map(|k| self.nodes.get(k))
+            .filter(|i| i.external)
+            .count()
+    }
+
     /// Longest-path layering over the acyclic part of the graph (back-edges
     /// removed). Level 0 holds roots with no real blockers; each subsequent
     /// level sits below its deepest blocker. Returns bands in level order.

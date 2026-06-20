@@ -301,6 +301,70 @@ pub fn push_head(worktree: &Path) -> Result<(), MirrorError> {
     Ok(())
 }
 
+/// Probe — without prompting and without fetching objects — whether `remote` is
+/// reachable and readable. The onboarding wizard calls this *before* it writes a
+/// binding so a bad remote is caught at setup rather than as a silent mirror-clone
+/// failure at the next launch (which the cockpit only reports as "agent control
+/// plane unavailable"). `git ls-remote` lists refs cheaply, under the **same**
+/// `GIT_TERMINAL_PROMPT=0` discipline as the real clone — plus ssh `BatchMode` /
+/// `ConnectTimeout` and a hard wall-clock `timeout` — so it can never stall the
+/// wizard's synchronous terminal on a credential prompt or a black-hole host. A
+/// green result predicts a clone that won't fail on credentials. `Ok(())` on
+/// success; [`MirrorError::Git`] (carrying git's stderr tail, or a "timed out"
+/// note) otherwise.
+pub fn probe_remote(remote: &str, timeout: std::time::Duration) -> Result<(), MirrorError> {
+    let mut child = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // git's own prompt is disabled above; ssh has its own. `BatchMode` makes it
+        // fail instead of asking for a passphrase / host-key, `ConnectTimeout` bounds
+        // a dead host. Harmless for an https remote (no ssh is spawned).
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=8",
+        )
+        // `--` so a remote beginning with `-` is never read as a git option.
+        .args(["ls-remote", "--", remote])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(MirrorError::Spawn)?;
+
+    // Poll rather than block on `wait()`: an https remote pointed at an unroutable
+    // host can outlast even ssh's `ConnectTimeout` (libcurl has no equivalent env),
+    // and the wizard owns the raw terminal — a hang there is unescapable. ls-remote's
+    // stderr is a few lines at most, well under the pipe buffer, so leaving it unread
+    // until the child exits can't deadlock.
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(MirrorError::Stream)? {
+            Some(status) => break status,
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MirrorError::Git {
+                    command: format!("git ls-remote {remote}"),
+                    code: None,
+                    stderr: format!("timed out after {}s", timeout.as_secs()),
+                });
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    Err(MirrorError::Git {
+        command: format!("git ls-remote {remote}"),
+        code: status.code(),
+        stderr: stderr.trim().to_string(),
+    })
+}
+
 // ── staleness, reference-counting & reclaim (ENG-540 / ENG-541) ───────────────
 
 /// How long a freshly-fetched mirror is trusted before another `remote update` is
@@ -647,6 +711,10 @@ fn verify_mirror_source(mirror: &Path, repo: &RepoEntry, source: &str) -> Result
 fn git_clone_streaming(args: &[&str], progress: Option<ProgressFn>) -> Result<(), MirrorError> {
     let mut cmd = Command::new("git");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Bound the dial so an unreachable ssh remote fails fast instead of hanging the
+    // clone; the wall-clock loop below bounds a mid-transfer stall (an https black-hole
+    // that stops sending) that ConnectTimeout can't catch (H5).
+    cmd.env("GIT_SSH_COMMAND", GIT_SSH_HARDENED);
     cmd.args(args);
     // `git clone` writes nothing useful to stdout; the progress meter and every
     // message go to stderr, which we pipe so we can read it incrementally.
@@ -654,6 +722,22 @@ fn git_clone_streaming(args: &[&str], progress: Option<ProgressFn>) -> Result<()
     cmd.stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(MirrorError::Spawn)?;
     let mut stderr = child.stderr.take().expect("stderr piped above");
+    // Poll the stream against a wall-clock cap rather than blocking forever: make the
+    // pipe non-blocking so a stalled transfer yields `WouldBlock` (we then check the
+    // deadline) instead of wedging `read()`. Unix-only; elsewhere we keep blocking.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stderr.as_raw_fd();
+        // SAFETY: `fd` is the live, owned read end of the child's stderr pipe.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags != -1 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+    }
+    let clone_start = std::time::Instant::now();
 
     // Last `(phase, percent)` surfaced, so we emit only on a real change (git
     // repaints the same percent many times a second). Last few `\n`-terminated
@@ -697,6 +781,24 @@ fn git_clone_streaming(args: &[&str], progress: Option<ProgressFn>) -> Result<()
             // A signal interrupting the read isn't a clone failure — retry, exactly
             // as std's own `read_to_end` (the old `Command::output()` path) did.
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // Non-blocking pipe with nothing ready: a healthy clone is just mid-compute,
+            // a dead one is stalled — so check the wall-clock cap, then nap and retry.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if clone_start.elapsed() >= GIT_NET_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(MirrorError::Git {
+                        command: format!("git {}", args.join(" ")),
+                        code: None,
+                        stderr: format!(
+                            "timed out after {}s — remote not responding",
+                            GIT_NET_TIMEOUT.as_secs()
+                        ),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
             // A real read error abandons the clone: kill + reap the child first so we
             // don't leave a zombie/orphan git holding the half-built `*.partial` dir.
             Err(e) => {
@@ -727,7 +829,30 @@ fn git_clone_streaming(args: &[&str], progress: Option<ProgressFn>) -> Result<()
     // A trailing fragment with no final newline (rare) is still error context.
     handle_segment(&seg, true);
 
-    let status = child.wait().map_err(MirrorError::Stream)?;
+    // A stall DURING the clone is already caught by the read loop's WouldBlock
+    // wall-clock cap above. This bounds the narrower window AFTER git closes stderr
+    // (EOF) but BEFORE it exits — a post-close repack/checkout that wedges — so the
+    // final reap can't block forever (CF-7).
+    let status = loop {
+        match child.try_wait().map_err(MirrorError::Stream)? {
+            Some(status) => break status,
+            None => {
+                if clone_start.elapsed() >= GIT_NET_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(MirrorError::Git {
+                        command: format!("git {}", args.join(" ")),
+                        code: None,
+                        stderr: format!(
+                            "timed out after {}s — clone stalled before exit",
+                            GIT_NET_TIMEOUT.as_secs()
+                        ),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
     if !status.success() {
         return Err(MirrorError::Git {
             command: format!("git {}", args.join(" ")),
@@ -760,23 +885,95 @@ fn parse_clone_progress(raw: &str) -> Option<(String, u8)> {
 }
 
 /// Run `git <args>` (optionally `-C <cwd>`), returning stdout on success.
+/// Wall-clock cap for a network git op (push / fetch / clone). Long enough for a
+/// slow-but-progressing transfer, bounded so a black-holed remote can't hang the
+/// cockpit — and every project queued behind it — forever (H5).
+const GIT_NET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// ssh hardening shared with [`probe_remote`]: `BatchMode` fails instead of prompting
+/// for a passphrase / host-key, `ConnectTimeout` bounds a dead host on the dial. Inert
+/// for an https remote (no ssh is spawned).
+const GIT_SSH_HARDENED: &str = "ssh -o BatchMode=yes -o ConnectTimeout=8";
+
 fn git(args: &[&str], cwd: Option<&Path>) -> Result<String, MirrorError> {
-    let mut cmd = Command::new("git");
+    git_inner("git", args, cwd, GIT_NET_TIMEOUT)
+}
+
+/// The drain + reap engine behind [`git`], with the program and wall-clock cap injected
+/// so tests can exercise the >64KB pipe-drain and the timeout/kill path deterministically
+/// (NEW-09 / H5) without a real hung remote. Production always calls it with `"git"` and
+/// `GIT_NET_TIMEOUT`.
+fn git_inner(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout: std::time::Duration,
+) -> Result<String, MirrorError> {
+    let mut cmd = Command::new(program);
     if let Some(cwd) = cwd {
         cmd.arg("-C").arg(cwd);
     }
-    // Never let git block on a credential or host-key prompt — fail fast instead.
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.args(args);
-    let output = cmd.output().map_err(MirrorError::Spawn)?;
-    if !output.status.success() {
+    // Never let git block on a credential / host-key prompt, and bound the dial so an
+    // unreachable remote on a push/fetch fails as an Err the caller can report instead
+    // of hanging the worktree command loop forever (H5). Drain stdout/stderr while the
+    // child runs; even commands expected to be small can become verbose on auth/network
+    // failures, and a full pipe would deadlock if we waited before reading it.
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", GIT_SSH_HARDENED)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(MirrorError::Spawn)?;
+    let mut stdout_pipe = child.stdout.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut stdout = String::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_string(&mut stdout);
+        }
+        stdout
+    });
+    let mut stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = stderr_pipe.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        stderr
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(MirrorError::Stream)? {
+            Some(status) => break status,
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_handle.join();
+                let stderr = stderr_handle.join().unwrap_or_default();
+                let detail = stderr.trim();
+                return Err(MirrorError::Git {
+                    command: format!("git {}", args.join(" ")),
+                    code: None,
+                    stderr: if detail.is_empty() {
+                        format!("timed out after {}s", timeout.as_secs())
+                    } else {
+                        format!("timed out after {}s: {detail}", timeout.as_secs())
+                    },
+                });
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    if !status.success() {
         return Err(MirrorError::Git {
             command: format!("git {}", args.join(" ")),
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            code: status.code(),
+            stderr: stderr.trim().to_string(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(stdout)
 }
 
 /// A cross-process advisory lock held for the lifetime of the guard. On Unix it is
@@ -935,6 +1132,48 @@ mod tests {
             handle: handle.to_string(),
             remote: Some(remote.to_string_lossy().into_owned()),
             local: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_inner_drains_a_large_pipe_without_deadlocking() {
+        // NEW-09 / H5: stdout is drained on a dedicated thread concurrently with the
+        // try_wait loop, so a child that fills the OS pipe buffer (>64 KiB) can't deadlock
+        // against a wait-before-read. `cat` of a large file is a binary-agnostic stand-in
+        // for a verbose git op — the drain logic doesn't care which program ran.
+        let dir = std::env::temp_dir().join(format!("lindep-git-drain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.txt");
+        let payload = "x".repeat(256 * 1024); // 256 KiB >> the ~64 KiB pipe buffer
+        std::fs::write(&big, &payload).unwrap();
+        let out = git_inner("cat", &[big.to_str().unwrap()], None, GIT_NET_TIMEOUT).unwrap();
+        assert_eq!(
+            out.len(),
+            payload.len(),
+            "the full large output is drained — no deadlock, no truncation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_inner_kills_and_reports_a_child_that_runs_past_the_timeout() {
+        // NEW-09 / H5: a black-holed / hung child must be killed at the wall-clock cap and
+        // reported as an error, never wedge the worktree command loop. `sleep` is a
+        // deterministic stand-in for a stalled git that emits nothing and never exits.
+        let start = std::time::Instant::now();
+        let err = git_inner("sleep", &["30"], None, std::time::Duration::from_millis(200))
+            .expect_err("a child that outlives the cap must error, not hang");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the cap fired promptly — the child was killed, not waited out"
+        );
+        match err {
+            MirrorError::Git { stderr, .. } => {
+                assert!(stderr.contains("timed out"), "reports a timeout, got {stderr:?}");
+            }
+            other => panic!("expected a timeout MirrorError::Git, got {other:?}"),
         }
     }
 

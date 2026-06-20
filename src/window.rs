@@ -112,14 +112,6 @@ pub enum LayoutMode {
 }
 
 impl LayoutMode {
-    /// The other layout — for the `|` toggle.
-    pub const fn toggled(self) -> Self {
-        match self {
-            LayoutMode::Rail => LayoutMode::Mosaic,
-            LayoutMode::Mosaic => LayoutMode::Rail,
-        }
-    }
-
     pub const fn label(self) -> &'static str {
         match self {
             LayoutMode::Rail => "rail",
@@ -244,6 +236,36 @@ impl DepsCursor {
             DepsSide::Down => (&self.down_rows, &mut self.down_state),
         };
         move_state(state, rows.len(), delta);
+    }
+
+    /// Jump the active tree's selection to its first (`to_end=false`) or last row,
+    /// clamped, never wrapping — the deps half of the top/bottom jumps (M3).
+    pub fn move_to_edge(&mut self, to_end: bool) {
+        let (rows, state) = match self.side {
+            DepsSide::Up => (&self.up_rows, &mut self.up_state),
+            DepsSide::Down => (&self.down_rows, &mut self.down_state),
+        };
+        if rows.is_empty() {
+            state.select(None);
+        } else {
+            state.select(Some(if to_end { rows.len() - 1 } else { 0 }));
+        }
+    }
+
+    /// Page the active tree's selection by `delta` rows, clamped (no wrap) — the
+    /// deps half of paging (M3).
+    pub fn page(&mut self, delta: i32) {
+        let (rows, state) = match self.side {
+            DepsSide::Up => (&self.up_rows, &mut self.up_state),
+            DepsSide::Down => (&self.down_rows, &mut self.down_state),
+        };
+        if rows.is_empty() {
+            state.select(None);
+            return;
+        }
+        let cur = state.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, rows.len() as i32 - 1) as usize;
+        state.select(Some(next));
     }
 
     /// Flip the active tree (upstream ↔ downstream).
@@ -677,8 +699,12 @@ impl WindowSet {
 
     /// Jump focus straight home to the Spine in one hop — the dedicated
     /// "back to nav" gesture (so you never step through the deps pane to return).
+    /// Clears zoom too: a zoomed coin hides the Spine entirely, so "back to nav"
+    /// while zoomed would otherwise be a silent no-op that leaves the Spine
+    /// off-screen while direct keys route to it blind (M1).
     pub fn focus_nav(&mut self) {
         self.focus = 0;
+        self.zoomed = false;
     }
 
     /// Non-destructive zoom toggle: the big pane fills the whole viewport. Zoom
@@ -718,11 +744,36 @@ impl WindowSet {
         self.layout = Self::auto_layout(self.docked_count());
     }
 
-    /// Force a layout mode (the `Ctrl-a |` override), suppressing auto-recompute
-    /// for the rest of the session.
+    /// Force a layout mode (a step of the `Ctrl-a |` cycle), suppressing
+    /// auto-recompute until the cycle returns to auto.
     pub fn force_layout(&mut self, layout: LayoutMode) {
         self.layout = layout;
         self.layout_manual = true;
+    }
+
+    /// Cycle the layout tri-state: auto → rail → mosaic → auto (M2). The auto step
+    /// re-enables count-driven recompute (so docking more coins flips rail⇄mosaic on
+    /// its own again); the forced steps pin a mode for the session. Without the
+    /// return-to-auto step, one tap of `|` permanently disabled the adaptive layout.
+    pub fn cycle_layout(&mut self) {
+        if !self.layout_manual {
+            self.force_layout(LayoutMode::Rail);
+        } else if self.layout == LayoutMode::Rail {
+            self.force_layout(LayoutMode::Mosaic);
+        } else {
+            self.layout_manual = false;
+            self.refresh_layout();
+        }
+    }
+
+    /// The live layout state for the footer/help: `auto (mosaic)` vs `rail (manual)`,
+    /// so the user can tell whether the adaptive layout is on.
+    pub fn layout_label(&self) -> String {
+        if self.layout_manual {
+            format!("{} (manual)", self.layout.label())
+        } else {
+            format!("auto ({})", self.layout.label())
+        }
     }
 }
 
@@ -870,6 +921,29 @@ mod tests {
         assert!(matches!(ws.focused_kind(), WindowKind::Spine));
         assert_eq!(ws.focus, 0);
         assert!(ws.focused().pinned, "the spine is always pinned");
+    }
+
+    #[test]
+    fn layout_cycle_is_tri_state_auto_rail_mosaic_auto() {
+        // M2: `Ctrl-a |` cycles through three states, returning to auto — so a peek
+        // never permanently disables the count-driven layout.
+        let mut ws = WindowSet::new();
+        assert!(!ws.layout_manual, "starts in auto");
+        ws.cycle_layout();
+        assert!(
+            ws.layout_manual && ws.layout == LayoutMode::Rail,
+            "auto → rail"
+        );
+        ws.cycle_layout();
+        assert!(
+            ws.layout_manual && ws.layout == LayoutMode::Mosaic,
+            "rail → mosaic"
+        );
+        ws.cycle_layout();
+        assert!(
+            !ws.layout_manual,
+            "mosaic → auto (adaptive layout restored)"
+        );
     }
 
     #[test]

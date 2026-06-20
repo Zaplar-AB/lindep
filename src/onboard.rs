@@ -54,16 +54,24 @@ pub fn run(project: &ProjectRef, registry: &registry::Registry) -> io::Result<bo
 /// applies on the next launch — the running workspace keeps its current binding for
 /// this session (re-rooting a live worktree manager mid-flight isn't safe), so the
 /// footer says so. Owns its own alternate screen; the caller suspends the cockpit's.
-pub fn run_for_project(project: &ProjectRef) -> io::Result<String> {
+pub fn run_for_project(project: &ProjectRef) -> io::Result<(String, bool)> {
     let (registry, _warnings) = registry::Registry::load();
     let mut wizard = Wizard::for_project(project.clone(), &registry);
     let mut terminal = ratatui::init();
     let result = run_loop(&mut terminal, &mut wizard);
     ratatui::restore();
-    Ok(if result? {
-        "saved to ~/.lindep/registry.toml — restart lindep to apply".to_string()
+    // Returns (footer, wrote-changes); the caller raises a standing "restart to apply"
+    // chip when the second element is true.
+    Ok(if result? && wizard.wrote {
+        (
+            "saved to ~/.lindep/registry.toml — restart lindep to apply".to_string(),
+            true,
+        )
     } else {
-        "configuration unchanged".to_string()
+        // Cancelled, or completed but nothing actually differed from the existing
+        // binding — either way the on-disk config is unchanged, so don't nudge a
+        // pointless restart.
+        ("configuration unchanged".to_string(), false)
     })
 }
 
@@ -149,7 +157,9 @@ impl ScratchForm {
             return Err("scratch name must be a safe handle (letters, digits, - _ .)".into());
         }
         if self.provision.trim().is_empty() {
-            return Err("scratch needs a provision command".into());
+            // Point at the exit, not just the missing field: the step is optional, so a
+            // user who typed a name then changed their mind needs to know how to bail.
+            return Err("add a provision command, or clear the name (backspace) to skip".into());
         }
         let mut env = std::collections::BTreeMap::new();
         for tok in self.env.split_whitespace() {
@@ -193,12 +203,33 @@ pub struct Wizard {
     input: String,
     /// Cursor over [`Self::repos`] on the primary-select step.
     primary: ListState,
+    /// Cursor over [`Self::registered_repos`] for the reuse picker on the Repos step.
+    existing: ListState,
     branch_prefix: String,
     /// Scratch datastores collected so far, and the in-progress entry.
     scratch: Vec<ScratchDraft>,
     scratch_form: ScratchForm,
+    /// Whether the user opted into the dense 7-field scratch form. Until they do (and
+    /// with no entries yet) the step shows a one-line "skip / press s to add" so it
+    /// isn't a wall of infra config between a first-timer and the Confirm step.
+    scratch_opt_in: bool,
     /// A transient message shown under the body (a bad input, a write failure).
     error: Option<String>,
+    /// Checks each new remote is reachable before [`Step::Confirm`] writes it (see
+    /// [`RemoteProbe`]). Defaults to the real `git ls-remote` probe; tests swap a stub.
+    probe: RemoteProbe,
+    /// Set once the user has been warned a remote is unreachable and chose to write
+    /// anyway — a second Enter on [`Step::Confirm`] then commits. Reset whenever the
+    /// repo set changes so a newly-added bad remote re-warns.
+    acknowledged_unreachable: bool,
+    /// First-Esc-on-Repos guard: every other step's Esc steps back, but Repos is the
+    /// first step, so its Esc tears down the whole wizard. Warn once, then a second
+    /// consecutive Esc confirms — so a back-walk reflex can't discard setup unprompted.
+    cancel_armed: bool,
+    /// Whether the Confirm step actually wrote registry.toml (vs a no-op write that
+    /// changed nothing). Lets the re-config footer say "configuration unchanged"
+    /// instead of nudging a needless restart when nothing differed.
+    wrote: bool,
 }
 
 impl Wizard {
@@ -218,10 +249,16 @@ impl Wizard {
             repos: Vec::new(),
             input: String::new(),
             primary: ListState::default(),
+            existing: ListState::default(),
             branch_prefix: String::new(),
             scratch: Vec::new(),
             scratch_form: ScratchForm::default(),
+            scratch_opt_in: false,
             error: None,
+            probe: default_remote_probe,
+            acknowledged_unreachable: false,
+            cancel_armed: false,
+            wrote: false,
         }
     }
 
@@ -334,6 +371,18 @@ impl Wizard {
                 label: input.to_string(),
             });
         }
+        // It looks like a path the user meant (tilde / dot / a separator) but no dir is
+        // there — name *that* (a typo to fix), not the generic "not a path/URL/repo".
+        if input.starts_with('~')
+            || input.starts_with('.')
+            || input.starts_with('/')
+            || input.contains(std::path::MAIN_SEPARATOR)
+        {
+            return Err(format!(
+                "no directory at {} — check the path",
+                expanded.display()
+            ));
+        }
         Err("not a directory, a URL, or a registered repo — give a path or remote URL".into())
     }
 
@@ -350,6 +399,9 @@ impl Wizard {
                     self.repos.push(row);
                     self.input.clear();
                     self.error = None;
+                    // The set changed: a newly-added remote must be re-checked, so a
+                    // prior "write anyway" acknowledgement no longer covers it.
+                    self.acknowledged_unreachable = false;
                 }
             }
             Err(e) => self.error = Some(e),
@@ -376,6 +428,25 @@ impl Wizard {
         move_state(&mut self.primary, self.repos.len(), delta);
     }
 
+    fn existing_move(&mut self, delta: i32) {
+        move_state(&mut self.existing, self.registered_repos.len(), delta);
+    }
+
+    /// Add the reuse-picker's current selection as a candidate for this project
+    /// (reuse — no new `[[repo]]` block, since the same repos serve many projects).
+    /// Funnels through [`Self::add_repo`] so dedup, the "already added" error, and
+    /// the unreachable-ack reset all share one path.
+    fn add_existing(&mut self) {
+        if self.registered_repos.is_empty() {
+            return;
+        }
+        let i = self.existing.selected().unwrap_or(0);
+        if let Some(handle) = self.registered_repos.get(i).cloned() {
+            self.input = handle;
+            self.add_repo();
+        }
+    }
+
     /// Leave the branch-prefix step. An empty prefix is fine — it falls back to
     /// `$USER`/`lindep` at launch (see [`crate::worktree::default_branch_prefix`]) —
     /// but a non-empty one must be a valid git ref segment, or `git worktree add -b
@@ -397,6 +468,12 @@ impl Wizard {
 
     /// Add the in-progress scratch entry to the list (validated), then reset the form;
     /// a bad entry sets the footer error instead. A no-op when the name is blank.
+    /// Whether the scratch step shows the full form (opted in, or already has
+    /// entries) rather than the one-line opt-in prompt.
+    fn scratch_showing_form(&self) -> bool {
+        self.scratch_opt_in || !self.scratch.is_empty()
+    }
+
     fn add_scratch(&mut self) {
         if self.scratch_form.name.trim().is_empty() {
             return;
@@ -464,6 +541,48 @@ impl Wizard {
     fn new_repos(&self) -> Vec<RepoDraft> {
         self.repos.iter().filter_map(|r| r.draft.clone()).collect()
     }
+
+    /// The remotes this binding will newly clone, as `(handle, url)`. Reused repos
+    /// (no draft) and local-only repos (no remote) contribute none — and a local
+    /// repo *with* an origin is included, because `mirror_source` prefers the remote
+    /// over the local path, so the remote is exactly what the boot clone will fetch.
+    fn remotes_to_check(&self) -> Vec<(String, String)> {
+        self.repos
+            .iter()
+            .filter_map(|r| Some((r.handle.clone(), r.draft.as_ref()?.remote.clone()?)))
+            .collect()
+    }
+
+    /// Probe every [`Self::remotes_to_check`] remote, returning the unreachable ones
+    /// as `(handle, reason)`. Empty when all are reachable (or there are none).
+    fn unreachable_remotes(&self) -> Vec<(String, String)> {
+        // Short-circuit on the FIRST unreachable remote (NEW-12). The Confirm footer
+        // only surfaces the first reason and `acknowledged_unreachable` arms off any
+        // single failure, so probing the rest adds no signal — it only multiplies the
+        // freeze (each probe runs to its per-remote cap, serially, on the event
+        // thread). Returning a 1-element Vec caps the worst-case wait at one probe.
+        for (handle, url) in self.remotes_to_check() {
+            if let Err(reason) = (self.probe)(&url) {
+                return vec![(handle, reason)];
+            }
+        }
+        Vec::new()
+    }
+}
+
+/// A one-line [`Step::Confirm`] footer naming the unreachable remote(s) and the
+/// first failure reason, and telling the user that a second Enter writes anyway.
+fn unreachable_warning(bad: &[(String, String)]) -> String {
+    let reason = bad
+        .first()
+        .map(|(_, r)| r.as_str())
+        .unwrap_or("unreachable");
+    let names = bad
+        .iter()
+        .map(|(h, _)| h.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("can't reach {names}: {reason} — ⏎ writes it anyway, esc to fix")
 }
 
 /// Whether `s` looks like a git remote rather than a bare word — so a typo doesn't
@@ -486,6 +605,32 @@ fn expand_tilde(raw: &str) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     PathBuf::from(raw)
+}
+
+/// How a repo's remote is checked for reachability before the wizard writes it.
+/// A plain fn pointer (not a capturing closure) so the [`Wizard`] stays a simple
+/// value and tests can swap in a deterministic stub with no network. `Ok(())` if
+/// the remote is reachable; `Err(reason)` — a short, footer-ready message — if not.
+type RemoteProbe = fn(&str) -> Result<(), String>;
+
+/// The production [`RemoteProbe`]: a bounded, non-interactive `git ls-remote`
+/// ([`crate::mirror::probe_remote`]) reduced to a concise reason for the footer.
+/// The wizard owns the raw terminal, so the probe is hard-capped and can never
+/// hang it. The single most actionable line of git's stderr is surfaced — for a
+/// private https remote that's `could not read Username for 'https://…'`.
+fn default_remote_probe(remote: &str) -> Result<(), String> {
+    // 8s matches ssh's ConnectTimeout — a reachability ping doesn't need 12s, and on
+    // the wizard's event thread every second is a frozen screen (NEW-12).
+    crate::mirror::probe_remote(remote, std::time::Duration::from_secs(8)).map_err(|e| match e {
+        crate::mirror::MirrorError::Git { stderr, .. } if !stderr.trim().is_empty() => stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("unreachable")
+            .to_string(),
+        other => other.to_string(),
+    })
 }
 
 /// The `origin` remote URL of a git clone, or `None` if it isn't a repo or has no
@@ -520,17 +665,45 @@ fn run_loop(terminal: &mut DefaultTerminal, wizard: &mut Wizard) -> io::Result<b
             return Ok(false);
         }
         match wizard.step {
-            Step::Repos => match key.code {
-                KeyCode::Esc => return Ok(false),
-                // Enter on a filled field adds the repo; on an empty field it advances.
-                KeyCode::Enter if wizard.input.trim().is_empty() => wizard.advance_from_repos(),
-                KeyCode::Enter => wizard.add_repo(),
-                KeyCode::Backspace => {
-                    wizard.input.pop();
+            Step::Repos => {
+                // Any key other than the arming Esc clears the cancel guard, so the
+                // confirm must be two *consecutive* Esc presses — and clears the stale
+                // "esc again to cancel setup" warning so it doesn't linger as a lie once
+                // the guard is gone.
+                if key.code != KeyCode::Esc {
+                    if wizard.cancel_armed {
+                        wizard.error = None;
+                    }
+                    wizard.cancel_armed = false;
                 }
-                KeyCode::Char(c) if !ctrl && !alt => wizard.input.push(c),
-                _ => {}
-            },
+                match key.code {
+                    // Repos is the first step, so Esc tears down the whole wizard
+                    // (every other step's Esc steps back). Guard it: warn once, then a
+                    // second consecutive Esc confirms the teardown.
+                    KeyCode::Esc => {
+                        if wizard.cancel_armed {
+                            return Ok(false);
+                        }
+                        wizard.cancel_armed = true;
+                        wizard.error = Some("esc again to cancel setup".into());
+                    }
+                    // Enter on a filled field adds the repo; on an empty field advances.
+                    KeyCode::Enter if wizard.input.trim().is_empty() => {
+                        wizard.advance_from_repos();
+                    }
+                    KeyCode::Enter => wizard.add_repo(),
+                    // The reuse picker: ↑↓ move over registered repos, Tab adds the
+                    // highlighted one as a candidate (only meaningful when some exist).
+                    KeyCode::Up => wizard.existing_move(-1),
+                    KeyCode::Down => wizard.existing_move(1),
+                    KeyCode::Tab => wizard.add_existing(),
+                    KeyCode::Backspace => {
+                        wizard.input.pop();
+                    }
+                    KeyCode::Char(c) if !ctrl && !alt => wizard.input.push(c),
+                    _ => {}
+                }
+            }
             Step::Primary => match key.code {
                 KeyCode::Esc => wizard.step = Step::Repos,
                 KeyCode::Up => wizard.primary_move(-1),
@@ -553,6 +726,16 @@ fn run_loop(terminal: &mut DefaultTerminal, wizard: &mut Wizard) -> io::Result<b
                 KeyCode::Char(c) if !ctrl && !alt => wizard.branch_prefix.push(c),
                 _ => {}
             },
+            Step::Scratch if !wizard.scratch_showing_form() => match key.code {
+                // The dense 7-field form is opt-in so it isn't a wall before Confirm.
+                KeyCode::Esc => wizard.step = Step::BranchPrefix,
+                KeyCode::Char('s') if !ctrl && !alt => wizard.scratch_opt_in = true,
+                KeyCode::Enter => {
+                    wizard.error = None;
+                    wizard.step = Step::Confirm;
+                }
+                _ => {}
+            },
             Step::Scratch => match key.code {
                 KeyCode::Esc => wizard.step = Step::BranchPrefix,
                 KeyCode::Up => wizard.scratch_form.move_focus(-1),
@@ -569,15 +752,39 @@ fn run_loop(terminal: &mut DefaultTerminal, wizard: &mut Wizard) -> io::Result<b
                 _ => {}
             },
             Step::Confirm => match key.code {
-                KeyCode::Esc => wizard.step = Step::Scratch,
+                KeyCode::Esc => {
+                    // Re-check on the next visit — they may go back and change repos.
+                    wizard.acknowledged_unreachable = false;
+                    wizard.step = Step::Scratch;
+                }
                 KeyCode::Enter => {
+                    // Catch an unreachable remote HERE, at setup, instead of writing a
+                    // binding that only fails as a silent mirror-clone error at the next
+                    // launch ("agent control plane unavailable"). Offline / credentials-
+                    // later is legitimate, so warn once and let a second Enter commit.
+                    if !wizard.acknowledged_unreachable && !wizard.remotes_to_check().is_empty() {
+                        wizard.error = Some("checking remotes…".into());
+                        terminal.draw(|frame| draw(wizard, frame))?;
+                        let unreachable = wizard.unreachable_remotes();
+                        if !unreachable.is_empty() {
+                            wizard.acknowledged_unreachable = true;
+                            wizard.error = Some(unreachable_warning(&unreachable));
+                            continue;
+                        }
+                        wizard.error = None;
+                    }
                     match registry::write_binding(
                         &wizard.layout,
                         &wizard.new_repos(),
                         &wizard.project_draft(),
                         &wizard.scratch,
                     ) {
-                        Ok(()) => return Ok(true),
+                        // `wrote` is false when the binding was byte-identical (no-op),
+                        // so the re-config footer can say "configuration unchanged".
+                        Ok(wrote) => {
+                            wizard.wrote = wrote;
+                            return Ok(true);
+                        }
                         // A write failure stays in the wizard so the user can retry or
                         // cancel rather than crashing out of the cockpit launch.
                         Err(e) => wizard.error = Some(e.to_string()),
@@ -604,7 +811,7 @@ fn draw(wizard: &mut Wizard, frame: &mut Frame) {
         Span::styled(wizard.project.name.clone(), Style::new().fg(INK).bold()),
     ]);
     let step_no = match wizard.step {
-        Step::Repos => "1 · repos",
+        Step::Repos => "1 · repos — the repo agents work in · esc = just view the graph",
         Step::Primary => "2 · primary repo",
         Step::BranchPrefix => "3 · branch prefix (optional)",
         Step::Scratch => "4 · scratch datastores (optional)",
@@ -618,12 +825,20 @@ fn draw(wizard: &mut Wizard, frame: &mut Frame) {
         header,
     );
 
-    let hint_text = match wizard.step {
-        Step::Repos => " type a path or remote URL · ⏎ add · ⏎ on empty → next · esc cancel",
-        Step::Primary => " ↑↓ move · ⏎ choose primary · esc back",
-        Step::BranchPrefix => " type a prefix · ⏎ accept (empty = default) · esc back",
-        Step::Scratch => " ↑↓ field · type/space edit · ⏎ add · ⏎ on empty → next · esc back",
-        Step::Confirm => " ⏎ write to ~/.lindep/registry.toml · esc back",
+    let hint_text: String = match wizard.step {
+        Step::Repos if wizard.registered_repos.is_empty() => {
+            " type a path or remote URL · ⏎ add · ⏎ on empty → next · esc cancel".into()
+        }
+        Step::Repos => " path/URL · ⏎ add · ↑↓+tab reuse a repo · ⏎ empty → next · esc".into(),
+        Step::Primary => " ↑↓ move · ⏎ choose primary · esc back".into(),
+        Step::BranchPrefix => " type a prefix · ⏎ accept (empty = default) · esc back".into(),
+        Step::Scratch if !wizard.scratch_showing_form() => {
+            " ⏎ skip (most projects do) · s add a datastore · esc back".into()
+        }
+        Step::Scratch => {
+            " ↑↓ field · type/space edit · ⏎ add · ⏎ on empty → next · esc back".into()
+        }
+        Step::Confirm => " ⏎ write to ~/.lindep/registry.toml · esc back".into(),
     };
 
     match wizard.step {
@@ -660,24 +875,34 @@ fn framed(title: &str) -> Block<'_> {
         )))
 }
 
-fn draw_repos(wizard: &Wizard, frame: &mut Frame, area: Rect) {
+fn draw_repos(wizard: &mut Wizard, frame: &mut Frame, area: Rect) {
     let block = framed("REPOS");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [field, list, reuse] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
+    // A first-ever run (no registry yet) shows just the field + the chosen list; once
+    // repos are registered, a navigable reuse picker takes a bounded area at the bottom
+    // so the same repo can join many projects without re-typing its remote.
+    let has_existing = !wizard.registered_repos.is_empty();
+    let chunks = if has_existing {
+        let pick_h = (wizard.registered_repos.len() as u16).clamp(1, 5);
+        Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(pick_h),
+        ])
+        .split(inner)
+    } else {
+        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inner)
+    };
 
     let field_line = Line::from(vec![
         Span::styled(" repo ", Style::new().fg(GREEN_400)),
         Span::styled(wizard.input.clone(), Style::new().fg(INK)),
         Span::styled("▏", Style::new().fg(GREEN_500)),
     ]);
-    frame.render_widget(Paragraph::new(field_line), field);
+    frame.render_widget(Paragraph::new(field_line), chunks[0]);
 
     let items: Vec<ListItem> = if wizard.repos.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
@@ -697,19 +922,48 @@ fn draw_repos(wizard: &Wizard, frame: &mut Frame, area: Rect) {
             })
             .collect()
     };
-    frame.render_widget(List::new(items), list);
+    frame.render_widget(List::new(items), chunks[1]);
 
-    if !wizard.registered_repos.is_empty() {
+    if has_existing {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!(
-                    " reuse a registered repo: {}",
-                    wizard.registered_repos.join(", ")
-                ),
+                " reuse a registered repo (↑↓ · tab adds):",
                 Style::new().fg(MUTED),
             ))),
-            reuse,
+            chunks[2],
         );
+        // Mark handles already chosen so re-picking reads as obviously redundant.
+        let already: std::collections::HashSet<&str> =
+            wizard.repos.iter().map(|r| r.handle.as_str()).collect();
+        let picks: Vec<ListItem> = wizard
+            .registered_repos
+            .iter()
+            .map(|h| {
+                let added = already.contains(h.as_str());
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        h.clone(),
+                        if added {
+                            Style::new().fg(GREEN_500)
+                        } else {
+                            Style::new().fg(INK)
+                        },
+                    ),
+                    Span::styled(
+                        if added { "  ✓ added" } else { "" },
+                        Style::new().fg(GREEN_500),
+                    ),
+                ]))
+            })
+            .collect();
+        if wizard.existing.selected().is_none() {
+            wizard.existing.select(Some(0));
+        }
+        let picker = List::new(picks)
+            .highlight_symbol("▸ ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(theme::cursor_active());
+        frame.render_stateful_widget(picker, chunks[3], &mut wizard.existing);
     }
 }
 
@@ -760,6 +1014,34 @@ fn draw_scratch(wizard: &Wizard, frame: &mut Frame, area: Rect) {
     let block = framed("SCRATCH DATASTORES");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // Opt-in: until the user asks for the form (or has entries already), show a short
+    // explanation + the two exits, not the dense 7-field grid.
+    if !wizard.scratch_showing_form() {
+        let lines = vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                "  Optional: per-issue scratch datastores — a throwaway DB / cache per",
+                Style::new().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "  agent, provisioned at launch and torn down at discard. Most projects",
+                Style::new().fg(MUTED),
+            )),
+            Line::from(Span::styled("  don't need them.", Style::new().fg(MUTED))),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("  ⏎ ", Style::new().fg(GREEN_400).bold()),
+                Span::styled("skip", Style::new().fg(INK)),
+                Span::styled("     s ", Style::new().fg(GREEN_400).bold()),
+                Span::styled("add one", Style::new().fg(INK)),
+                Span::styled("     esc ", Style::new().fg(GREEN_400).bold()),
+                Span::styled("back", Style::new().fg(INK)),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
 
     let [added, form] = Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(inner);
 
@@ -930,6 +1212,29 @@ mod tests {
     }
 
     #[test]
+    fn picking_a_registered_repo_adds_it_as_a_candidate_only() {
+        // CF-18: reuse an already-registered repo for this project without re-typing
+        // its remote — and write no second [[repo]] block (candidate only).
+        let mut w = wizard(&["shared"], &[]);
+        w.add_existing();
+        assert_eq!(w.repos.len(), 1);
+        assert_eq!(w.repos[0].handle, "shared");
+        assert!(
+            w.repos[0].draft.is_none(),
+            "a reused repo writes no new [[repo]]"
+        );
+    }
+
+    #[test]
+    fn picking_an_already_added_registered_repo_is_refused() {
+        let mut w = wizard(&["shared"], &[]);
+        w.add_existing();
+        w.add_existing();
+        assert_eq!(w.repos.len(), 1, "no duplicate candidate");
+        assert!(w.error.is_some(), "re-picking warns it's already added");
+    }
+
+    #[test]
     fn advancing_with_one_repo_skips_the_primary_step() {
         let mut w = wizard(&[], &[]);
         w.input = "git@github.com:zaplar/core-pms.git".into();
@@ -995,6 +1300,114 @@ mod tests {
     }
 
     #[test]
+    fn remotes_to_check_skips_reused_and_local_only_repos() {
+        let mut w = wizard(&["shared"], &[]);
+        // A freshly-added remote repo → checked.
+        w.input = "git@github.com:zaplar/core.git".into();
+        w.add_repo();
+        // A reused (already-registered) repo → no draft → not checked.
+        w.input = "shared".into();
+        w.add_repo();
+        // A local-only repo (a draft with no remote) → nothing to clone → not checked.
+        w.repos.push(RepoRow {
+            handle: "localthing".into(),
+            draft: Some(RepoDraft {
+                handle: "localthing".into(),
+                remote: None,
+                local: Some("/tmp/localthing".into()),
+            }),
+            label: "local-only".into(),
+        });
+        let to_check = w.remotes_to_check();
+        assert_eq!(to_check.len(), 1, "only the new remote repo is probed");
+        assert_eq!(to_check[0].0, "core");
+        assert_eq!(to_check[0].1, "git@github.com:zaplar/core.git");
+    }
+
+    #[test]
+    fn unreachable_remotes_uses_the_injected_probe() {
+        let mut w = wizard(&[], &[]);
+        w.input = "git@github.com:zaplar/reachable.git".into();
+        w.add_repo();
+        w.input = "git@github.com:zaplar/unreachable.git".into();
+        w.add_repo();
+        // Stub probe (non-capturing → coerces to the fn pointer): only the
+        // "unreachable" remote fails, exercising the wizard's logic without a network.
+        w.probe = |remote| {
+            if remote.contains("unreachable") {
+                Err("could not read Username".into())
+            } else {
+                Ok(())
+            }
+        };
+        let bad = w.unreachable_remotes();
+        assert_eq!(bad.len(), 1, "only the unreachable remote is reported");
+        assert_eq!(bad[0].0, "unreachable");
+        assert!(
+            bad[0].1.contains("Username"),
+            "the probe's reason is carried"
+        );
+    }
+
+    #[test]
+    fn unreachable_remotes_short_circuits_on_the_first_failure() {
+        // NEW-12: with several unreachable remotes the wizard must NOT probe them all
+        // serially (each runs to its per-remote cap — a multi-second-per-remote freeze
+        // on the event thread). It stops at the first failure and reports just that one.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static PROBES: AtomicUsize = AtomicUsize::new(0);
+        PROBES.store(0, Ordering::SeqCst);
+        let mut w = wizard(&[], &[]);
+        w.input = "git@github.com:zaplar/alpha.git".into();
+        w.add_repo();
+        w.input = "git@github.com:zaplar/beta.git".into();
+        w.add_repo();
+        w.probe = |_remote| {
+            PROBES.fetch_add(1, Ordering::SeqCst);
+            Err("could not read Username".into())
+        };
+        let bad = w.unreachable_remotes();
+        assert_eq!(bad.len(), 1, "only the first unreachable remote is reported");
+        assert_eq!(
+            PROBES.load(Ordering::SeqCst),
+            1,
+            "probing stops at the first failure — no 8s × N serial freeze"
+        );
+    }
+
+    #[test]
+    fn adding_a_repo_resets_the_unreachable_acknowledgement() {
+        let mut w = wizard(&[], &[]);
+        w.acknowledged_unreachable = true; // user previously chose "write anyway"
+        w.input = "git@github.com:zaplar/core.git".into();
+        w.add_repo();
+        assert!(
+            !w.acknowledged_unreachable,
+            "a changed repo set must re-warn before writing"
+        );
+    }
+
+    #[test]
+    fn unreachable_warning_names_repos_and_offers_an_override() {
+        let msg = unreachable_warning(&[
+            ("core".into(), "could not read Username".into()),
+            ("shared".into(), "host unreachable".into()),
+        ]);
+        assert!(
+            msg.contains("core") && msg.contains("shared"),
+            "names both repos"
+        );
+        assert!(
+            msg.contains("could not read Username"),
+            "shows the first reason"
+        );
+        assert!(
+            msg.contains("esc"),
+            "tells the user how to go back and fix it"
+        );
+    }
+
+    #[test]
     fn the_branch_prefix_is_optional() {
         let mut w = wizard(&[], &[]);
         w.input = "git@github.com:zaplar/core.git".into();
@@ -1002,6 +1415,36 @@ mod tests {
         assert!(w.project_draft().branch_prefix.is_none(), "empty = default");
         w.branch_prefix = "felix".into();
         assert_eq!(w.project_draft().branch_prefix.as_deref(), Some("felix"));
+    }
+
+    #[test]
+    fn the_scratch_step_gates_the_dense_form_behind_an_opt_in() {
+        // NEW-13: the scratch step opens as a one-line opt-in, NOT the dense 7-field grid.
+        // `scratch_showing_form` is the gate the key handler and renderer both read; it's
+        // false until the user presses `s` (sets `scratch_opt_in`) or has added an entry.
+        // (The Esc revert that makes the gate two-way lives in the run-loop key handler.)
+        let mut w = wizard(&[], &[]);
+        assert!(
+            !w.scratch_showing_form(),
+            "the scratch step starts gated — the opt-in prompt, not the grid"
+        );
+        w.scratch_opt_in = true;
+        assert!(
+            w.scratch_showing_form(),
+            "pressing `s` (scratch_opt_in) reveals the form"
+        );
+
+        // An added entry forces the form open even without an explicit opt-in.
+        let mut w = wizard(&[], &[]);
+        w.scratch_form.name = "db".into();
+        w.scratch_form.provision = "createdb x".into();
+        w.scratch_form.env = "X=y".into();
+        w.add_scratch();
+        assert_eq!(w.scratch.len(), 1, "the entry was added");
+        assert!(
+            w.scratch_showing_form(),
+            "an existing scratch entry keeps the form shown"
+        );
     }
 
     #[test]

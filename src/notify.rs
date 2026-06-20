@@ -38,7 +38,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::event::{AppEvent, AppEventTx};
+use crate::event::{AppEvent, AppEventTx, PushOutcome};
 use crate::session::{AgentStatus, SessionStore};
 use crate::workspace::StoreRegistry;
 
@@ -325,18 +325,29 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
             // The durable status this hook implies (None = surface-only).
             let implied = match event_name {
                 "Notification" if notif_needs_you => Some(AgentStatus::NeedsYou),
-                "Stop" => Some(AgentStatus::Idle),
-                // Any working signal promotes a live, non-terminal agent to
-                // Running — Spawning/Idle (it began a turn) AND NeedsYou (it
-                // resumed after you answered). Never revive a terminal agent; a
-                // no-op when already Running is absorbed by the `changed` guard.
+                // Imply Idle only over a *live* current — never resurrect a terminal
+                // record. A late Stop hook landing after the supervisor's terminal
+                // verdict must not flip a finished/killed agent back to live IDLE
+                // (which auto-resumes on the next boot). Mirrors the working arm below,
+                // which already gates on `current`. (E-H1; durably backstopped by
+                // SessionStore::set_status's terminal guard.)
+                "Stop" => current.filter(|s| s.is_live()).map(|_| AgentStatus::Idle),
+                // A working signal promotes a live, non-terminal agent to Running.
+                // Spawning/NeedsYou/Running all promote (a turn began, or it resumed
+                // after you answered). An *Idle* agent is only revived by a genuine
+                // new turn — `UserPromptSubmit` — never by a mid-turn `PostToolUse`,
+                // so a late or out-of-order tool hook can't flip a settled agent back
+                // to Running (A4). Mirrors the runtime rule (UserPromptSubmit routed
+                // as a status change; PostToolUse promotes non-idle only). Never
+                // revive a terminal agent; a no-op when already Running is absorbed by
+                // the `changed` guard.
                 _ if working => match current {
-                    Some(
-                        AgentStatus::Spawning
-                        | AgentStatus::Idle
-                        | AgentStatus::NeedsYou
-                        | AgentStatus::Running,
-                    ) => Some(AgentStatus::Running),
+                    Some(AgentStatus::Idle) if event_name == "UserPromptSubmit" => {
+                        Some(AgentStatus::Running)
+                    }
+                    Some(AgentStatus::Spawning | AgentStatus::NeedsYou | AgentStatus::Running) => {
+                        Some(AgentStatus::Running)
+                    }
                     _ => None,
                 },
                 _ => None,
@@ -417,14 +428,15 @@ async fn route(payload: &HookPayload, stores: &StoreRegistry, events: &AppEventT
                 reason,
             }
         }
-        // The user submitted a turn: the agent is working now. A bare status
-        // change (no tool name to show) that, like any working signal, clears a
-        // standing NeedsYou — answering a question is precisely a prompt submit.
-        (Some(issue), "UserPromptSubmit") => AppEvent::AgentAction {
+        // The user submitted a turn: a genuine new-turn status change → Running. It
+        // revives even an *Idle* agent (a fresh turn started) and clears a standing
+        // NeedsYou (answering a question is precisely a prompt submit). Routed as a
+        // status change — not an AgentAction — so that a *mid-turn* PostToolUse can't
+        // also revive Idle: only a real new turn does (A4).
+        (Some(issue), "UserPromptSubmit") => AppEvent::AgentStatusChanged {
             project_id,
             issue,
-            action: "working…".to_string(),
-            working: true,
+            status: AgentStatus::Running,
         },
         (Some(issue), "Notification") => {
             // A non-blocking notification (idle nudge / auth-success /
@@ -883,9 +895,12 @@ pub fn push_head_serialized(
     crate::mirror::push_head(worktree)
 }
 
-/// Push a committed branch to its true remote in the background, then emit the
-/// passive [`AppEvent::AgentCommitted`] indicator — and, on a reject, a footer.
-/// Never force-pushes; never blocks the hook or the render loop.
+/// Push a committed branch to its true remote in the background, then emit ONE
+/// [`AppEvent::AgentCommitted`] carrying the push's true [`PushOutcome`]. Folding the
+/// outcome into the single event is the fix for the data-integrity bug where a reject
+/// footer and an unconditional "pushed" footer drained in the same render tick and
+/// "pushed" won — so a stranded commit read as a clean success. Never force-pushes;
+/// never blocks the hook or the render loop.
 fn spawn_auto_push(
     events: AppEventTx,
     project_id: String,
@@ -896,38 +911,62 @@ fn spawn_auto_push(
 ) {
     tokio::spawn(async move {
         let lock = push_mutex(&repo_handle);
-        let push = tokio::task::spawn_blocking(move || {
-            let _guard = lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::mirror::push_head(&worktree)
-        })
-        .await;
-        // The commit happened regardless of the push outcome: always show the
-        // passive indicator; add a footer when the push itself was rejected OR the
-        // push task panicked. Surfacing the panic (like `session::persist_snapshot`
-        // does) keeps a push that never ran from masquerading as a clean success.
-        match &push {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = events.send(AppEvent::Notification(format!(
-                    "{issue}: auto-push failed: {}",
-                    clamp_display(&e.to_string())
-                )));
-            }
-            Err(join) => {
-                let _ = events.send(AppEvent::Notification(format!(
-                    "{issue}: auto-push task aborted: {join}"
-                )));
-            }
-        }
+        let handle = repo_handle.clone();
+        let outcome = tokio::task::spawn_blocking(move || push_committed(&handle, &worktree, lock))
+            .await
+            // A panic in the push task is itself a failed push — surface it (like
+            // `session::persist_snapshot` does) so a commit that never reached the
+            // remote can't masquerade as a clean success.
+            .unwrap_or_else(|join| {
+                PushOutcome::Rejected(clamp_display(&format!("auto-push task aborted: {join}")))
+            });
         let _ = events.send(AppEvent::AgentCommitted {
             project_id,
             issue,
             repo_handle,
             branch,
+            outcome,
         });
     });
+}
+
+/// Resolve the auto-push outcome for one committed worktree, on the blocking pool.
+/// ALWAYS pushes under the shared per-handle [`push_mutex`] — for a local-only repo
+/// `origin` is the synthesised bare mirror, and that push is the **durability
+/// backstop** (the L2 reference clone is rebuilt on an fsck self-heal, after which the
+/// branch is recovered from `origin/<branch>`, so a commit that never reached the
+/// mirror is silently stranded). Only the *label* depends on whether there is a true
+/// remote: a clean push to a true remote is [`PushOutcome::Pushed`], a clean push to
+/// the local mirror is [`PushOutcome::LocalOnly`] (committed + backstopped, not
+/// published), and either failing is [`PushOutcome::Rejected`].
+fn push_committed(handle: &str, worktree: &Path, lock: Arc<Mutex<()>>) -> PushOutcome {
+    // Classify the repo before taking the lock so the registry read never widens the
+    // per-handle push critical section.
+    let can_push = registry_can_push(handle);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match crate::mirror::push_head(worktree) {
+        Ok(()) if can_push => PushOutcome::Pushed,
+        Ok(()) => PushOutcome::LocalOnly,
+        Err(e) => PushOutcome::Rejected(clamp_display(&e.to_string())),
+    }
+}
+
+/// Whether `handle`'s registered repo has a true remote (vs. a local-only repo whose
+/// `origin` is the synthesised mirror) — i.e. whether a clean push should read as
+/// "pushed" or "committed (local-only)". Reads the registry fresh off disk (so a
+/// remote added mid-session via re-config is honoured, not a boot-time snapshot) and
+/// defaults to `true` for an unknown or empty handle (the push still runs either way;
+/// this only picks the label).
+fn registry_can_push(handle: &str) -> bool {
+    if handle.is_empty() {
+        return true;
+    }
+    let (registry, _) = crate::registry::Registry::load();
+    registry
+        .repo(handle)
+        .is_none_or(crate::mirror::can_push_to_remote)
 }
 
 /// Synchronous loopback POST of `body` to the endpoint, with the bearer `token`.
@@ -1104,6 +1143,17 @@ mod tests {
         assert!(json.contains("'/opt/lindep' --hook-forward 8765 --hook-token 'secrettoken'"));
         assert!(
             json.contains("Notification") && json.contains("Stop") && json.contains("PostToolUse")
+        );
+    }
+
+    #[test]
+    fn registry_can_push_defaults_true_for_an_empty_handle() {
+        // The post-commit forwarder defaults `repo_handle` to "" when git gives it no
+        // value; classifying must never silently skip the push (which always runs) — an
+        // unclassifiable handle just gets the optimistic "pushed" label, not LocalOnly.
+        assert!(
+            registry_can_push(""),
+            "an empty handle defaults to can-push (the push still runs regardless)"
         );
     }
 
@@ -1399,9 +1449,10 @@ mod tests {
         assert!(
             got.iter().any(|ev| matches!(
                 ev,
-                AppEvent::AgentAction { issue, working, .. } if issue == "ENG-1" && *working
+                AppEvent::AgentStatusChanged { issue, status, .. }
+                    if issue == "ENG-1" && *status == AgentStatus::Running
             )),
-            "the prompt submit emits a working action; got {got:?}"
+            "the prompt submit emits a Running status change (a new turn); got {got:?}"
         );
     }
 

@@ -39,7 +39,10 @@ pub enum AppEvent {
     /// the loop into a single redraw per tick. The ids are `Arc<str>` (not `String`)
     /// because the pump emits one of these per PTY read — cloning an `Arc` is a
     /// refcount bump, where two fresh `String`s would heap-allocate on every chunk.
-    AgentOutput { project_id: Arc<str>, issue: Arc<str> },
+    AgentOutput {
+        project_id: Arc<str>,
+        issue: Arc<str>,
+    },
     /// An agent process exited (cleanly or not).
     AgentExited {
         project_id: String,
@@ -80,13 +83,17 @@ pub enum AppEvent {
     AgentReaped { project_id: String, issue: String },
     /// An agent committed in `repo_handle`'s worktree (from a `post-commit` hook).
     /// Drives v1.6 auto-push: the work is pushed to the repo's true remote off the
-    /// status machinery (a commit is never "needs you"), and surfaces a passive
-    /// per-issue push indicator. `branch` is the committed branch.
+    /// status machinery (a commit is never "needs you"), and `outcome` carries the
+    /// push's true fate so the cockpit reports it faithfully — a *rejected* push
+    /// raises a standing "unpushed" chip instead of being papered over by a blanket
+    /// "pushed" (the v1.6 "a rejected push is never papered over" contract). `branch`
+    /// is the committed branch.
     AgentCommitted {
         project_id: String,
         issue: String,
         repo_handle: String,
         branch: String,
+        outcome: PushOutcome,
     },
     /// The agent on `(project_id, issue)` requested an extra repo be pulled into its
     /// workspace (from `lindep request-repo <handle>` over the hook endpoint, ENG-542).
@@ -98,6 +105,12 @@ pub enum AppEvent {
         issue: String,
         repo_handle: String,
     },
+    /// The supervisor refused a specific launch (at capacity, already running, or
+    /// still stopping). Carries the rejected `issue` so the cockpit drops *only* that
+    /// issue's double-press guard — unlike a bare `Notification`, which used to clear
+    /// every issue's `pending_launch` (M10). NOT agent-scoped — launches only target
+    /// the active project, so `project_id()` is `None`.
+    LaunchRejected { issue: String, reason: String },
     /// A background disk-reclaim scan finished (`Ctrl-a m`, ENG-540). Carries the
     /// unreferenced mirrors safe to offer, whether this scan should *open* the
     /// prompt (the initial scan) or merely *refresh* an already-open one (the
@@ -134,6 +147,40 @@ pub enum AppEvent {
     /// in this enum (latest switch wins). NOT agent-scoped — it *changes* the
     /// active project — so `project_id()` is `None` and the guard never drops it.
     ProjectActivated,
+    /// A confirmed discard finished. `WorkspaceDiscarded` = the worktrees were actually
+    /// removed (the cockpit may now drop the fleet entry + window). `DiscardKeptWorktree`
+    /// = teardown KEPT the worktree (a rejected push left unpushed commits on disk), so
+    /// the cockpit must NOT silently drop it — it raises a standing "unpushed work kept"
+    /// chip and leaves the issue re-discardable (D-HIGH). Project-scoped because a
+    /// backgrounded teardown result must not mutate the active project if issue keys
+    /// collide across projects.
+    WorkspaceDiscarded { project_id: String, issue: String },
+    DiscardKeptWorktree {
+        project_id: String,
+        issue: String,
+        reason: String,
+    },
+}
+
+/// The fate of a v1.6 auto-push, carried on [`AppEvent::AgentCommitted`]. A commit
+/// always happened — only the *push* of it can fail or be a no-op — so the cockpit
+/// must distinguish "reached the true remote" from "stranded on the local clone",
+/// never collapsing both to "pushed" (a rejected push masquerading as a clean
+/// success is the exact data-integrity bug this enum closes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The committed branch reached the repo's true remote.
+    Pushed,
+    /// The push to the true remote was rejected (or the push task panicked): the
+    /// commit is stranded on the local clone and has NOT reached the remote. The
+    /// string is git's clamped reason, shown in the footer and the standing chip.
+    Rejected(String),
+    /// The repo is local-only (no true remote): the branch was pushed to the
+    /// synthesised bare mirror — the durability backstop a clone rebuild recovers
+    /// from — but there is nowhere to publish it. A clean state, reported as
+    /// "committed" (never "pushed", which would imply a remote), and never the
+    /// "unpushed" chip.
+    LocalOnly,
 }
 
 impl AppEvent {
@@ -144,6 +191,7 @@ impl AppEvent {
     pub fn project_id(&self) -> Option<&str> {
         match self {
             AppEvent::Notification(_)
+            | AppEvent::LaunchRejected { .. }
             | AppEvent::ReclaimScanned { .. }
             | AppEvent::ProjectActivated => None,
             AppEvent::AgentSpawned { project_id, .. }
@@ -155,7 +203,9 @@ impl AppEvent {
             | AppEvent::AgentCommitted { project_id, .. }
             | AppEvent::MaterializeProgress { project_id, .. }
             | AppEvent::MaterializeDone { project_id, .. }
-            | AppEvent::RepoRequested { project_id, .. } => Some(project_id),
+            | AppEvent::RepoRequested { project_id, .. }
+            | AppEvent::WorkspaceDiscarded { project_id, .. }
+            | AppEvent::DiscardKeptWorktree { project_id, .. } => Some(project_id),
             // Separate arm: its `project_id` is `Arc<str>`, not `String`, so it can't
             // share the or-pattern above (both still deref-coerce to `&str` here).
             AppEvent::AgentOutput { project_id, .. } => Some(project_id),

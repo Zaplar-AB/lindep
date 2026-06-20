@@ -15,7 +15,7 @@
 //! projects gets two distinct conversations. (Sessions persisted before v1.5
 //! were keyed on the bare issue; their stored id is preserved verbatim on the
 //! v1→v2 migration so `--resume` continuity survives the rekey.) `STATE_VERSION`
-//! is `3` as of v1.6, which added the per-issue repo handle set additively.
+//! is `5` as of v1.7, which added the durable kept-worktree warning additively.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -64,6 +64,20 @@ impl AgentStatus {
     /// `&self` so it can be passed directly as `Option::is_some_and`'s predicate.
     pub const fn needs_you(&self) -> bool {
         matches!(self, AgentStatus::NeedsYou)
+    }
+
+    /// Whether the agent is actively churning — spawning, or producing output /
+    /// running tools. Drives the `Working` readiness band; the exact complement of
+    /// [`is_idle`](Self::is_idle) *within* the live-but-not-needs-you set, so a
+    /// resting agent never reads as still working.
+    pub const fn is_working(&self) -> bool {
+        matches!(self, AgentStatus::Spawning | AgentStatus::Running)
+    }
+
+    /// Whether the agent is alive but resting — it finished a turn (a `Stop` hook
+    /// fired) with its process still up. Drives the `Idle` readiness band.
+    pub const fn is_idle(&self) -> bool {
+        matches!(self, AgentStatus::Idle)
     }
 
     /// Whether a live process backs this status — i.e. the agent is genuinely
@@ -142,6 +156,11 @@ pub struct Session {
     /// so a pre-`STATE_VERSION 4` file loads with none.
     #[serde(default)]
     pub scratch: Vec<ScratchRecord>,
+    /// True when a discard attempted cleanup but kept the checkout because there
+    /// is unpushed work or an incomplete teardown. Re-emitted on startup so the
+    /// cockpit keeps warning about the retained disk state.
+    #[serde(default)]
+    pub kept_unpushed: bool,
     /// `claude`'s session id (a UUID string), passed as `--session-id` /
     /// `--resume`.
     pub session_id: String,
@@ -206,14 +225,16 @@ struct Persisted {
 /// v1 → v2 (lindep v1.5): added `Session::project_id` and folded the project into
 /// the deterministic `session_id`. v2 → v3 (lindep v1.6): added `Session::repos`,
 /// the per-issue repo handle set under managed workspaces. v3 → v4 (v1.6): added
-/// `Session::scratch`, the per-issue scratch-datastore records (ENG-561). All bumps
-/// are purely additive — the new fields ride a `#[serde(default)]`, so every version
-/// deserializes as-is; the only migration is stamping the owning `project_id` onto
-/// unstamped records (done in [`SessionStore::for_project`], which preserves the
-/// stored `session_id`). v1.6 abandons the in-repo `.lindep` location wholesale
-/// (state now lives under `~/.lindep/projects/<handle>/`), so there is no legacy
-/// adoption: a fresh per-project store stands in where none exists.
-const STATE_VERSION: u32 = 4;
+/// `Session::scratch`, the per-issue scratch-datastore records (ENG-561). v4 → v5
+/// (v1.7): added `Session::kept_unpushed`, the durable warning that a discard kept
+/// local work on disk, including push rejects and cleanup failures. All bumps are purely additive — the new fields ride a
+/// `#[serde(default)]`, so every version deserializes as-is; the only migration is
+/// stamping the owning `project_id` onto unstamped records (done in
+/// [`SessionStore::for_project`], which preserves the stored `session_id`). v1.6
+/// abandons the in-repo `.lindep` location wholesale (state now lives under
+/// `~/.lindep/projects/<handle>/`), so there is no legacy adoption: a fresh
+/// per-project store stands in where none exists.
+const STATE_VERSION: u32 = 5;
 
 /// Serde default for a version-less file: the first format that carried a tag.
 fn default_state_version() -> u32 {
@@ -335,6 +356,7 @@ impl SessionStore {
                 branch,
                 repos: Vec::new(),
                 scratch: Vec::new(),
+                kept_unpushed: false,
                 status: AgentStatus::Spawning,
                 transcript_path: None,
                 created_at: now,
@@ -347,10 +369,32 @@ impl SessionStore {
         self.sessions.get(issue)
     }
 
-    /// Update an agent's status (and bump `updated_at`). No-op if the issue has
-    /// no record. Returns whether a record was found and changed.
+    /// Update an agent's status (and bump `updated_at`). No-op if the issue has no
+    /// record. Returns whether a record was found and changed — `false` ALSO when a
+    /// live-over-terminal write was refused (see the guard below).
     pub fn set_status(&mut self, issue: &str, status: AgentStatus) -> bool {
         if let Some(s) = self.sessions.get_mut(issue) {
+            // Durable backstop (CF-4 / E-H1): never let a *live* status overwrite an
+            // existing *terminal* one. This is the single mutation choke point every
+            // writer (hook bus + supervisor) shares, so a late Stop / needs-you hook
+            // landing after the supervisor's terminal verdict can never resurrect a
+            // finished/killed agent (which would rehydrate as live IDLE and auto-resume
+            // on the next boot). Terminal→terminal regrades and live↔live transitions
+            // stay allowed.
+            //
+            // `Spawning` is the one live status exempt from the guard: it is the
+            // supervisor's authoritative *new-process* signal (set only on the launch
+            // path at supervisor.rs, never by a stray late hook), so it must be allowed
+            // to clear a terminal record — otherwise relaunching/resuming a finished or
+            // killed agent leaves the durable record terminal, the snapshot persists it
+            // dead, and the genuinely-running relaunch is not auto-resumed on next boot
+            // (the inverse of the H1 bug this guard fixes).
+            if status.is_live()
+                && !matches!(status, AgentStatus::Spawning)
+                && s.status.is_terminal()
+            {
+                return false;
+            }
             s.status = status;
             s.updated_at = crate::ledger::now_unix();
             true
@@ -392,6 +436,18 @@ impl SessionStore {
     pub fn set_scratch(&mut self, issue: &str, scratch: Vec<ScratchRecord>) -> bool {
         if let Some(s) = self.sessions.get_mut(issue) {
             s.scratch = scratch;
+            s.updated_at = crate::ledger::now_unix();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record whether this issue's workspace was kept after a discard attempt.
+    /// Cleared implicitly when the session is forgotten after a clean discard.
+    pub fn set_kept_unpushed(&mut self, issue: &str, kept: bool) -> bool {
+        if let Some(s) = self.sessions.get_mut(issue) {
+            s.kept_unpushed = kept;
             s.updated_at = crate::ledger::now_unix();
             true
         } else {
@@ -1001,6 +1057,56 @@ mod tests {
             store.get("ENG-1").unwrap().worktree_path,
             PathBuf::from("/wt/ENG-1")
         );
+    }
+
+    #[test]
+    fn set_status_refuses_a_live_status_over_a_terminal_one() {
+        // CF-4 / E-H1: the one mutation choke point refuses live-over-terminal, so a
+        // late Stop/needs-you hook can't resurrect a finished/killed agent (which would
+        // rehydrate as live IDLE and auto-resume). Terminal regrades + live↔live stay ok.
+        let path = temp_state_path();
+        let mut store = SessionStore::load(&path).unwrap();
+        store.ensure("ENG-1", "/wt/ENG-1".into(), "b".into());
+        store.set_status("ENG-1", AgentStatus::Done);
+        assert!(
+            !store.set_status("ENG-1", AgentStatus::Idle),
+            "a live status over a terminal one is refused"
+        );
+        assert_eq!(store.get("ENG-1").unwrap().status, AgentStatus::Done);
+        assert!(
+            store.set_status("ENG-1", AgentStatus::Failed),
+            "a terminal→terminal regrade still goes through"
+        );
+        assert_eq!(store.get("ENG-1").unwrap().status, AgentStatus::Failed);
+    }
+
+    #[test]
+    fn relaunch_clears_a_terminal_record_via_the_spawning_exemption() {
+        // R1 (CF-4): the live-over-terminal guard must EXEMPT `Spawning` — the
+        // supervisor's authoritative new-process signal on the relaunch path. Without
+        // the exemption a relaunch of a finished/killed agent leaves the durable record
+        // terminal, the snapshot persists it dead, and the genuinely-running relaunch is
+        // NOT auto-resumed on next boot (the inverse of the H1 bug). The sibling test
+        // covers the guard; this covers the exemption that keeps relaunch working.
+        let path = temp_state_path();
+        let mut store = SessionStore::load(&path).unwrap();
+        store.ensure("ENG-1", "/wt/ENG-1".into(), "b".into());
+        store.set_status("ENG-1", AgentStatus::Done);
+
+        assert!(
+            store.set_status("ENG-1", AgentStatus::Spawning),
+            "a relaunch's Spawning clears a terminal record"
+        );
+        assert_eq!(store.get("ENG-1").unwrap().status, AgentStatus::Spawning);
+
+        // The exemption is narrow: only Spawning. A stray late Running/Idle/NeedsYou
+        // still can't resurrect a terminal record.
+        store.set_status("ENG-1", AgentStatus::Done);
+        assert!(
+            !store.set_status("ENG-1", AgentStatus::Running),
+            "a non-Spawning live status stays refused over terminal"
+        );
+        assert_eq!(store.get("ENG-1").unwrap().status, AgentStatus::Done);
     }
 
     #[test]
