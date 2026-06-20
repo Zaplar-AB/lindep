@@ -7,6 +7,7 @@
 mod app;
 mod demo;
 mod event;
+mod key_setup;
 mod keymap;
 mod layout;
 mod ledger;
@@ -195,8 +196,11 @@ fn real_main() -> Result<(), String> {
     let (graph, project, client, projects) = if cli.demo {
         (demo::graph(), None, None, Vec::new())
     } else {
-        let client = Client::new(require_key()?);
+        let client = Client::new(ensure_key_interactive()?);
         let Some(project) = resolve_or_pick(&client, cli.project.as_deref())? else {
+            eprintln!(
+                "lindep: no project selected — rerun lindep to pick one, or lindep --demo to explore."
+            );
             return Ok(()); // user quit the picker
         };
         eprintln!("Loading {}…", project.name);
@@ -211,10 +215,6 @@ fn real_main() -> Result<(), String> {
             projects,
         )
     };
-
-    if graph.is_empty() {
-        return Err("no issues found for that project".into());
-    }
 
     let mut app = App::new(graph);
     if cli.graph {
@@ -237,6 +237,24 @@ fn load_env() {
 
 fn require_key() -> Result<String, String> {
     validate_key(std::env::var("LINEAR_API_KEY").ok())
+}
+
+/// The interactive key gate. An exported / `.env`-loaded key always wins; otherwise,
+/// on a real terminal, let the user paste one in-app (validated against Linear, saved
+/// to `~/.config/lindep/.env`, exported for this run — see [`key_setup`]). A non-TTY
+/// run (CI, a pipe) keeps the actionable stderr hint, so nothing scripted regresses.
+fn ensure_key_interactive() -> Result<String, String> {
+    if let Ok(key) = require_key() {
+        return Ok(key);
+    }
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && let Some(key) = key_setup::prompt_for_key()?
+    {
+        return Ok(key);
+    }
+    require_key() // no TTY, or the user skipped → the stderr hint (+ the --demo offer)
 }
 
 /// Validate the configured key, treating an absent, empty, or still-placeholder
@@ -396,7 +414,7 @@ fn run_tui(
             )
         } else {
             format!(
-                "read-only demo · {} · {} issues — drop --demo to run agents · ? help",
+                "read-only demo · {} · {} issues — drop --demo to run agents (needs a Linear key) · ? help",
                 app.graph.project,
                 app.graph.len()
             )
@@ -420,6 +438,7 @@ fn run_tui(
     };
 
     let mut terminal = ratatui::init();
+    enable_bracketed_paste();
     let result = event_loop(&mut terminal, &mut app, rx);
 
     // Capture the final window layout (notably the focus, which we don't persist
@@ -435,13 +454,13 @@ fn run_tui(
     // project-keyed `world` and honour the `project_id` the closer passes — NOT
     // the active-only, issue-keyed `fleet`, which would stamp a backgrounded
     // project's open run with the active project's status for a shared issue id.
-    if let Some(path) = app.ledger_path.clone() {
+    if app.ledger_path.is_some() || app.layout.is_some() {
         let now = ledger::now_unix();
         let world = std::mem::take(&mut app.world);
         app.ledger.close_open(now, |project_id, issue| {
             world.get(project_id).and_then(|m| m.get(issue)).copied()
         });
-        let _ = app.ledger.save(&path);
+        app.save_ledgers();
     }
 
     // Normal path: stop agents before restoring the terminal. (On a panic the
@@ -449,6 +468,7 @@ fn run_tui(
     // teardown is ordered before `ratatui::restore`.)
     guard.shutdown();
     drop(guard);
+    disable_bracketed_paste();
     ratatui::restore();
     result
 }
@@ -626,6 +646,35 @@ fn start_control_plane(
             Some((pid.clone(), choices))
         })
         .collect();
+    // Every registered repo (handle + local-only), sorted — the at-launch repo picker's
+    // "add another repo" (CF-20) offers any of these the active project doesn't yet list
+    // as a candidate, so one agent can be given a repo the project wasn't set up with.
+    app.registered_repos = {
+        let mut repos: Vec<picker::RepoChoice> = registry
+            .repo_handles()
+            .into_iter()
+            .filter_map(|h| {
+                registry.repo(&h).map(|e| picker::RepoChoice {
+                    handle: e.handle.clone(),
+                    local: e.is_local_only(),
+                    primary: false,
+                })
+            })
+            .collect();
+        repos.sort_by(|a, b| a.handle.cmp(&b.handle));
+        repos
+    };
+    // Snapshot id → handle so a later switch can re-point the ledger to the target's
+    // own file (H3); the registry moves into the workspace below.
+    app.project_handles = project_ids
+        .iter()
+        .filter_map(|pid| {
+            registry
+                .project(pid)
+                .ok()
+                .map(|d| (pid.clone(), d.handle.clone()))
+        })
+        .collect();
 
     // Workspace store registry: the one loopback hook endpoint resolves each hook to
     // its owning project's store through it (a hook carries only a session id / cwd,
@@ -749,6 +798,7 @@ fn start_control_plane(
             app.ledger_path = Some(ledger_path);
         }
         Err(e @ session::StateError::Version { .. }) => {
+            app.project_handles.remove(&active.id);
             let _ = events.send(event::AppEvent::Notification(format!(
                 "agent ledger is from a newer lindep; leaving it untouched ({e})"
             )));
@@ -803,9 +853,28 @@ fn run_request_repo(handle: &str) -> Result<(), String> {
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        disable_bracketed_paste();
         ratatui::restore();
         original(info);
     }));
+}
+
+/// Enable terminal bracketed-paste mode (DECSET 2004) alongside the cockpit's
+/// alt-screen, so a multi-line paste arrives as one `Event::Paste` we forward to the
+/// focused agent verbatim — instead of the terminal delivering each line as its own
+/// submit (the line-by-line paste bug). Disabled on teardown.
+fn enable_bracketed_paste() {
+    let _ = ratatui::crossterm::execute!(
+        io::stdout(),
+        ratatui::crossterm::event::EnableBracketedPaste
+    );
+}
+
+fn disable_bracketed_paste() {
+    let _ = ratatui::crossterm::execute!(
+        io::stdout(),
+        ratatui::crossterm::event::DisableBracketedPaste
+    );
 }
 
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx) -> io::Result<()> {
@@ -856,7 +925,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
                     app.set_viewport(Rect::new(0, 0, w, h));
                     dirty = true;
                 }
-                _ => {} // mouse / focus / paste change nothing on screen
+                Event::Paste(text) => dirty |= app.forward_paste(&text),
+                _ => {} // mouse / focus change nothing on screen
             }
         }
 
@@ -866,10 +936,16 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
         // change applies on the next launch — the live workspace is untouched.
         if let Some(project) = app.take_configure_request() {
             ratatui::restore();
-            let footer = onboard::run_for_project(&project)?;
+            let (footer, wrote) = onboard::run_for_project(&project)?;
             *terminal = ratatui::init();
+            enable_bracketed_paste();
             if let Ok(size) = terminal.size() {
                 app.set_viewport(Rect::new(0, 0, size.width, size.height));
+            }
+            // The live workspace keeps its old binding until restart, so raise a
+            // standing chip when the re-config actually changed something.
+            if wrote {
+                app.config_restart_pending = true;
             }
             app.note_status(footer);
             dirty = true;
@@ -922,9 +998,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
         // ledger is view-only history, so a write failure must not end the session.
         if app.ledger_dirty {
             app.ledger_dirty = false;
-            if let Some(path) = app.ledger_path.clone() {
-                let _ = app.ledger.save(&path);
-            }
+            app.save_ledgers();
         }
     }
     Ok(())
@@ -1012,8 +1086,11 @@ mod tests {
         let mut app = App::new(demo::graph());
         let out = render_snapshot(&mut app, 120, 40).expect("render");
         assert!(out.contains("Inference Platform"), "header missing:\n{out}");
-        assert!(out.contains("UPSTREAM"), "upstream header missing");
-        assert!(out.contains("DOWNSTREAM"), "downstream header missing");
+        assert!(
+            out.contains("BLOCKED BY"),
+            "upstream (blocked-by) header missing"
+        );
+        assert!(out.contains("BLOCKS"), "downstream (blocks) header missing");
         assert!(out.contains("ZAP-204"), "focus issue missing");
         assert!(out.contains("cycles"), "cycle count missing");
     }
@@ -1049,9 +1126,9 @@ mod tests {
         // Match the glyph-prefixed divider headers so a band label can't collide
         // with the same word used as a window-status title (e.g. "WORKING").
         let headers = [
-            "⚑ NEEDS YOU",
-            "◉ WORKING",
-            "◦ IDLE",
+            "⚐ NEEDS YOU",
+            "◎ WORKING",
+            "◯ IDLE",
             "▸ READY",
             "⊘ BLOCKED",
             "✓ DONE",

@@ -28,8 +28,8 @@ pub const MUTED: Color = Color::Rgb(0x8A, 0x8F, 0x96); // secondary / dim text
 pub const BORDER: Color = Color::Rgb(0x2C, 0x2F, 0x33); // idle pane borders
 pub const WELL: Color = Color::Rgb(0x14, 0x15, 0x17); // footer well
 
-// ── Amber — warnings: blocked, urgent, cycles, and the one must-act agent
-//    state (needs-you). Deliberately *not* reused for "working" — see ORANGE. ─
+// ── Amber — warnings: blocked, urgent, cycles. Deliberately *not* reused for
+//    "working" or "needs-you" — see ORANGE / RED. ───────────────────────────
 pub const AMBER_400: Color = Color::Rgb(0xF0, 0xAD, 0x43);
 pub const AMBER_500: Color = Color::Rgb(0xE1, 0x8C, 0x1B);
 
@@ -43,8 +43,9 @@ pub const ORANGE_400: Color = Color::Rgb(0xF2, 0x7A, 0x21);
 pub const STATUS_400: Color = Color::Rgb(0x4F, 0xC9, 0x8C);
 pub const STATUS_600: Color = Color::Rgb(0x0F, 0x84, 0x44);
 
-// ── Red — a failed agent. Distinct from amber so a crash reads as "wrong", not
-//    merely "attention". ──────────────────────────────────────────────────────
+// ── Red — failed agents and the one must-act agent state (needs-you). Distinct
+//    from amber so human attention reads as urgent, not merely warning. ───────
+pub const RED_300: Color = Color::Rgb(0xF2, 0x7A, 0x68);
 pub const RED_400: Color = Color::Rgb(0xE0, 0x5A, 0x4B);
 
 // ── Violet — the cockpit-v3 focus colour. House rule: racing green stays
@@ -65,7 +66,7 @@ pub fn focus_border_style() -> Style {
 
 /// Border hue + short label for an *unfocused* window, by its agent status — the
 /// status the title bar / border communicates at a glance (running-orange,
-/// needs-you breathing-amber, idle-cyan…). Lifted verbatim from the v2
+/// needs-you breathing-red, idle-cyan…). Lifted verbatim from the v2
 /// `chat_pane_chrome` so the colour vocabulary is unchanged; `None` is a
 /// non-agent window (Deps/Spine) or one whose status hasn't landed yet, and
 /// `exited` is the sub-frame window where the PTY is gone but no terminal status
@@ -74,7 +75,7 @@ pub fn window_status_hue(status: Option<AgentStatus>, exited: bool) -> (Color, &
     match status {
         Some(AgentStatus::Spawning) => (GREEN_400, "STARTING"),
         Some(AgentStatus::Running) => (ORANGE_400, "WORKING"),
-        Some(AgentStatus::NeedsYou) => (AMBER_400, "NEEDS YOU"),
+        Some(AgentStatus::NeedsYou) => (RED_400, "NEEDS YOU"),
         Some(AgentStatus::Idle) => (STATUS_400, "IDLE"),
         Some(AgentStatus::Stopped) => (MUTED, "STOPPED"),
         Some(AgentStatus::Done) => (STATUS_400, "DONE"),
@@ -111,7 +112,10 @@ pub fn status_glyph(status: Status) -> (&'static str, Color) {
     // colour told apart from Todo), and Canceled is `⊗` (not `⊘`, which is reserved for
     // *blocked* — a live "needs unblocking" state, the opposite of a dead one).
     match status {
-        Status::Completed | Status::Duplicate => ("●", STATUS_600),
+        // STATUS_400 (8.76:1), not STATUS_600 (3.83:1, below AA): the done dot is the
+        // only mark distinguishing a completed issue in the label-less Spine/deps views,
+        // so it must stay legible (STATUS_600 remains the Flash::Finished background).
+        Status::Completed | Status::Duplicate => ("●", STATUS_400),
         Status::Started => ("◐", STATUS_400),
         Status::Unstarted => ("○", INK),
         Status::Backlog => ("·", MUTED),
@@ -130,16 +134,20 @@ pub fn agent_spinner(frame: u64) -> &'static str {
     SPINNER[(frame % SPINNER.len() as u64) as usize]
 }
 
-/// The pulse style for the needs-you flag: a ~1.2 s heartbeat between bold and
-/// dim amber. Never a terminal blink attribute (those flash the whole cell and
-/// are an accessibility hazard) — just a brightness breath.
+/// The pulse style for the needs-you flag: a ~1.2 s heartbeat between two reds.
+/// Never a terminal blink attribute (those flash the whole cell and are an
+/// accessibility hazard) — just a luminance breath, and NOT BOLD↔DIM: DIM is widely
+/// unimplemented (aliased to normal) or renders barely-legible, so the cockpit's most
+/// important cue would vanish on those terminals. A colour change every terminal
+/// honours keeps the dim half readable — aligning the flag/badges with the row tint,
+/// which already breathes between two distinct RGBs.
 pub fn needs_you_style(frame: u64) -> Style {
-    let base = Style::new().fg(AMBER_400);
-    if (frame / 6).is_multiple_of(2) {
-        base.add_modifier(Modifier::BOLD)
+    let hue = if (frame / 6).is_multiple_of(2) {
+        RED_400
     } else {
-        base.add_modifier(Modifier::DIM)
-    }
+        RED_300
+    };
+    Style::new().fg(hue).add_modifier(Modifier::BOLD)
 }
 
 /// Marker — glyph + full style — for an agent's state at `frame`. This is the
@@ -181,8 +189,8 @@ pub fn agent_row_bg(status: AgentStatus, frame: u64) -> Color {
         AgentStatus::Spawning => Color::Rgb(0x10, 0x1C, 0x16),
         AgentStatus::Running => Color::Rgb(0x2B, 0x1A, 0x0C),
         // The same ~1.2 s heartbeat as the flag/header, applied to the row tint.
-        AgentStatus::NeedsYou if (frame / 6).is_multiple_of(2) => Color::Rgb(0x3A, 0x2B, 0x0D),
-        AgentStatus::NeedsYou => Color::Rgb(0x24, 0x1B, 0x09),
+        AgentStatus::NeedsYou if (frame / 6).is_multiple_of(2) => Color::Rgb(0x3A, 0x12, 0x10),
+        AgentStatus::NeedsYou => Color::Rgb(0x24, 0x0E, 0x0D),
         AgentStatus::Idle => Color::Rgb(0x0E, 0x20, 0x19),
         AgentStatus::Stopped => Color::Rgb(0x17, 0x18, 0x1A),
         AgentStatus::Done => Color::Rgb(0x0C, 0x22, 0x17),
@@ -266,6 +274,26 @@ mod tests {
     }
 
     #[test]
+    fn the_needs_you_pulse_breathes_by_colour_not_dim() {
+        // DIM is unportable, so the must-act pulse must change colour, both phases BOLD
+        // (never DIM) so it stays legible on terminals that don't render DIM at all.
+        let a = needs_you_style(0);
+        let b = needs_you_style(6);
+        assert_ne!(
+            a.fg, b.fg,
+            "the pulse changes colour between its two phases"
+        );
+        assert!(
+            a.add_modifier.contains(Modifier::BOLD) && b.add_modifier.contains(Modifier::BOLD),
+            "both phases stay bold"
+        );
+        assert!(
+            !a.add_modifier.contains(Modifier::DIM) && !b.add_modifier.contains(Modifier::DIM),
+            "never DIM — many terminals render it invisible"
+        );
+    }
+
+    #[test]
     fn a_repo_checkbox_reads_in_monochrome() {
         // Checked vs unchecked must differ by glyph shape, not only colour.
         assert_ne!(repo_check(true).0, repo_check(false).0);
@@ -292,7 +320,11 @@ mod tests {
             "Backlog must not reuse Todo's ○"
         );
         // Canceled must not reuse `⊘` (reserved for *blocked*) nor `✗` (a failed agent).
-        assert_ne!(status_glyph(Status::Canceled).0, "⊘", "⊘ is blocked, not canceled");
+        assert_ne!(
+            status_glyph(Status::Canceled).0,
+            "⊘",
+            "⊘ is blocked, not canceled"
+        );
         assert_ne!(
             status_glyph(Status::Canceled).0,
             agent_marker(AgentStatus::Failed, 0).0,

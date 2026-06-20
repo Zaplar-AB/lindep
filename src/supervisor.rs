@@ -192,6 +192,18 @@ impl SupervisorHandle {
             repos,
         });
     }
+
+    /// Launch a synthetic ad-hoc agent. The supervisor's spawn path is identical
+    /// to a normal issue launch; callers own the synthetic id and cleanup policy.
+    pub fn launch_ask(
+        &self,
+        issue: String,
+        title: String,
+        size: Option<(u16, u16)>,
+        repos: Vec<String>,
+    ) {
+        self.launch_with_repos(issue, title, size, repos);
+    }
     /// Stop a single agent, leaving the others running.
     pub fn cancel(&self, issue: String) {
         let _ = self.cmd_tx.send(Command::Cancel { issue });
@@ -322,7 +334,10 @@ impl Supervisor {
             // the user it's still stopping rather than the misleading "already
             // running" — the relaunch will take once the matching `Reaped` lands.
             if record.cancelling {
-                self.reject_launch(&issue, format!("still stopping {issue}, try again in a moment"));
+                self.reject_launch(
+                    &issue,
+                    format!("still stopping {issue}, try again in a moment"),
+                );
             } else {
                 self.reject_launch(&issue, format!("{issue} already has a running agent"));
             }
@@ -502,6 +517,12 @@ async fn supervise(task: &AgentTask) {
     let notify = |msg: String| {
         let _ = task.events.send(AppEvent::Notification(msg));
     };
+    let reject = |reason: String| {
+        let _ = task.events.send(AppEvent::LaunchRejected {
+            issue: task.issue.clone(),
+            reason,
+        });
+    };
 
     // Materialise every selected repo (primary + the up-front multi-select,
     // ENG-536) on the blocking pool: each repo's L2 reference clone is ensured
@@ -611,8 +632,8 @@ async fn supervise(task: &AgentTask) {
         () = task.token.cancelled() => return,
         res = materialize => match res {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => return notify(format!("workspace for {} failed: {e}", task.issue)),
-            Err(e) => return notify(format!("workspace task for {} panicked: {e}", task.issue)),
+            Ok(Err(e)) => return reject(format!("workspace for {} failed: {e}", task.issue)),
+            Err(e) => return reject(format!("workspace task for {} panicked: {e}", task.issue)),
         },
     };
     // A skipped secondary isn't fatal, but the human should know its tools won't be
@@ -694,7 +715,7 @@ async fn supervise(task: &AgentTask) {
         .await
         {
             Ok(v) => v,
-            Err(e) => return notify(format!("scratch task for {} panicked: {e}", task.issue)),
+            Err(e) => return reject(format!("scratch task for {} panicked: {e}", task.issue)),
         };
         if task.token.is_cancelled() {
             rollback_scratch(
@@ -741,7 +762,7 @@ async fn supervise(task: &AgentTask) {
                     .collect(),
             )
             .await;
-            return notify(msg);
+            return reject(msg);
         }
         for p in ok {
             scratch_env.extend(p.env);
@@ -752,7 +773,7 @@ async fn supervise(task: &AgentTask) {
     // Session record: deterministic id, resume if we've launched this before.
     let (session_id, resume, snapshot) = {
         let Ok(mut store) = task.store.lock() else {
-            return notify("session store lock poisoned".to_string());
+            return reject("session store lock poisoned".to_string());
         };
         let resume = store.get(&task.issue).is_some();
         let session = store.ensure(&task.issue, cwd.clone(), primary_wt.branch.clone());
@@ -812,9 +833,9 @@ async fn supervise(task: &AgentTask) {
     };
     match write {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return notify(format!("hook settings for {} failed: {e}", task.issue)),
+        Ok(Err(e)) => return reject(format!("hook settings for {} failed: {e}", task.issue)),
         Err(e) => {
-            return notify(format!(
+            return reject(format!(
                 "hook settings task for {} panicked: {e}",
                 task.issue
             ));
@@ -884,7 +905,7 @@ async fn supervise(task: &AgentTask) {
 
         let backend = match (task.spawn)(spawn_cfg, task.events.clone()) {
             Ok(backend) => backend,
-            Err(e) => return notify(format!("spawning agent for {} failed: {e}", task.issue)),
+            Err(e) => return reject(format!("spawning agent for {} failed: {e}", task.issue)),
         };
         let _ = task.events.send(AppEvent::AgentSpawned {
             project_id: task.project_id.clone(),
@@ -1219,11 +1240,13 @@ mod tests {
 
         handle.launch("ENG-1".into(), "One".into(), None);
 
-        // The spawn failure surfaces as a footer notification…
+        // The spawn failure is typed to the rejected launch, so the cockpit can drop
+        // only ENG-1's pending guard.
         let saw_failure = wait_for(|| {
             while let Ok(ev) = rx.try_recv() {
-                if let AppEvent::Notification(m) = ev
-                    && m.contains("spawning agent for ENG-1 failed")
+                if let AppEvent::LaunchRejected { issue, reason } = ev
+                    && issue == "ENG-1"
+                    && reason.contains("spawning agent for ENG-1 failed")
                 {
                     return true;
                 }

@@ -144,6 +144,32 @@ impl Ledger {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Project ids currently represented in this in-memory ledger.
+    pub fn project_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .runs
+            .keys()
+            .map(|(project_id, _)| project_id.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Replace this ledger's entries for `project_id` with the entries from
+    /// `other` for that same project. Used when switching projects: each project's
+    /// file is self-contained, but the live cockpit keeps one in-memory view so
+    /// background events can still be recorded before their project is active.
+    pub fn merge_project(&mut self, project_id: &str, other: Ledger) {
+        self.runs.retain(|(pid, _), _| pid != project_id);
+        self.runs.extend(
+            other
+                .runs
+                .into_iter()
+                .filter(|((pid, _), _)| pid == project_id),
+        );
+    }
+
     /// Begin a run: append a fresh open [`Episode`]. Any still-open run for the
     /// issue is closed first (a relaunch implies the prior process is gone), so
     /// there is at most one open episode per issue. Bounded to the most recent
@@ -222,14 +248,11 @@ impl Ledger {
             .find(|e| e.is_open())
     }
 
-    /// Persist atomically + durably via the shared [`SessionStore::write_snapshot`]
-    /// discipline (the same as `cockpit.json`). Synchronous — called only by the
-    /// render thread on a lifecycle change, never per keystroke. Issues are written
-    /// in a stable order so the file diffs cleanly.
-    pub fn save(&self, path: &Path) -> Result<(), StateError> {
+    fn issue_logs_for(&self, project_filter: Option<&str>) -> Vec<IssueLog> {
         let mut issues: Vec<IssueLog> = self
             .runs
             .iter()
+            .filter(|((project_id, _), _)| project_filter.is_none_or(|want| project_id == want))
             .map(|((project_id, issue), episodes)| IssueLog {
                 project_id: project_id.clone(),
                 issue: issue.clone(),
@@ -240,6 +263,10 @@ impl Ledger {
             (a.project_id.as_str(), a.issue.as_str())
                 .cmp(&(b.project_id.as_str(), b.issue.as_str()))
         });
+        issues
+    }
+
+    fn save_logs(path: &Path, issues: Vec<IssueLog>) -> Result<(), StateError> {
         let persisted = Persisted {
             version: LEDGER_VERSION,
             issues,
@@ -247,6 +274,19 @@ impl Ledger {
         let bytes = serde_json::to_vec_pretty(&persisted).map_err(StateError::Serialize)?;
         let seq = LEDGER_SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         SessionStore::write_snapshot(path, &bytes, seq)
+    }
+
+    /// Persist atomically + durably via the shared [`SessionStore::write_snapshot`]
+    /// discipline (the same as `cockpit.json`). Synchronous — called only by the
+    /// render thread on a lifecycle change, never per keystroke. Issues are written
+    /// in a stable order so the file diffs cleanly.
+    pub fn save(&self, path: &Path) -> Result<(), StateError> {
+        Self::save_logs(path, self.issue_logs_for(None))
+    }
+
+    /// Persist only one project's issue logs to that project's ledger file.
+    pub fn save_project(&self, path: &Path, project_id: &str) -> Result<(), StateError> {
+        Self::save_logs(path, self.issue_logs_for(Some(project_id)))
     }
 }
 
@@ -382,6 +422,54 @@ mod tests {
         l.begin("proj-b", "ENG-1", "b".into(), 2);
         assert_eq!(l.episodes("proj-a", "ENG-1").len(), 1);
         assert_eq!(l.episodes("proj-b", "ENG-1").len(), 1);
+    }
+
+    #[test]
+    fn save_project_files_each_projects_slice_in_isolation() {
+        // NEW-23: the in-memory ledger spans EVERY project (it records events before
+        // the active-project scoping guard), but each project must persist to its OWN
+        // file. `save_project` writes only its slice — so a backgrounded project's
+        // episode can never leak into the active project's ledger.json (the H3
+        // cross-file mis-file the one-file-per-project model exists to prevent). The
+        // sibling `..keeps_separate_logs` proves in-memory separation; this proves the
+        // separation survives the round-trip to disk, which `save_ledgers` relies on.
+        let mut l = Ledger::default();
+        l.begin("proj-a", "ENG-1", "a".into(), 1);
+        l.note_terminal("proj-a", "ENG-1", AgentStatus::Done, 5);
+        l.begin("proj-b", "ENG-9", "b".into(), 2);
+        l.note_terminal("proj-b", "ENG-9", AgentStatus::Failed, 6);
+
+        let path_a = temp_path();
+        let path_b = temp_path();
+        l.save_project(&path_a, "proj-a").unwrap();
+        l.save_project(&path_b, "proj-b").unwrap();
+
+        let a = Ledger::load(&path_a).unwrap();
+        assert_eq!(
+            a.episodes("proj-a", "ENG-1").len(),
+            1,
+            "A's own run is in A's file"
+        );
+        assert!(
+            a.episodes("proj-b", "ENG-9").is_empty(),
+            "B's run must NOT leak into A's ledger.json"
+        );
+        assert!(a.project_ids().contains(&"proj-a".to_string()));
+        assert!(
+            !a.project_ids().contains(&"proj-b".to_string()),
+            "A's file holds only A's projects"
+        );
+
+        let b = Ledger::load(&path_b).unwrap();
+        assert_eq!(
+            b.episodes("proj-b", "ENG-9").len(),
+            1,
+            "B's own run is in B's file"
+        );
+        assert!(
+            b.episodes("proj-a", "ENG-1").is_empty(),
+            "A's run must NOT leak into B's ledger.json"
+        );
     }
 
     #[test]

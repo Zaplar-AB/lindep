@@ -86,9 +86,10 @@ pub enum Action {
     FocusNav,
     /// Non-destructive zoom of the focused window to fill the strip.
     ZoomToggle,
-    /// Pin / unpin the focused window (persistence).
+    /// Pin = keep the focused coin as a permanent window (it stops following the
+    /// selection and persists across restarts); pinning again removes it.
     PinWindow,
-    /// Close = undock the focused window (an agent keeps running).
+    /// Close = remove a pinned window (its agent keeps running).
     CloseWindow,
     /// Kill the focused agent (confirmed) — separate from close.
     KillWindow,
@@ -121,6 +122,22 @@ pub enum Action {
     /// scratch datastores (v1.6, `Ctrl-a o`). Writes `~/.lindep/registry.toml`; the
     /// change applies on the next launch (the running workspace keeps its binding).
     ConfigureProject,
+    /// Restart the on-screen issue's agent in one press — reclaim a dead backend and
+    /// relaunch, collapsing the kill→reselect→Enter ritual (CF-14).
+    RestartAgent,
+    /// Walk to the next live agent (any state), focusing its chat — "how are my agents
+    /// doing" without hunting the Spine (CF-14).
+    NextAgent,
+    /// Launch every READY issue up to the concurrency cap in one press; the rest queue
+    /// and auto-launch as agents finish (CF-14).
+    DispatchReady,
+    /// Launch the selected issue but always open the repo multi-select first, even on a
+    /// single-candidate project — the on-demand way to give one agent more than one repo
+    /// (and, from inside the modal, add a registered repo the project doesn't yet list).
+    /// Plain `Enter` keeps its fast path; this is the explicit "choose repos" entry (CF-20).
+    ChooseRepos,
+    /// Start an ad-hoc agent that is not tied to a Linear issue.
+    AskAgent,
 }
 
 /// `(action, config name, default keys)` for the **direct** keys consulted when
@@ -155,6 +172,7 @@ const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::ToggleHelp, "help", &["?"]),
     (Action::ToggleSummary, "summary", &["i"]),
     (Action::ToggleLedger, "ledger", &["t"]),
+    (Action::PinWindow, "pin", &["p"]),
 ];
 
 /// `(action, config name, default keys)` for the **prefix** verbs, reached as
@@ -194,6 +212,12 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     // `Ctrl-a Tab` flips the active window chat⇄deps from any focus — notably
     // from inside a chat, where a bare Tab would go to the agent's PTY.
     (Action::ContextToggle, "context", &["tab"]),
+    // CF-14 core-loop accelerators (r / j / g are unused in the verb table).
+    (Action::RestartAgent, "restart", &["r"]),
+    (Action::NextAgent, "next-agent", &["j"]),
+    (Action::DispatchReady, "dispatch-ready", &["g"]),
+    (Action::ChooseRepos, "choose-repos", &["c"]),
+    (Action::AskAgent, "ask", &["?"]),
 ];
 
 /// The default prefix chord — tmux's `Ctrl-A`, which never collides with
@@ -738,6 +762,32 @@ mod tests {
     }
 
     #[test]
+    fn pin_is_direct_and_prefixed() {
+        let km = Keymap::default();
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('p'), KeyModifiers::NONE)),
+            Some(Action::PinWindow)
+        );
+        assert_eq!(
+            km.verb_for(ev(KeyCode::Char('p'), KeyModifiers::NONE)),
+            Some(Action::PinWindow)
+        );
+    }
+
+    #[test]
+    fn ask_is_a_prefix_verb() {
+        let km = Keymap::default();
+        assert_eq!(
+            km.verb_for(ev(KeyCode::Char('?'), KeyModifiers::NONE)),
+            Some(Action::AskAgent)
+        );
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('?'), KeyModifiers::NONE)),
+            Some(Action::ToggleHelp)
+        );
+    }
+
+    #[test]
     fn the_prefix_is_ctrl_a_by_default() {
         let km = Keymap::default();
         assert!(km.is_prefix(ev(KeyCode::Char('a'), KeyModifiers::CONTROL)));
@@ -965,5 +1015,20 @@ mod tests {
         assert_eq!(cfg.prefix.as_deref(), Some("ctrl-b"));
         assert!(matches!(cfg.keys.get("jump-needs-you"), Some(KeySpec::Many(v)) if v.len() == 2));
         assert!(matches!(cfg.verbs.get("kill"), Some(KeySpec::One(s)) if s == "k"));
+    }
+
+    #[test]
+    fn every_config_action_name_is_documented_in_the_readme() {
+        // The README's rebinding reference must stay in lockstep with the bindable
+        // actions, so the docs can't silently drift: a dropped action (the v1.7
+        // `sort` removal) is never left in an example, and a new one (the paging
+        // keys) is never missing. Mirrors the keymap's own label tests.
+        const README: &str = include_str!("../README.md");
+        for (_, name, _) in DIRECT_DEFAULTS.iter().chain(VERB_DEFAULTS.iter()) {
+            assert!(
+                README.contains(&format!("`{name}`")),
+                "config action `{name}` is not listed in the README action-name reference"
+            );
+        }
     }
 }

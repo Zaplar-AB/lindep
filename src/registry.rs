@@ -693,18 +693,99 @@ pub fn write_binding(
     if out == existing {
         return Ok(false);
     }
+    write_registry_atomic(&path, &out)?;
+    Ok(true)
+}
+
+/// Append `handle` to a project's `candidates` set in `registry.toml`, preserving the
+/// file's comments, ordering, and every other field (scratch datastores, other
+/// projects, the `[[repo]]` blocks). This is the durable side of the at-launch repo
+/// picker's "add another repo" (CF-20): a human deliberately widening one project's
+/// candidate set — its **trust boundary** — so the agent may span the repo and a later
+/// `--resume` / `request-repo` still knows it. Returns `Ok(false)` (no write) when the
+/// project already lists `handle`; errors if the project id is unknown or the file is
+/// unreadable. `handle` must already be a registered `[[repo]]` — this only references
+/// an existing repo, it never creates one.
+pub fn add_candidate(
+    layout: &Layout,
+    project_id: &str,
+    handle: &str,
+) -> Result<bool, RegistryError> {
+    use toml_edit::{Array, DocumentMut, value};
+
+    let path = layout.registry_path();
+    let existing = std::fs::read_to_string(&path).map_err(|source| RegistryError::Write {
+        path: path.clone(),
+        source,
+    })?;
+    let mut doc = existing
+        .parse::<DocumentMut>()
+        .map_err(|source| RegistryError::EditParse {
+            path: path.clone(),
+            source: Box::new(source),
+        })?;
+
+    let projects = doc
+        .get_mut("project")
+        .and_then(|i| i.as_array_of_tables_mut())
+        .ok_or_else(|| RegistryError::Write {
+            path: path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "`project` in registry.toml is not an array of tables",
+            ),
+        })?;
+    let slot = projects
+        .iter_mut()
+        .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(project_id))
+        .ok_or_else(|| RegistryError::UnknownProject {
+            project_id: project_id.to_string(),
+        })?;
+
+    // Today's candidate set: the explicit `candidates` array, or — when it's omitted
+    // (the tidy single-repo form) — just the `primary` the loader folds in. Keep the
+    // primary first so the picker's declared order is stable, then append `handle`.
+    let primary = slot
+        .get("primary")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut cands: Vec<String> = slot
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if cands.is_empty() && !primary.is_empty() {
+        cands.push(primary);
+    }
+    if cands.iter().any(|c| c == handle) {
+        return Ok(false);
+    }
+    cands.push(handle.to_string());
+    slot["candidates"] = value(cands.into_iter().collect::<Array>());
+
+    write_registry_atomic(&path, &doc.to_string())?;
+    Ok(true)
+}
+
+/// Durably replace `registry.toml` with `out`, matching `SessionStore::write_snapshot`:
+/// a process-unique sibling temp (so two lindep instances both writing can't collide on
+/// one fixed temp name and corrupt the user-global registry), fsync the temp, rename,
+/// then fsync the parent dir so the rename survives a crash. Shared by the wizard
+/// ([`write_binding`]) and the at-launch candidate add ([`add_candidate`]).
+fn write_registry_atomic(path: &Path, out: &str) -> Result<(), RegistryError> {
     let parent = path.parent();
     if let Some(parent) = parent {
         std::fs::create_dir_all(parent).map_err(|source| RegistryError::Write {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source,
         })?;
     }
-    // Write durably, matching `SessionStore::write_snapshot`: a process-unique sibling
-    // temp (so two lindep instances both onboarding can't collide on one fixed temp
-    // name and corrupt the user-global registry), fsync the temp, rename, then fsync
-    // the parent dir so the rename survives a crash.
-    let mut tmp = path.clone();
+    let mut tmp = path.to_path_buf();
     tmp.set_file_name(format!("registry.toml.tmp.{}", std::process::id()));
     let write_tmp = || -> std::io::Result<()> {
         use std::io::Write;
@@ -719,10 +800,10 @@ pub fn write_binding(
             source,
         }
     })?;
-    std::fs::rename(&tmp, &path).map_err(|source| {
+    std::fs::rename(&tmp, path).map_err(|source| {
         let _ = std::fs::remove_file(&tmp);
         RegistryError::Write {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source,
         }
     })?;
@@ -734,7 +815,7 @@ pub fn write_binding(
                 source,
             })?;
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Parse the registry document: repos first (so projects can cross-reference
@@ -1165,7 +1246,9 @@ mod tests {
             "the first definition is kept"
         );
         assert!(
-            warnings.iter().any(|w| w.contains("declared more than once")),
+            warnings
+                .iter()
+                .any(|w| w.contains("declared more than once")),
             "{warnings:?}"
         );
     }
@@ -1253,7 +1336,10 @@ mod tests {
             "#,
         );
         let (reg, warnings) = Registry::load_at(layout);
-        assert!(reg.repo("evil").is_none(), "the unsafe-remote repo is dropped");
+        assert!(
+            reg.repo("evil").is_none(),
+            "the unsafe-remote repo is dropped"
+        );
         assert!(reg.repo("api").is_some(), "the safe repo still loads");
         assert!(
             warnings.iter().any(|w| w.contains("unsafe `remote`")),
@@ -1568,6 +1654,192 @@ mod tests {
         let proj = reg.project("p-uuid").unwrap();
         assert_eq!(proj.primary, "core-pms");
         assert_eq!(proj.candidates, vec!["core-pms"]);
+    }
+
+    #[test]
+    fn a_two_repo_project_round_trips_both_candidates_for_the_multi_select() {
+        // CF-17: a project mapping two repos must persist BOTH as candidates so the
+        // up-front repo multi-select (gated on >1 candidate) actually offers them —
+        // guarding the writer's `[primary]`-only elision and the loader's unknown-drop
+        // that would otherwise silently starve the modal back to a single repo.
+        let root = temp_root("two-candidate-roundtrip");
+        let layout = Layout::new(&root);
+        let api = RepoDraft {
+            handle: "api".into(),
+            remote: Some("git@github.com:zaplar/api".into()),
+            local: None,
+        };
+        let web = RepoDraft {
+            handle: "web".into(),
+            remote: Some("git@github.com:zaplar/web".into()),
+            local: None,
+        };
+        let project = ProjectDraft {
+            id: "p-multi".into(),
+            handle: "platform".into(),
+            name: "Platform".into(),
+            candidates: vec!["api".into(), "web".into()],
+            primary: "api".into(),
+            branch_prefix: None,
+        };
+        write_binding(&layout, &[api, web], &project, &[]).unwrap();
+
+        let (reg, warnings) = Registry::load_at(Layout::new(&root));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let proj = reg.project("p-multi").unwrap();
+        assert_eq!(
+            proj.candidates,
+            vec!["api", "web"],
+            "both repos persist as candidates"
+        );
+        assert_eq!(
+            reg.candidate_repos("p-multi").len(),
+            2,
+            "the multi-select modal is offered both repos (its gate is >1 candidate)"
+        );
+    }
+
+    #[test]
+    fn add_candidate_widens_a_single_repo_project_without_a_restart_path() {
+        // CF-20: a project with only its primary (candidates omitted, the tidy form)
+        // gains a second candidate at launch. The write makes the multi-select gate
+        // (>1 candidate) fire next time — the durable half of the at-launch add.
+        let root = temp_root("add-cand-single");
+        let layout = write_registry(
+            &root,
+            r#"
+            [[repo]]
+            handle = "api"
+            remote = "git@github.com:zaplar/api"
+
+            [[repo]]
+            handle = "web"
+            remote = "git@github.com:zaplar/web"
+
+            [[project]]
+            id = "p1"
+            handle = "platform"
+            primary = "api"
+            "#,
+        );
+        assert!(
+            add_candidate(&layout, "p1", "web").unwrap(),
+            "the first add writes"
+        );
+        let (reg, warnings) = Registry::load_at(Layout::new(&root));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let proj = reg.project("p1").unwrap();
+        assert_eq!(
+            proj.candidates,
+            vec!["api", "web"],
+            "primary stays first, the added repo follows"
+        );
+        assert_eq!(
+            reg.candidate_repos("p1").len(),
+            2,
+            "the multi-select is now offered both repos"
+        );
+    }
+
+    #[test]
+    fn add_candidate_is_a_no_op_when_already_listed() {
+        let root = temp_root("add-cand-dup");
+        let layout = write_registry(
+            &root,
+            r#"
+            [[repo]]
+            handle = "api"
+            remote = "git@github.com:zaplar/api"
+
+            [[repo]]
+            handle = "web"
+            remote = "git@github.com:zaplar/web"
+
+            [[project]]
+            id = "p1"
+            handle = "platform"
+            candidates = ["api", "web"]
+            primary = "api"
+            "#,
+        );
+        let before = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        assert!(
+            !add_candidate(&layout, "p1", "web").unwrap(),
+            "an already-listed candidate is a no-op"
+        );
+        let after = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        assert_eq!(before, after, "a no-op never rewrites the file");
+    }
+
+    #[test]
+    fn add_candidate_preserves_comments_scratch_and_sibling_projects() {
+        // The surgical array edit must leave the file's comments, the project's scratch
+        // datastore, and every other project untouched.
+        let root = temp_root("add-cand-preserve");
+        let layout = write_registry(
+            &root,
+            r#"
+            # hand-written note that must survive
+            [[repo]]
+            handle = "api"
+            remote = "git@github.com:zaplar/api"
+
+            [[repo]]
+            handle = "web"
+            remote = "git@github.com:zaplar/web"
+
+            [[project]]
+            id = "p1"
+            handle = "platform"
+            primary = "api"
+
+              [[project.scratch]]
+              name = "pg"
+              provision = "docker run pg"
+
+            [[project]]
+            id = "p2"
+            handle = "other"
+            primary = "web"
+            "#,
+        );
+        assert!(add_candidate(&layout, "p1", "web").unwrap());
+        let text = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        assert!(
+            text.contains("# hand-written note that must survive"),
+            "comments survive: {text}"
+        );
+        assert!(text.contains("[[project.scratch]]"), "scratch survives: {text}");
+        let (reg, warnings) = Registry::load_at(Layout::new(&root));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(reg.project("p1").unwrap().candidates, vec!["api", "web"]);
+        assert_eq!(
+            reg.project("p2").unwrap().candidates,
+            vec!["web"],
+            "the sibling project is untouched"
+        );
+    }
+
+    #[test]
+    fn add_candidate_rejects_an_unknown_project() {
+        let root = temp_root("add-cand-unknown");
+        let layout = write_registry(
+            &root,
+            r#"
+            [[repo]]
+            handle = "api"
+            remote = "git@github.com:zaplar/api"
+
+            [[project]]
+            id = "p1"
+            handle = "platform"
+            primary = "api"
+            "#,
+        );
+        assert!(matches!(
+            add_candidate(&layout, "ghost", "api"),
+            Err(RegistryError::UnknownProject { .. })
+        ));
     }
 
     #[test]

@@ -431,10 +431,12 @@ impl AgentBackend for PtyAgent {
 
     fn resize(&self, rows: u16, cols: u16) -> Result<(), AgentError> {
         let (rows, cols) = (rows.max(1), cols.max(1));
-        // Both halves must learn the size, or claude's UI and our render diverge.
-        if let Ok(mut parser) = self.parser.write() {
-            parser.screen_mut().set_size(rows, cols);
-        }
+        // Both halves must learn the size, or claude's UI and our render diverge — but
+        // resize the kernel PTY FIRST and mutate the vt100 grid only on success, so a
+        // failed / poisoned master resize leaves BOTH halves at the old (consistent)
+        // size. (The old order shrank the grid first; on a master `Err` that left the
+        // grid ahead of the child AND defeated the A3 bottom-align, since the grid no
+        // longer read as "too tall".) (E-S2.)
         let master = self.master.lock().map_err(|_| AgentError::Poisoned)?;
         master
             .resize(PtySize {
@@ -443,7 +445,11 @@ impl AgentBackend for PtyAgent {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| AgentError::Pty(format!("{e:#}")))
+            .map_err(|e| AgentError::Pty(format!("{e:#}")))?;
+        if let Ok(mut parser) = self.parser.write() {
+            parser.screen_mut().set_size(rows, cols);
+        }
+        Ok(())
     }
 
     fn parser(&self) -> Arc<RwLock<Parser>> {

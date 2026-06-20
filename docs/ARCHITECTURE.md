@@ -4,7 +4,7 @@
 > (layers, concurrency, data flow, lifecycle, state, hooks) and the Operating
 > guide reflect the shipped product; the bullets below trace how it got here from
 > the original v1 spine.
-> - **v1.6 managed workspaces (substrate landed)**: lindep is now a **repo-independent workspace manager run from anywhere** (`git_toplevel` anchoring is gone). A global `~/.lindep/registry.toml` (`registry` module) names repos + projects; opening a project materialises its isolated `~/.lindep/projects/<handle>/` world via a 3-layer git model (`mirror` module: bare mirror → reference clone → per-issue worktree, the re-rooted `worktree` manager). `STATE_VERSION` is `3` (`Session` gains a per-issue repo handle set); `reject_repo_root_collisions` and the `projects.toml` mapping are **deleted** (per-project ref namespaces make collisions structurally impossible). Every agent commit **auto-pushes** (`post-commit` hook → `--post-commit` forwarder → `AgentCommitted` → per-handle push); `Ctrl-a e` opens the workspace in an editor. *Still pending (additive, on this substrate): up-front multi-repo select, fenced agent lazy-pull, mirror staleness/refcount teardown, the global all-agents view.*
+> - **v1.6 managed workspaces (substrate landed)**: lindep is now a **repo-independent workspace manager run from anywhere** (`git_toplevel` anchoring is gone). A global `~/.lindep/registry.toml` (`registry` module) names repos + projects; opening a project materialises its isolated `~/.lindep/projects/<handle>/` world via a 3-layer git model (`mirror` module: bare mirror → reference clone → per-issue worktree, the re-rooted `worktree` manager). `STATE_VERSION` is `3` (`Session` gains a per-issue repo handle set); `reject_repo_root_collisions` and the `projects.toml` mapping are **deleted** (per-project ref namespaces make collisions structurally impossible). Every agent commit **auto-pushes** (`post-commit` hook → `--post-commit` forwarder → `AgentCommitted{outcome}` → per-handle push), and the commit event carries the push's true `PushOutcome` (`Pushed` / `Rejected` / `LocalOnly`) so a *rejected* push raises a standing cross-project `⇡ N unpushed` chip instead of being papered over by a blanket "pushed"; a local-only repo still pushes to its synthesised mirror — the durability backstop a clone rebuild recovers from — but is labelled "committed", not "pushed". `Ctrl-a e` opens the workspace in an editor. *The additive v1.6/v1.7 work has since landed on this substrate: up-front multi-repo select (`Ctrl-a c`), fenced agent lazy-pull (`request-repo` → candidate-gated materialise), mirror staleness/refcount reclaim (`Ctrl-a m`), and the global all-agents screen (`Ctrl-a a`).*
 > - **v1.5 multi-project**: the session store, supervisor, and notification bus are keyed by `(project_id, issue)`; there are `workspace`, `picker`, and `ledger` modules; hooks carry an `x-lindep-token` and route via a workspace-wide registry.
 > - **Cockpit v3.2 + v1.7 readiness UX**: the live UI is a `Ctrl-a`-prefixed tiling window manager (Spine / Coin / Fleet, auto mosaic/rail); the Spine is a readiness-banded schedule (`App::readiness`) and `Enter` dispatches a READY issue. `i` = issue summary, `t` = ledger — no composer, no chat-wall, no agents-roster tab. The Operating guide below reflects this; for the exhaustive, remappable keymap trust the **README** and the in-app `?` overlay.
 
@@ -19,8 +19,9 @@ Build Plan"*; the tui-term feasibility verdict is in
 
 **Linear is the source of truth for planning. lindep is the visibility +
 orchestration layer.** The existing dependency-graph TUI is now a *cockpit* that
-launches and supervises fleets of real `claude` (Claude Code) agents — each
-anchored to a Linear issue, each in its own git worktree. We **spawn the real
+launches and supervises fleets of real `claude` (Claude Code) agents — usually
+anchored to a Linear issue, or to a synthetic `ask-*` id for an ad-hoc agent,
+each in its own git worktree. We **spawn the real
 `claude`**; we do not reimplement it.
 
 Inside a git repo lindep is the cockpit; with `--demo` or outside a repo it
@@ -35,13 +36,13 @@ degrades cleanly to the read-only graph viewer.
 | 3. Control plane | `backend` | `AgentBackend` trait + `PtyAgent` (PTY host); Codex/Aider slot in here |
 | 4. Pipeline engine | *(v3)* | Generic stage machine over `.lindep/pipeline.toml` — not in v1 |
 | 5. Notification bus | `notify` | Claude hooks → loopback endpoint → `AppEvent` |
-| 6. Worktree manager | `worktree` | One git worktree + branch per issue, crash-safe |
+| 6. Worktree manager | `worktree` | One git worktree + branch per issue or synthetic ask id, crash-safe |
 | (glue) | `event`, `supervisor`, `session` | Async backbone, fleet owner, durable state |
 
 **The readiness model (v1.7).** The cockpit's one noun is the Issue; its one
 *state* is `App::readiness` — a fusion of the **graph truth** (`model`: blocked /
 done / in-cycle) and the **agent truth** (`session`: running / needs-you) into a
-single band: **NEEDS-YOU · RUNNING · READY · BLOCKED · DONE**. A live agent
+single band: **NEEDS-YOU · WORKING · IDLE · READY · BLOCKED · DONE**. A live agent
 outranks the graph; a terminal agent reverts to graph truth. It lives in `app`
 (not the pure, agent-free `model` layer) and is the *single* source for the
 spine's banded schedule (ENG-558), the dispatch gate `button()` (ENG-559), and
@@ -102,7 +103,7 @@ keyboard: when it's an **agent** pane the key is encoded by
 `backend::key_to_bytes` and written to the PTY via `AgentBackend::send_input` —
 the `Ctrl-a` prefix is the sole escape (pressed twice it forwards a literal
 `Ctrl-a`). When the **Spine** or a **Deps** window is focused the key drives the
-cockpit directly (move, `Enter` to dispatch a ready issue, sort/filter, the
+cockpit directly (move, `Enter` to dispatch a ready issue, filter, the
 needs-you/cycle jumps, graph navigation); `Ctrl-a` then reaches the window verbs
 (focus, zoom, pin, close, kill, …) from any focus.
 
@@ -178,6 +179,7 @@ Two subtleties worth knowing, both the result of review findings:
 ```
 .lindep/
   worktrees/<ISSUE>/         one git worktree + branch felix/<issue>-<slug> per issue
+  worktrees/<ASK-ID>/        throwaway ad-hoc agent worktree (`ask-*`, not pushed)
   hooks/<ISSUE>.settings.json generated hook config passed via `claude --settings`
   state.json                 atomic (temp+rename) serde_json session store, versioned
   transcripts/…              NDJSON logs referenced by path (never inlined)
@@ -187,6 +189,11 @@ The **process is disposable; the conversation is durable.** Each issue's `claude
 `session_id` is a deterministic UUIDv5 of the issue id, so even if `state.json` is
 lost the same id regenerates and `--resume` reconnects. On startup the store is
 reconciled against live worktrees (records whose worktree vanished are dropped).
+
+Ad-hoc agents use the same machinery with a synthetic `ask-*` id minted by
+`worktree::synthetic_ask_id`. The cockpit grafts that id into the graph as an
+edgeless row, the supervisor uses the normal worktree/session/hook/PTY path, and
+terminal cleanup removes the throwaway worktree without pushing the branch.
 
 ## Notifications & hooks
 
@@ -218,20 +225,20 @@ scrolling **rail** beyond that (pin a layout with `Ctrl-a |`). The focused windo
 takes every keystroke; **`Ctrl-a` is the prefix** that escapes to window commands
 (focus, zoom, pin, close, kill, layout, switch-project, the global all-agents
 screen, …), pressed twice to send a literal `Ctrl-a` to the agent. Direct keys
-(movement, sort/filter, search, the `i` summary / `t` ledger overlays) apply when
+(movement, filter, search, the `i` summary / `t` ledger overlays) apply when
 the Spine or a Deps window is focused; an Agent pane forwards every direct key to
 its PTY. The full, *remappable* binding list lives in the README and the in-app
 `?` overlay — the source of truth is the `keymap` module's `Action` enum +
 defaults, not a table here (re-listing keys is exactly how this section went stale).
 
 **The Spine is a readiness schedule (v1.7).** Issues are banded top→bottom
-**NEEDS-YOU · RUNNING · READY · BLOCKED · DONE** from `App::readiness` (the fused
+**NEEDS-YOU · WORKING · IDLE · READY · BLOCKED · DONE** from `App::readiness` (the fused
 per-issue state — see [the readiness model](#the-six-layers--modules) above), so
 the work needing you sits at the top and the dispatchable **READY** lane (a `▸`
 rail) reads at a glance. **Dispatch** is `Enter` on a READY row — it launches an
 agent in the issue's own worktree + branch; a BLOCKED row is refused with its
 blocker named, so you never launch work that can't progress. There is no separate
-agents-roster tab any more: live agents *are* the NEEDS-YOU and RUNNING bands.
+agents-roster tab any more: live agents *are* the NEEDS-YOU, WORKING and IDLE bands.
 
 Agent state reads two ways at once — a whole-row **colour tint** (the entire issue
 row, not just an edge; needs-you breathes) and a **marker** in a fixed left gutter
@@ -241,7 +248,7 @@ row, not just an edge; needs-you breathes) and a **marker** in a fixed left gutt
 |-------|-------|--------|----------|
 | spawning | `◌` | green | — |
 | working | spinner `⠋…` | **orange** | spins |
-| needs you | `⚑` | **amber** | pulses |
+| needs you | `⚑` | **red** | pulses |
 | idle (alive) | `◦` | teal | — |
 | stopped (you cancelled it) | `◼` | graphite | — |
 | done | `✓` | teal | — |
@@ -282,7 +289,7 @@ to defaults rather than aborting.
 
 ## Testing
 
-272 tests run headlessly. Notably: the worktree manager against a real temp git
+481 tests run headlessly. Notably: the worktree manager against a real temp git
 repo; the session store round-trip/reconcile; the hook endpoint via real loopback
 POSTs mapping concurrent agents; the **PTY plumbing end-to-end against a non-`claude`
 program** (`sh`); the supervisor (launch/cancel/shutdown/relaunch/reap) against a

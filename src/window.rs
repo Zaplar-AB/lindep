@@ -930,14 +930,20 @@ mod tests {
         let mut ws = WindowSet::new();
         assert!(!ws.layout_manual, "starts in auto");
         ws.cycle_layout();
-        assert!(ws.layout_manual && ws.layout == LayoutMode::Rail, "auto → rail");
+        assert!(
+            ws.layout_manual && ws.layout == LayoutMode::Rail,
+            "auto → rail"
+        );
         ws.cycle_layout();
         assert!(
             ws.layout_manual && ws.layout == LayoutMode::Mosaic,
             "rail → mosaic"
         );
         ws.cycle_layout();
-        assert!(!ws.layout_manual, "mosaic → auto (adaptive layout restored)");
+        assert!(
+            !ws.layout_manual,
+            "mosaic → auto (adaptive layout restored)"
+        );
     }
 
     #[test]

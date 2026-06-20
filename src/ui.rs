@@ -33,7 +33,25 @@ const MAX_TITLE: usize = 64;
 /// cramped terminal) collapses to a one-line summary instead of a garbled grid.
 const MIN_PTY_W: u16 = 24;
 
+fn display_status(app: &App, issue: &str, status: Option<AgentStatus>) -> Option<AgentStatus> {
+    status.map(|s| app.display_agent_status(issue, s))
+}
+
 pub fn draw(app: &mut App, frame: &mut Frame) {
+    // Accessibility floor: below this the body + modals collapse to ~0 rows and render
+    // an unusable sliver with no signpost. Bail with a "too small" line instead (like
+    // htop / lazygit / k9s), gating on both axes.
+    let full = frame.area();
+    if full.height < 8 || full.width < MIN_PTY_W {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " terminal too small — resize to at least 24×8 ",
+                Style::new().fg(MUTED),
+            ))),
+            full,
+        );
+        return;
+    }
     let [header, body, detail, hints] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -189,21 +207,28 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     // Workspace roll-up (ENG-406): needs-you across EVERY project. The "elsewhere"
     // badge breaks out the backgrounded subset; `agents` (the live count) is metadata.
     let (agents, needs_you) = app.workspace_summary();
-    if needs_you > 0 {
+    // Disjoint split so the two badges never read as additive (elsewhere ⊆ total): the
+    // "elsewhere" count is in projects you've switched away from, so subtract it to get
+    // the local, actionable-now count. A backgrounded prompt is never invisible
+    // (Ctrl-a s / the global screen / cross-project `n` reach it; the switcher flags it).
+    let elsewhere = app.elsewhere_needs_you();
+    let here = needs_you.saturating_sub(elsewhere);
+    if here > 0 {
         spans.push(dot());
         spans.push(Span::styled(
-            format!("{needs_you} needs you ⚑"),
+            format!("{here} needs you ⚑"),
             theme::needs_you_style(app.frame),
         ));
     }
-    // Of the needs-you above, how many are in projects you've switched away from —
-    // so a backgrounded prompt is never invisible (Ctrl-a s to reach it, or the
-    // global screen / cross-project `n` jump; the switcher flags which project).
-    let elsewhere = app.elsewhere_needs_you();
     if elsewhere > 0 {
         spans.push(dot());
         spans.push(Span::styled(
-            format!("⚑{elsewhere} elsewhere"),
+            // Surface the cross-project teleport so a backgrounded prompt is reachable
+            // by being invited to use it, not just visible (CF-14).
+            format!(
+                "⚑{elsewhere} elsewhere · {} jumps",
+                app.keymap.verb_label(Action::JumpNeedsYou)
+            ),
             theme::needs_you_style(app.frame),
         ));
     }
@@ -227,18 +252,52 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     // compete with the pulsing needs-you cluster for the eye.
     if app.workspace.is_none() && !app.demo {
         spans.push(dot());
-        spans.push(Span::styled(
-            "⚠ agents off",
-            Style::new().fg(AMBER_400).add_modifier(Modifier::DIM),
-        ));
+        spans.push(Span::styled("⚠ agents off", Style::new().fg(AMBER_400)));
     } else if app.demo {
         // A demo is an intentional read-only viewer, not a degraded run — give it its
         // own standing chip so the read-only state is legible after the first keystroke
         // wipes the boot banner (its symmetric counterpart to "agents off").
         spans.push(dot());
+        spans.push(Span::styled("◌ read-only demo", Style::new().fg(MUTED)));
+    }
+    // A re-config (Ctrl-a o) wrote registry.toml but the live session still runs the
+    // old binding — a standing dim chip keeps that divergence visible until restart,
+    // since the "saved … restart to apply" footer is wiped by the next keystroke.
+    if app.config_restart_pending {
+        spans.push(dot());
         spans.push(Span::styled(
-            "read-only demo",
-            Style::new().fg(MUTED).add_modifier(Modifier::DIM),
+            "⟳ restart to apply config",
+            Style::new().fg(AMBER_400),
+        ));
+    }
+    // A discard that kept the worktree (rejected push or cleanup failure) left local
+    // state on disk — a standing chip so the work isn't silently stranded.
+    if !app.kept_worktrees.is_empty() {
+        spans.push(dot());
+        let kept = app.kept_worktrees.len();
+        spans.push(Span::styled(
+            format!("⚠ {kept} kept worktree{}", if kept == 1 { "" } else { "s" }),
+            Style::new().fg(AMBER_400),
+        ));
+    }
+    // A rejected auto-push left commits stranded on the local clone (never reaching
+    // the true remote) — a standing, higher-salience chip (cross-project, so it counts
+    // strands in backgrounded projects too) so the failure isn't lost when the next
+    // footer wipes the transient line (the data-integrity contract).
+    let unpushed = app.unpushed_count();
+    if unpushed > 0 {
+        spans.push(dot());
+        spans.push(Span::styled(
+            format!("⇡ {unpushed} unpushed"),
+            Style::new().fg(RED_400),
+        ));
+    }
+    // A lightweight "you're winning" tally of clean finishes this session (CF-14).
+    if app.shipped_today > 0 {
+        spans.push(dot());
+        spans.push(Span::styled(
+            format!("✓ {} shipped", app.shipped_today),
+            Style::new().fg(GREEN_400),
         ));
     }
     // ── Lower-salience graph + agent metadata. ──
@@ -287,7 +346,10 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         )])
     };
 
-    let right_w = u16::try_from(right.width()).unwrap_or(u16::MAX);
+    let min_left = 24u16.min(area.width);
+    let right_w = u16::try_from(right.width())
+        .unwrap_or(u16::MAX)
+        .min(area.width.saturating_sub(min_left));
     let [left, right_area] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(right_w)]).areas(area);
     frame.render_widget(Paragraph::new(Line::from(spans)), left);
@@ -328,15 +390,36 @@ fn render_strip(app: &mut App, frame: &mut Frame, area: Rect) {
         // the Spine is focused), and a column of compact text cards for every other
         // docked window (never the preview).
         LayoutMode::Rail => {
-            let (full, cards) = layout::rail(area, n, focus, active, preview);
+            let (full, cards, overflow) = layout::rail(area, n, focus, active, preview);
             for p in full {
                 render_window_at(app, frame, p.rect, p.index);
             }
             for p in cards {
                 render_card(app, frame, p.rect, p.index);
             }
+            if let Some(overflow) = overflow {
+                render_rail_overflow(frame, overflow.rect, overflow.hidden);
+            }
         }
     }
+}
+
+fn render_rail_overflow(frame: &mut Frame, rect: Rect, hidden: usize) {
+    if rect.area() == 0 {
+        return;
+    }
+    // The overflow slot is always exactly one row tall (the rail splits into
+    // `visible + 1` equal slots, each 1 row), so a bordered block would spend that
+    // single row on its top border and zero out the inner area — suppressing the
+    // count entirely (NEW-03). Render the count directly as a borderless muted line
+    // so `+N` actually shows; the `⋯` carries the "more" cue the border used to.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" ⋯ +{hidden} more"),
+            Style::new().fg(MUTED).bold(),
+        ))),
+        rect,
+    );
 }
 
 /// Render the window at `idx` as a full pane (the Spine, a live PTY screen, or a
@@ -383,7 +466,7 @@ fn render_card(app: &App, frame: &mut Frame, rect: Rect, idx: usize) {
             issue,
             mode: CoinMode::Chat,
         } => {
-            let status = app.fleet.get(issue).copied();
+            let status = display_status(app, issue, app.fleet.get(issue).copied());
             let exited = app
                 .backends
                 .get(issue)
@@ -576,7 +659,12 @@ fn render_banded_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bo
         if *key == app.root {
             selected = Some(items.len());
         }
-        items.push(issue_item(app, key, band == Readiness::Ready, selected_here));
+        items.push(issue_item(
+            app,
+            key,
+            band == Readiness::Ready,
+            selected_here,
+        ));
         bands.push(band);
     }
     let [sticky_area, list_area] =
@@ -616,6 +704,30 @@ fn render_banded_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bo
     frame.render_widget(Paragraph::new(sticky), sticky_area);
 }
 
+/// The (glyph, label, accent) for a readiness band header. Factored out so the
+/// renderer and the disjointness tests share one source of truth.
+///
+/// One distinct glyph per band, each disjoint from the row marker it sits above so
+/// a header never stutters with its own rows (the v1.7 IDLE `◦` and WORKING `◉`
+/// regressions — see `band_headers_never_stutter_with_their_member_rows`):
+///   • `⚐` (outline flag) ≠ the row's filled, breathing `⚑`,
+///   • `◎` (bullseye)     ≠ the repo-select checkbox `◉`,
+///   • `◯` (large ring)   ≠ the idle marker `◦`.
+/// `▸` (READY) and `✓` (DONE) intentionally echo their own agent markers — like the
+/// rail, the lane rows *should* match — so they stay distinct by COLOUR (a muted header
+/// vs the live marker hue), which `band_headers_never_stutter…` verifies; `⊘` (BLOCKED)
+/// is off every marker / priority / checkbox set.
+fn band_header(band: Readiness) -> (&'static str, &'static str, Color) {
+    match band {
+        Readiness::NeedsYou => ("⚐", "NEEDS YOU", RED_400),
+        Readiness::Working => ("◎", "WORKING", ORANGE_400),
+        Readiness::Idle => ("◯", "IDLE", STATUS_400),
+        Readiness::Ready => ("▸", "READY", INK),
+        Readiness::Blocked => ("⊘", "BLOCKED", AMBER_400),
+        Readiness::Done => ("✓", "DONE", MUTED),
+    }
+}
+
 /// A thin section header between readiness bands. Reuses each band's *existing*
 /// accent (no new hue): the glyph + label carry the colour, a dim rule fills the
 /// row. The READY header gets a right-aligned `dispatch` hint; DONE dims.
@@ -627,16 +739,7 @@ fn band_divider<'a>(band: Readiness, rule_width: u16, dispatch: bool) -> ListIte
 /// the sticky header pinned to the top of the spine viewport (A1), so the two
 /// always read identically. `dispatch` gates the READY lane's launch affordance.
 fn band_divider_line<'a>(band: Readiness, rule_width: u16, dispatch: bool) -> Line<'a> {
-    // One distinct, non-triangle glyph per band — `▸` is reserved for the READY
-    // rail + the selection cursor, so the active bands can't be mistaken for it.
-    let (glyph, label, accent) = match band {
-        Readiness::NeedsYou => ("⚑", "NEEDS YOU", AMBER_400),
-        Readiness::Working => ("◉", "WORKING", ORANGE_400),
-        Readiness::Idle => ("◦", "IDLE", STATUS_400),
-        Readiness::Ready => ("▸", "READY", INK),
-        Readiness::Blocked => ("⊘", "BLOCKED", AMBER_400),
-        Readiness::Done => ("✓", "DONE", MUTED),
-    };
+    let (glyph, label, accent) = band_header(band);
     let head = format!("{glyph} {label} ");
     // The READY divider carries the dispatch affordance only when agents can
     // actually launch (a live workspace) — never in the read-only demo or a degraded
@@ -681,7 +784,7 @@ fn render_agent_window(
     if rect.area() == 0 {
         return;
     }
-    let status = app.fleet.get(issue).copied();
+    let status = display_status(app, issue, app.fleet.get(issue).copied());
     let backend = app.backends.get(issue).map(Arc::clone);
     let exited = backend
         .as_ref()
@@ -738,13 +841,23 @@ fn render_agent_window(
         return;
     };
 
-    // Too small for a real preview — collapse to a one-line summary.
+    // Too small for a real preview — collapse to a one-line summary. When the tile is
+    // FOCUSED, say so in amber: keystrokes are landing in this invisible pane, so tell
+    // the user how to enlarge it instead of letting them type blind into claude (D-MED).
     if pane.height < 2 || pane.width < MIN_PTY_W {
+        let (text, style) = if focused {
+            (
+                format!(
+                    " {} zoom · {key} too small",
+                    app.keymap.verb_label(Action::ZoomToggle)
+                ),
+                Style::new().fg(AMBER_400),
+            )
+        } else {
+            (format!(" {key} · {label}"), Style::new().fg(MUTED))
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {key} · {label}"),
-                Style::new().fg(MUTED),
-            ))),
+            Paragraph::new(Line::from(Span::styled(text, style))).wrap(Wrap { trim: true }),
             pane,
         );
         return;
@@ -817,7 +930,7 @@ fn render_deps_window(
         .as_ref()
         .map(|c| c.root.clone())
         .unwrap_or_default();
-    let status = app.fleet.get(&root).copied();
+    let status = display_status(app, &root, app.fleet.get(&root).copied());
     let breathe = !focused && status == Some(AgentStatus::NeedsYou);
     // The coin's *identity* (fixed) can diverge from the displayed deps root after a
     // re-root: Tab flips to the identity's chat, not the rooted issue's. Surface that
@@ -867,6 +980,35 @@ fn render_deps_window(
     if inner.area() == 0 {
         return;
     }
+    if inner.height < 2 || inner.width < MIN_PTY_W {
+        let (text, style) = if focused {
+            (
+                format!(
+                    " {} zoom · {root} deps too small",
+                    app.keymap.verb_label(Action::ZoomToggle)
+                ),
+                Style::new().fg(AMBER_400),
+            )
+        } else {
+            (format!(" {root} · deps"), Style::new().fg(MUTED))
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, style))).wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+    if crate::worktree::is_synthetic_ask_id(&root) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " ad-hoc agent · no dependency graph",
+                Style::new().fg(MUTED).italic(),
+            )))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
 
     let up_n = app.graph.direct_count(&root, Direction::Upstream);
     let up_t = app.graph.transitive(&root, Direction::Upstream);
@@ -888,12 +1030,12 @@ fn render_deps_window(
     }
 
     frame.render_widget(
-        section_header("▲ UPSTREAM", "must finish first", up_n, up_t),
+        section_header("▲ BLOCKED BY", "must finish first", up_n, up_t),
         up_head,
     );
     render_tree(app, frame, up_body, idx, Direction::Upstream, focused);
     frame.render_widget(
-        section_header("▼ DOWNSTREAM", "this unblocks", down_n, down_t),
+        section_header("▼ BLOCKS", "this unblocks", down_n, down_t),
         down_head,
     );
     render_tree(app, frame, down_body, idx, Direction::Downstream, focused);
@@ -989,7 +1131,14 @@ fn render_fleet_window(app: &mut App, frame: &mut Frame, rect: Rect, focused: bo
     ];
 
     let bands = g.levels();
-    let chips_per_row = ((inner.width.saturating_sub(6)) / 14).max(1) as usize;
+    let max_key_w = bands
+        .iter()
+        .flat_map(|band| band.iter())
+        .map(|key| UnicodeWidthStr::width(key.as_str()))
+        .max()
+        .unwrap_or(7);
+    let per_chip = (max_key_w + 6).max(10);
+    let chips_per_row = (usize::from(inner.width.saturating_sub(6)) / per_chip).max(1);
     let mut root_line: Option<usize> = None;
     for (level, band) in bands.iter().enumerate() {
         for (row, chunk) in band.chunks(chips_per_row).enumerate() {
@@ -1013,8 +1162,8 @@ fn render_fleet_window(app: &mut App, frame: &mut Frame, rect: Rect, focused: bo
                 };
                 spans.push(Span::styled(format!("{glyph} "), Style::new().fg(color)));
                 spans.push(Span::styled(key.to_string(), key_style));
-                if let Some(status) = app.fleet.get(key) {
-                    let (mark, mstyle) = theme::agent_marker(*status, app.frame);
+                if let Some(status) = display_status(app, key, app.fleet.get(key).copied()) {
+                    let (mark, mstyle) = theme::agent_marker(status, app.frame);
                     spans.push(Span::styled(format!(" {mark}"), mstyle));
                 }
                 spans.push(Span::raw("  "));
@@ -1084,19 +1233,23 @@ fn render_fleet_window(app: &mut App, frame: &mut Frame, rect: Rect, focused: bo
 
 fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
     if let Some(msg) = &app.status_msg {
-        // A pending kill confirmation is the one destructive prompt, so flag it red.
-        let style = if app.kill_confirm.is_some() {
-            Style::new().fg(RED_400).bold()
-        } else {
-            Style::new().fg(AMBER_400)
-        };
+        let style =
+            if app.kill_confirm.is_some() || app.discard_confirm.is_some() || app.quit_confirm {
+                Style::new().fg(RED_400).bold()
+            } else if app.repo_confirm.is_some() {
+                Style::new().fg(AMBER_400).bold()
+            } else {
+                Style::new().fg(AMBER_400)
+            };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(format!(" {msg}"), style))),
             area,
         );
         return;
     }
-    let Some(issue) = app.focused_issue() else {
+    // Describe the issue the pane shows — a re-rooted deps coin's cursor root included
+    // — so the detail bar agrees with the `i` summary and the dispatch/kill verbs (H6).
+    let Some(issue) = app.detail_key().and_then(|k| app.graph.get(k)) else {
         return;
     };
     let g = &app.graph;
@@ -1148,12 +1301,18 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
     let vk = |a| app.keymap.verb_key_label(a);
     let dk = |a| app.keymap.label_for(a);
     let text: String = if app.search_active {
-        " type to filter · ⏎ accept · esc clear".to_string()
+        " type to filter · ⏎ accept · esc clear · ctrl-c close".to_string()
     } else if app.kill_confirm.is_some() {
         " y / ⏎ confirm kill · any other key cancels".to_string()
+    } else if app.discard_confirm.is_some() {
+        " y / ⏎ confirm discard · any other key cancels".to_string()
+    } else if app.repo_confirm.is_some() {
+        " y / ⏎ pull repo · any other key denies".to_string()
+    } else if app.quit_confirm {
+        " y / ⏎ confirm quit · esc cancels".to_string()
     } else if app.prefix_armed {
         format!(
-            " {p} armed: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} layout · {} quit · {p} again → agent",
+            " {p} armed: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} layout · {} quit · {p} again → agent · {} for all",
             vk(Action::ContextToggle),
             vk(Action::ZoomToggle),
             vk(Action::PinWindow),
@@ -1161,6 +1320,7 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
             vk(Action::KillWindow),
             vk(Action::LayoutToggle),
             vk(Action::Quit),
+            dk(Action::ToggleHelp),
         )
     } else {
         match app.windows.focused_kind() {
@@ -1192,7 +1352,7 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
                 dk(Action::ToggleHelp),
             ),
             WindowKind::Spine => format!(
-                " ↑↓ move · ⇞⇟ page · ⏎ open agent · {} deps · {} map · {} needs-you · {} find · {} summary · {} ledger · {p} {} quit · {} help",
+                " ↑↓ move · ⇞⇟ page · ⏎ open agent · {} deps · {} map · {} needs you · {} find · {} summary · {} ledger · {p} {} quit · {} help",
                 dk(Action::OpenDeps),
                 dk(Action::OpenFleet),
                 dk(Action::JumpNeedsYou),
@@ -1214,128 +1374,179 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
 fn render_help(app: &mut App, frame: &mut Frame) {
     let direct = |action| app.keymap.label_for(action);
     let verb = |action| app.keymap.verb_label(action);
+    let prefix = app.prefix_label();
 
-    let rows: Vec<(String, &str)> = vec![
-        ("— the spine —".to_string(), ""),
+    let rows: Vec<(String, std::borrow::Cow<'static, str>)> = vec![
+        ("— the spine —".to_string(), "".into()),
         (
             format!("{} {}", direct(Action::MoveUp), direct(Action::MoveDown)),
-            "move the selection",
+            "move the selection".into(),
         ),
         (
             format!("{} {}", direct(Action::PageUp), direct(Action::PageDown)),
-            "page up / down (Home / End jump to top / bottom)",
+            "page up / down (Home / End jump to top / bottom)".into(),
         ),
         (
             direct(Action::Enter),
-            "open / focus an agent on the selection (active window → chat)",
+            "open / focus an agent on the selection".into(),
         ),
         (
             direct(Action::ContextToggle),
-            "flip the active window: chat ↔ deps (Ctrl-a Tab in a chat)",
+            format!(
+                "flip the current window's face: chat ↔ deps ({} {} in a chat)",
+                prefix,
+                app.keymap.verb_key_label(Action::ContextToggle)
+            )
+            .into(),
         ),
         (
             direct(Action::OpenDeps),
-            "dive into the active window's dependency tree",
+            "dive into the current window's deps".into(),
         ),
         (
             direct(Action::OpenFleet),
-            "open the project overview (Fleet) tab",
+            "open the project overview (the Fleet)".into(),
         ),
         (
             direct(Action::StartSearch),
-            "fuzzy-find issues by id or title",
+            "fuzzy-find issues by id or title".into(),
         ),
         (
             direct(Action::ToggleSummary),
-            "summary overlay for the selected issue (any key closes)",
+            "summary overlay for the selected issue (↑↓ scroll · esc / i close)".into(),
         ),
         (
             direct(Action::ToggleLedger),
-            "agent ledger: this issue's session history (any key closes)",
+            "agent ledger: this issue's session history (↑↓ scroll · esc / t close)".into(),
         ),
-        (direct(Action::CycleFilter), "cycle the issue filter"),
+        (direct(Action::CycleFilter), "cycle the issue filter".into()),
         (
             direct(Action::JumpNeedsYou),
-            "jump to the next agent that needs you (Ctrl-a n from a chat)",
+            format!(
+                "jump to the next agent that needs you ({} {} from a chat)",
+                prefix,
+                app.keymap.verb_key_label(Action::JumpNeedsYou)
+            )
+            .into(),
         ),
-        (direct(Action::JumpCycle), "jump through issues on a cycle"),
-        ("— a dependency window —".to_string(), ""),
+        (
+            direct(Action::JumpCycle),
+            "jump through issues on a cycle".into(),
+        ),
+        ("— deps —".to_string(), "".into()),
         (
             direct(Action::SwitchSide),
-            "switch the active tree (up ↔ down)",
+            "switch the active tree (blocked-by ↔ blocks)".into(),
         ),
         (
             direct(Action::Enter),
-            "re-root the lens onto the selected node",
+            "re-root the deps tree on the selected node".into(),
         ),
         (
             direct(Action::ToggleCollapse),
-            "collapse / expand the subtree",
+            "collapse / expand the subtree".into(),
         ),
-        (direct(Action::Back), "back to the previous root"),
-        (format!("— windows ({} prefix) —", app.prefix_label()), ""),
+        (direct(Action::Back), "back to the previous root".into()),
+        (format!("— windows ({} prefix) —", prefix), "".into()),
         (
             format!("{} {}", verb(Action::FocusLeft), verb(Action::FocusRight)),
-            "focus the window left / right",
+            "focus the window left / right".into(),
         ),
-        (verb(Action::FocusNav), "jump focus home to the nav (spine)"),
+        (
+            verb(Action::FocusNav),
+            "jump focus home to the nav (spine)".into(),
+        ),
         (
             verb(Action::AttachOrSpawn),
-            "open / focus an agent (from any window)",
+            "open / focus an agent (from any window)".into(),
         ),
         (
             verb(Action::ZoomToggle),
-            "zoom the focused window (non-destructive)",
+            "zoom the focused window (non-destructive)".into(),
         ),
         (
             verb(Action::PinWindow),
-            "pin = graduate the preview coin to a permanent tab",
+            "pin = keep this window permanently (it stops following the selection)"
+                .into(),
         ),
         (
             verb(Action::CloseWindow),
-            "close = undock a tab (an agent keeps running)",
+            "close = remove a pinned window (its agent keeps running)".into(),
         ),
         (
             verb(Action::KillWindow),
-            "kill the focused agent (confirmed)",
+            "kill the focused agent (confirmed)".into(),
+        ),
+        (
+            verb(Action::RestartAgent),
+            "restart the on-screen issue's agent (reclaim + relaunch)".into(),
+        ),
+        (
+            verb(Action::NextAgent),
+            "walk to the next live agent".into(),
+        ),
+        (
+            verb(Action::DispatchReady),
+            "launch every READY issue up to the capacity cap".into(),
+        ),
+        (
+            verb(Action::ChooseRepos),
+            "launch, choosing repos — opens the select even for one repo; a adds another".into(),
+        ),
+        (
+            verb(Action::AskAgent),
+            "start an ad-hoc agent with a throwaway worktree".into(),
         ),
         (
             verb(Action::LayoutToggle),
-            "cycle layout: auto (by coin count) → rail → mosaic",
+            "cycle layout: auto (by window count) → rail → mosaic".into(),
         ),
-        (format!("— workspace ({} prefix) —", app.prefix_label()), ""),
+        (format!("— project & disk ({} prefix) —", prefix), "".into()),
         (
             verb(Action::SwitchProject),
-            "switch project (set one up the first time you open it)",
+            "switch project (set one up the first time you open it)".into(),
         ),
         (
             verb(Action::ConfigureProject),
-            "(re)configure this project's repos / scratch — applies on restart",
+            "(re)configure this project's repos / scratch — applies on restart".into(),
         ),
         (
             verb(Action::GlobalView),
-            "global all-agents screen (every project)",
+            "global all-agents screen (every project)".into(),
         ),
         (
             verb(Action::OpenInEditor),
-            "open the focused agent's workspace in your editor",
+            "open the focused agent's workspace in your editor".into(),
         ),
         (
             verb(Action::DiscardWorkspace),
-            "discard a finished issue's workspace (push + remove worktrees)",
+            "discard a finished issue's workspace (push + remove worktrees)".into(),
         ),
         (
             verb(Action::ReclaimMirrors),
-            "reclaim disk: free unreferenced mirrors",
+            "reclaim disk: free unreferenced mirrors".into(),
         ),
-        (verb(Action::Quit), "quit the cockpit"),
+        (verb(Action::Quit), "quit the cockpit".into()),
     ];
 
-    let area = centered_rect(78, rows.len() as u16 + 7, frame.area());
+    let area = centered_rect(78, rows.len() as u16 + 10, frame.area());
     frame.render_widget(Clear, area);
 
+    // A one-line orientation so the section headers below assemble into a model
+    // instead of reading as four unrelated topics (the vocabulary findings).
     let mut lines = vec![
         Line::from(Span::styled(" Keys", Style::new().fg(GREEN_100).bold())),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  tiled windows: Spine (window 0) · coins (one issue, chat/deps) · the Fleet.",
+            Style::new().fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "  {prefix} = window/project verbs · pin a coin to keep it (else it previews)."
+            ),
+            Style::new().fg(MUTED),
+        )),
         Line::raw(""),
     ];
     for (key, desc) in &rows {
@@ -1347,42 +1558,54 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         } else {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {key:<18}"), Style::new().fg(GREEN_400).bold()),
-                Span::styled(*desc, Style::new().fg(INK)),
+                Span::styled(desc.as_ref(), Style::new().fg(INK)),
             ]));
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "  rebind any of these in ~/.config/lindep/config.toml  [keys] / [verbs]",
-        Style::new().fg(MUTED),
-    )));
 
-    // The card is routinely taller than a split-pane terminal, so scroll instead of
-    // clipping the bottom rows (Quit + the rebind-path footer used to fall off, with
-    // no marker). Clamp the offset to the real content height and write it back, so
-    // an over-scroll (End, or a long press) leaves no dead presses before it moves (H3).
-    let inner_h = area.height.saturating_sub(2);
-    let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    // The config footer is load-bearing (the rebind paths + the agents cap), so PIN it
+    // to the bottom of the card — the bindings scroll above it and it is never clipped on
+    // a short terminal, even as the verb list grows (H3).
+    let footer_lines = vec![
+        Line::from(Span::styled(
+            "  rebind in ./.lindep/config.toml or ~/.config/lindep/config.toml — [keys] / [verbs]",
+            Style::new().fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            "  cap live agents: [agents] max_concurrent = N in the same file",
+            Style::new().fg(MUTED),
+        )),
+    ];
+
+    let base = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(GREEN_600))
+        .title(Line::from(Span::styled(
+            " lindep ",
+            Style::new().fg(GREEN_500).bold(),
+        )));
+    let inner = base.inner(area);
+    let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(inner);
+
+    // Scroll the bindings (not the pinned footer); clamp the offset to the real height
+    // and write it back so an over-scroll leaves no dead presses (H3).
+    let max_scroll = (lines.len() as u16).saturating_sub(body.height);
     app.help_scroll = app.help_scroll.min(max_scroll);
     let scroll = app.help_scroll;
 
-    // Exit + scroll affordance on the bottom border: help was the one overlay with
-    // no "how to close" hint, and the ▴/▾ arrows appear only when there's overflow.
+    // Exit + scroll affordance on the bottom border; ▴/▾ appear only on overflow.
     let hint = match (scroll > 0, scroll < max_scroll) {
         (true, true) => " ▴▾ scroll · ? / esc close ",
         (false, true) => " ▾ more · ↓ scroll · ? / esc close ",
         (true, false) => " ▴ more · ↑ scroll · ? / esc close ",
         (false, false) => " ? / esc close ",
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(GREEN_600))
-        .title(Line::from(Span::styled(
-            " lindep ",
-            Style::new().fg(GREEN_500).bold(),
-        )))
-        .title_bottom(Line::from(Span::styled(hint, Style::new().fg(MUTED))).right_aligned());
-    frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+    frame.render_widget(
+        base.title_bottom(Line::from(Span::styled(hint, Style::new().fg(MUTED))).right_aligned()),
+        area,
+    );
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
+    frame.render_widget(Paragraph::new(footer_lines), footer);
 }
 
 /// The issue-summary overlay (`i`): a dismissable, at-a-glance card for the
@@ -1727,6 +1950,7 @@ fn issue_line<'a>(
         Some(Flash::Launched) => Style::new().fg(INK).bg(GREEN_700).bold(),
         Some(Flash::Finished) => Style::new().fg(GREEN_100).bg(STATUS_600).bold(),
         Some(Flash::Failed) => Style::new().fg(INK).bg(RED_400).bold(),
+        Some(Flash::Stopped) => Style::new().fg(INK).bg(BORDER).bold(),
         None if resolved => Style::new().fg(MUTED).add_modifier(Modifier::DIM),
         None => Style::new().fg(INK).bold(),
     };
@@ -1758,7 +1982,7 @@ fn issue_item<'a>(app: &App, key: &str, ready_band: bool, selected_here: bool) -
         .flash
         .get(key)
         .and_then(|&(kind, until)| (app.frame < until).then_some(kind));
-    let status = app.fleet.get(key).copied();
+    let status = display_status(app, key, app.fleet.get(key).copied());
     let item = ListItem::new(issue_line(
         &app.graph,
         key,
@@ -1878,7 +2102,7 @@ fn status_for(graph: &Graph, key: &str) -> (&'static str, ratatui::style::Color)
 /// (Idle's status-green is the resting-agent hue — green here *is* the agent).
 fn readiness_tint(r: Readiness) -> Color {
     match r {
-        Readiness::NeedsYou => AMBER_400,
+        Readiness::NeedsYou => RED_400,
         Readiness::Working => ORANGE_400,
         Readiness::Idle => STATUS_400,
         Readiness::Ready => INK,
@@ -1948,7 +2172,7 @@ mod tests {
     fn the_fleet_recolor_reuses_hues_and_never_paints_a_graph_band_green() {
         // ENG-560: node tints come from the readiness classifier, not the raw
         // workflow status, reusing the existing hue vocabulary.
-        assert_eq!(readiness_tint(Readiness::NeedsYou), AMBER_400);
+        assert_eq!(readiness_tint(Readiness::NeedsYou), RED_400);
         assert_eq!(readiness_tint(Readiness::Working), ORANGE_400);
         assert_eq!(readiness_tint(Readiness::Idle), STATUS_400);
         assert_eq!(readiness_tint(Readiness::Ready), INK);
@@ -2046,7 +2270,16 @@ mod tests {
             external: false,
         });
         g.finalize();
-        let line = issue_line(&g, "A", Some(AgentStatus::Failed), 0, None, true, true, false);
+        let line = issue_line(
+            &g,
+            "A",
+            Some(AgentStatus::Failed),
+            0,
+            None,
+            true,
+            true,
+            false,
+        );
         assert_eq!(line.spans[0].content, "✗ ", "a crashed ready row shows ✗");
         assert_eq!(
             line.spans[0].style.fg,
@@ -2055,7 +2288,111 @@ mod tests {
         );
         // Even when selected: ✗ is a distinct glyph from the cursor's ▸, so there's
         // no doubling to suppress — the crash must stay visible.
-        let sel = issue_line(&g, "A", Some(AgentStatus::Failed), 0, None, true, true, true);
+        let sel = issue_line(
+            &g,
+            "A",
+            Some(AgentStatus::Failed),
+            0,
+            None,
+            true,
+            true,
+            true,
+        );
         assert_eq!(sel.spans[0].content, "✗ ", "selection never hides a crash");
+    }
+
+    #[test]
+    fn rail_overflow_renders_the_count_in_its_one_row_slot() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // The rail always hands the overflow marker an exactly-one-row slot. The old
+        // bordered block spent that single row on its top border and zeroed the inner
+        // area, so the `+N` count rendered in 0% of overflow cases (NEW-03). The
+        // borderless line must surface the count in a 1-row rect.
+        let mut term = Terminal::new(TestBackend::new(32, 1)).unwrap();
+        term.draw(|f| render_rail_overflow(f, Rect::new(0, 0, 32, 1), 7))
+            .unwrap();
+        let out = term.backend().to_string();
+        assert!(
+            out.contains("+7"),
+            "the hidden-count `+7` must render in a 1-row slot, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_needs_you_band_header_is_red_and_distinct_from_blocked_and_working() {
+        // R5 / CF-13: NEEDS YOU must read as red (must-act) and stay distinct in hue
+        // from the amber BLOCKED and orange WORKING headers — three warm bands that
+        // must never be confused at a glance.
+        let needs = band_header(Readiness::NeedsYou).2;
+        let blocked = band_header(Readiness::Blocked).2;
+        let working = band_header(Readiness::Working).2;
+        assert_eq!(needs, RED_400, "NEEDS YOU is red");
+        assert_ne!(needs, blocked, "NEEDS YOU red must differ from BLOCKED amber");
+        assert_ne!(needs, working, "NEEDS YOU red must differ from WORKING orange");
+        assert_ne!(blocked, working, "BLOCKED amber must differ from WORKING orange");
+    }
+
+    #[test]
+    fn band_headers_never_stutter_with_their_member_rows() {
+        // A band header must be visually distinct (glyph OR colour) from the gutter
+        // marker of the rows beneath it, so the header reads as a header and not as
+        // just another row — the v1.7 IDLE `◦`/`◦` and WORKING-vs-`◉` regressions.
+        // READY is exempt: its rows intentionally echo the `▸` rail (covered by
+        // `ready_band_row_shows_the_rail_not_a_terminal_agent_marker`).
+        let cases = [
+            (AgentStatus::Spawning, Readiness::Working),
+            (AgentStatus::Running, Readiness::Working),
+            (AgentStatus::NeedsYou, Readiness::NeedsYou),
+            (AgentStatus::Idle, Readiness::Idle),
+            (AgentStatus::Done, Readiness::Done),
+        ];
+        for (status, band) in cases {
+            let (hglyph, _, haccent) = band_header(band);
+            let (mglyph, mstyle) = theme::agent_marker(status, 0);
+            assert!(
+                hglyph != mglyph || Some(haccent) != mstyle.fg,
+                "{band:?} header `{hglyph}` is identical in glyph+colour to its \
+                 {status:?} row marker `{mglyph}` — it will stutter"
+            );
+        }
+    }
+
+    #[test]
+    fn band_header_glyphs_are_off_the_priority_and_repo_check_sets() {
+        // The v1.7 WORKING header reused the repo-select `◉`; guard the whole class
+        // — no band-header glyph may collide with a priority marker or a repo
+        // checkbox, the same monochrome discipline theme.rs enforces within each set.
+        use crate::model::Priority;
+        let bands = [
+            Readiness::NeedsYou,
+            Readiness::Working,
+            Readiness::Idle,
+            Readiness::Ready,
+            Readiness::Blocked,
+            Readiness::Done,
+        ];
+        for band in bands {
+            let (hglyph, _, _) = band_header(band);
+            for p in [
+                Priority::Urgent,
+                Priority::High,
+                Priority::Medium,
+                Priority::Low,
+            ] {
+                assert_ne!(
+                    hglyph,
+                    theme::priority_marker(p).0,
+                    "{band:?} header collides with priority {p:?}"
+                );
+            }
+            for checked in [true, false] {
+                assert_ne!(
+                    hglyph,
+                    theme::repo_check(checked).0,
+                    "{band:?} header collides with a repo checkbox"
+                );
+            }
+        }
     }
 }

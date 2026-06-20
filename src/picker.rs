@@ -8,7 +8,7 @@ use ratatui::DefaultTerminal;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph,
@@ -17,6 +17,20 @@ use ratatui::widgets::{
 use crate::linear::ProjectRef;
 use crate::theme::{self, *};
 use crate::window::move_state;
+
+fn empty_picker_line(query: &str, total: usize) -> Line<'static> {
+    let msg = if total == 0 {
+        " no projects available"
+    } else if query.is_empty() {
+        " no projects to show"
+    } else {
+        " no matches — edit the filter"
+    };
+    Line::from(Span::styled(
+        msg,
+        Style::new().fg(MUTED).add_modifier(Modifier::ITALIC),
+    ))
+}
 
 /// The project list + live filter state. Drives both the startup full-screen
 /// [`pick`] and the in-cockpit switch overlay ([`render_overlay`]); the cockpit
@@ -81,14 +95,26 @@ pub(crate) struct RepoChoice {
     pub primary: bool,
 }
 
+/// The "add another repo" sub-list (CF-20): registered repos the project doesn't yet
+/// list as candidates, with their own cursor. Open from the [`RepoPicker`] with `a`;
+/// picking one appends it to the checklist (checked) so this launch spans it and the
+/// confirm persists it as a new project candidate.
+struct AddList {
+    rows: Vec<RepoChoice>,
+    state: ListState,
+}
+
 /// The repo multi-select modal — a checkbox list over a project's candidate repos
 /// in **declared order** (no sort, unlike the project [`Picker`]). The primary is
 /// pre-checked and can't be unchecked; Space toggles the rest. Owned by `App` and
-/// fed keys directly (see `App::on_repo_select_key`), like the project switcher.
+/// fed keys directly (see `App::on_repo_select_key`), like the project switcher. While
+/// the `adding` sub-list is open it captures movement/confirm so the human can pull in
+/// a registered repo the project doesn't yet list (CF-20).
 pub(crate) struct RepoPicker {
     rows: Vec<RepoChoice>,
     checked: Vec<bool>,
     state: ListState,
+    adding: Option<AddList>,
 }
 
 impl RepoPicker {
@@ -102,16 +128,24 @@ impl RepoPicker {
             rows,
             checked,
             state,
+            adding: None,
         }
     }
 
+    /// Movement drives the add-list while it's open, else the main checklist.
     pub(crate) fn move_by(&mut self, delta: i32) {
-        move_state(&mut self.state, self.rows.len(), delta);
+        match &mut self.adding {
+            Some(add) => move_state(&mut add.state, add.rows.len(), delta),
+            None => move_state(&mut self.state, self.rows.len(), delta),
+        }
     }
 
     /// Toggle the cursor's repo. The primary is always materialised, so toggling it
-    /// is a deliberate no-op (it stays checked).
+    /// is a deliberate no-op (it stays checked). Inert while the add-list is open.
     pub(crate) fn toggle(&mut self) {
+        if self.adding.is_some() {
+            return;
+        }
         if let Some(i) = self.state.selected()
             && !self.rows[i].primary
         {
@@ -119,7 +153,56 @@ impl RepoPicker {
         }
     }
 
-    /// The checked handles, in declared order — always including the primary.
+    /// Whether the "add another repo" sub-list is currently open.
+    pub(crate) fn is_adding(&self) -> bool {
+        self.adding.is_some()
+    }
+
+    /// Open the "add another repo" sub-list over `registered` minus the repos already
+    /// offered here (the project's current candidates). Returns `false` (and opens
+    /// nothing) when there's nothing left to add.
+    pub(crate) fn open_add(&mut self, registered: &[RepoChoice]) -> bool {
+        let here: std::collections::HashSet<&str> =
+            self.rows.iter().map(|r| r.handle.as_str()).collect();
+        let rows: Vec<RepoChoice> = registered
+            .iter()
+            .filter(|r| !here.contains(r.handle.as_str()))
+            .cloned()
+            .collect();
+        if rows.is_empty() {
+            return false;
+        }
+        let mut state = ListState::default();
+        state.select(Some(0));
+        self.adding = Some(AddList { rows, state });
+        true
+    }
+
+    /// Commit the add-list cursor: append the chosen repo to the checklist as a
+    /// checked, non-primary row, then close the sub-list. A no-op if nothing's open.
+    pub(crate) fn confirm_add(&mut self) {
+        let Some(add) = self.adding.take() else {
+            return;
+        };
+        if let Some(i) = add.state.selected()
+            && let Some(choice) = add.rows.get(i)
+        {
+            self.rows.push(RepoChoice {
+                handle: choice.handle.clone(),
+                local: choice.local,
+                primary: false,
+            });
+            self.checked.push(true);
+        }
+    }
+
+    /// Back out of the add-list without adding anything (Esc inside the sub-list).
+    pub(crate) fn cancel_add(&mut self) {
+        self.adding = None;
+    }
+
+    /// The checked handles, in declared order — always including the primary, plus any
+    /// repos added via the sub-list (appended after the candidates).
     pub(crate) fn selected_handles(&self) -> Vec<String> {
         self.rows
             .iter()
@@ -185,42 +268,49 @@ pub(crate) fn render_overlay(
     ]);
     frame.render_widget(Paragraph::new(query_line), query);
 
-    // A project with an agent that needs you carries a breathing ⚑ — so a
-    // backgrounded prompt is visible right where you'd switch to handle it.
-    let items: Vec<ListItem> = picker
-        .order
-        .iter()
-        .map(|&i| {
-            let project = &picker.projects[i];
-            let mut spans = vec![Span::styled(project.name.clone(), Style::new().fg(INK))];
-            // Per-project agent counts (ENG-406): `· 3 agents · 1 needs you`, so a
-            // backgrounded project's load shows in the list without entering it.
-            // Steady (not breathing) — the modal doesn't drive the animation tick.
-            if let Some(&(live, needs)) = counts.get(&project.id) {
-                if live > 0 {
-                    spans.push(Span::styled(
-                        format!("  · {live} agent{}", if live == 1 { "" } else { "s" }),
-                        Style::new().fg(GREEN_400),
-                    ));
+    if picker.order.is_empty() {
+        frame.render_widget(
+            Paragraph::new(empty_picker_line(&picker.query, picker.projects.len())),
+            body,
+        );
+    } else {
+        // A project with an agent that needs you carries a breathing ⚑ — so a
+        // backgrounded prompt is visible right where you'd switch to handle it.
+        let items: Vec<ListItem> = picker
+            .order
+            .iter()
+            .map(|&i| {
+                let project = &picker.projects[i];
+                let mut spans = vec![Span::styled(project.name.clone(), Style::new().fg(INK))];
+                // Per-project agent counts (ENG-406): `· 3 agents · 1 needs you`, so a
+                // backgrounded project's load shows in the list without entering it.
+                // Steady (not breathing) — the modal doesn't drive the animation tick.
+                if let Some(&(live, needs)) = counts.get(&project.id) {
+                    if live > 0 {
+                        spans.push(Span::styled(
+                            format!("  · {live} agent{}", if live == 1 { "" } else { "s" }),
+                            Style::new().fg(GREEN_400),
+                        ));
+                    }
+                    if needs > 0 {
+                        spans.push(Span::styled(
+                            format!(" · {needs} needs you"),
+                            theme::needs_you_style(0),
+                        ));
+                    }
                 }
-                if needs > 0 {
-                    spans.push(Span::styled(
-                        format!(" · {needs} needs you"),
-                        Style::new().fg(AMBER_400).bold(),
-                    ));
+                if needs_you.contains(&project.id) {
+                    spans.push(Span::styled("  ⚑", theme::needs_you_style(0)));
                 }
-            }
-            if needs_you.contains(&project.id) {
-                spans.push(Span::styled("  ⚑", Style::new().fg(AMBER_400).bold()));
-            }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-    let list = List::new(items)
-        .highlight_symbol("▸ ")
-        .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(theme::cursor_active());
-    frame.render_stateful_widget(list, body, &mut picker.state);
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(theme::cursor_active());
+        frame.render_stateful_widget(list, body, &mut picker.state);
+    }
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -375,6 +465,38 @@ pub(crate) fn render_repo_overlay(picker: &mut RepoPicker, frame: &mut Frame, fu
 
     let [body, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
 
+    // The "add another repo" sub-list owns the body while it's open (CF-20): a plain
+    // list of registered repos the project doesn't yet list, picked into the checklist.
+    if let Some(add) = picker.adding.as_mut() {
+        let items: Vec<ListItem> = add
+            .rows
+            .iter()
+            .map(|repo| {
+                let mut spans = vec![
+                    Span::styled("+ ", Style::new().fg(GREEN_400)),
+                    Span::styled(repo.handle.clone(), Style::new().fg(INK)),
+                ];
+                if repo.local {
+                    spans.push(Span::styled("  (local)", Style::new().fg(AMBER_400)));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(theme::cursor_active());
+        frame.render_stateful_widget(list, body, &mut add.state);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " add a repo to this project · ↑↓ move · ⏎ add · esc back",
+                Style::new().fg(MUTED),
+            ))),
+            hint,
+        );
+        return;
+    }
+
     let items: Vec<ListItem> = picker
         .rows
         .iter()
@@ -401,7 +523,7 @@ pub(crate) fn render_repo_overlay(picker: &mut RepoPicker, frame: &mut Frame, fu
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " space toggles · ↑↓ move · ⏎ launch · esc cancel",
+            " space toggles · a add repo · ↑↓ move · ⏎ launch · esc cancel",
             Style::new().fg(MUTED),
         ))),
         hint,
@@ -486,34 +608,41 @@ fn draw(picker: &mut Picker, frame: &mut Frame, needs_you: &std::collections::Ha
     frame.render_widget(Paragraph::new(title), hl);
     frame.render_widget(Paragraph::new(query).alignment(Alignment::Right), hr);
 
-    let items: Vec<ListItem> = picker
-        .order
-        .iter()
-        .map(|&i| {
-            let project = &picker.projects[i];
-            let mut spans = vec![Span::styled(project.name.clone(), Style::new().fg(INK))];
-            // The same ⚑ the in-cockpit switcher shows (render_overlay), now at
-            // launch too (ENG-562) — see which project wants you before you pick.
-            if needs_you.contains(&project.id) {
-                spans.push(Span::styled("  ⚑", Style::new().fg(AMBER_400).bold()));
-            }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(GREEN_500))
-                .title(Line::from(Span::styled(
-                    " PROJECTS ",
-                    Style::new().fg(GREEN_100).bold(),
-                ))),
-        )
-        .highlight_symbol("▸ ")
-        .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(theme::cursor_active());
-    frame.render_stateful_widget(list, body, &mut picker.state);
+    let project_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(GREEN_500))
+        .title(Line::from(Span::styled(
+            " PROJECTS ",
+            Style::new().fg(GREEN_100).bold(),
+        )));
+    let project_inner = project_block.inner(body);
+    frame.render_widget(project_block, body);
+    if picker.order.is_empty() {
+        frame.render_widget(
+            Paragraph::new(empty_picker_line(&picker.query, picker.projects.len())),
+            project_inner,
+        );
+    } else {
+        let items: Vec<ListItem> = picker
+            .order
+            .iter()
+            .map(|&i| {
+                let project = &picker.projects[i];
+                let mut spans = vec![Span::styled(project.name.clone(), Style::new().fg(INK))];
+                // The same ⚑ the in-cockpit switcher shows (render_overlay), now at
+                // launch too (ENG-562) — see which project wants you before you pick.
+                if needs_you.contains(&project.id) {
+                    spans.push(Span::styled("  ⚑", theme::needs_you_style(0)));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(theme::cursor_active());
+        frame.render_stateful_widget(list, project_inner, &mut picker.state);
+    }
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -619,6 +748,62 @@ mod tests {
         // Toggle it back off.
         p.toggle();
         assert_eq!(p.selected_handles(), vec!["lindep"]);
+    }
+
+    #[test]
+    fn add_list_offers_only_repos_the_project_doesnt_already_list() {
+        // CF-20: rows are api(primary)+web; the registry also has `shared` and a
+        // local-only `scratch`. "add another repo" must offer only the two NOT already
+        // candidates, and picking one appends it checked (so the launch spans it).
+        let mut p = RepoPicker::new(vec![repo_named("api", true), repo_named("web", false)]);
+        let registered = vec![
+            RepoChoice { handle: "api".into(), local: false, primary: false },
+            RepoChoice { handle: "web".into(), local: false, primary: false },
+            RepoChoice { handle: "shared".into(), local: false, primary: false },
+            RepoChoice { handle: "scratch".into(), local: true, primary: false },
+        ];
+        assert!(p.open_add(&registered), "there are repos to add");
+        assert!(p.is_adding());
+        let offered: Vec<&str> = p
+            .adding
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.handle.as_str())
+            .collect();
+        assert_eq!(offered, vec!["shared", "scratch"], "only the non-candidates");
+
+        // Move to `scratch` and add it — it lands checked, after the candidates.
+        p.move_by(1);
+        p.confirm_add();
+        assert!(!p.is_adding(), "confirming closes the sub-list");
+        assert_eq!(p.selected_handles(), vec!["api", "scratch"]);
+    }
+
+    #[test]
+    fn open_add_is_false_when_every_registered_repo_is_already_listed() {
+        let mut p = RepoPicker::new(vec![repo_named("api", true), repo_named("web", false)]);
+        let registered = vec![
+            RepoChoice { handle: "api".into(), local: false, primary: false },
+            RepoChoice { handle: "web".into(), local: false, primary: false },
+        ];
+        assert!(!p.open_add(&registered), "nothing left to add");
+        assert!(!p.is_adding(), "so the sub-list never opens");
+    }
+
+    #[test]
+    fn cancel_add_adds_nothing() {
+        let mut p = RepoPicker::new(vec![repo_named("api", true)]);
+        let registered = vec![RepoChoice { handle: "web".into(), local: false, primary: false }];
+        assert!(p.open_add(&registered));
+        p.cancel_add();
+        assert!(!p.is_adding());
+        assert_eq!(p.selected_handles(), vec!["api"], "backing out adds no repo");
+    }
+
+    fn repo_named(handle: &str, primary: bool) -> RepoChoice {
+        RepoChoice { handle: handle.into(), local: false, primary }
     }
 
     #[test]
