@@ -214,6 +214,13 @@ pub struct App {
     /// `AgentSpawned`, so it never blocks a fresh agent.
     reaped: HashSet<String>,
 
+    /// The repo handles each live agent materialised, keyed by issue (primary
+    /// first), as reported by the supervisor on `AgentSpawned` (ENG-536). Lets the
+    /// agent window/coin headers show *which* repos/worktrees an agent spans — a
+    /// multi-repo agent is otherwise indistinguishable from a single-repo one.
+    /// Cleared on `AgentReaped` (full teardown); an EXITED card keeps it so you can
+    /// still see what the finished agent owned.
+    pub agent_repos: HashMap<String, Vec<String>>,
     /// Per-issue agent status, driven by the supervisor + notification bus.
     /// Absence of an entry means "no agent" — the fleet view's resting state.
     pub fleet: HashMap<String, AgentStatus>,
@@ -485,6 +492,7 @@ impl App {
             needs_you_alert: false,
             pending_launch: HashMap::new(),
             reaped: HashSet::new(),
+            agent_repos: HashMap::new(),
             fleet: HashMap::new(),
             backends: HashMap::new(),
             last_output: HashMap::new(),
@@ -922,6 +930,21 @@ impl App {
             return;
         }
 
+        // 5b. Global window switch (Alt-←/→): a one-step, wrapping focus move that
+        //     fires from ANY focus — including a focused chat, so it must sit ABOVE
+        //     the PTY-forwarding match below. Like the prefix, these chords are taken
+        //     from the agent's PTY by design; Alt-arrows aren't claude editing keys,
+        //     so nothing useful is lost. All modals/overlays/confirms returned above,
+        //     so this only ever runs against a real window.
+        if let Some(action) = self.keymap.global_for(key) {
+            match action {
+                Action::CycleNext => self.cycle_window(true),
+                Action::CyclePrev => self.cycle_window(false),
+                _ => {}
+            }
+            return;
+        }
+
         // 6. Route by the focused window's kind.
         match self.windows.focused_kind().clone() {
             // A coin's chat face owns the keyboard: every key (Esc too) goes to its
@@ -1151,6 +1174,15 @@ impl App {
             // The rest are direct (Spine/Deps) actions, never prefix verbs.
             _ => {}
         }
+    }
+
+    /// One-step, wrapping window switch (Alt-←/→). Shares `after_focus_change` with
+    /// the prefixed FocusLeft/Right so landing on the Spine reveals it (clears zoom)
+    /// and a docked agent that just gained focus lazy-resumes — the move is identical,
+    /// only the reach (any focus, no prefix) and the wrap differ.
+    fn cycle_window(&mut self, forward: bool) {
+        self.windows.cycle_focus(forward);
+        self.after_focus_change();
     }
 
     /// Ask the event loop to re-open the onboarding wizard for the active project
@@ -2098,7 +2130,11 @@ impl App {
                     .insert(key.clone(), self.frame + RESUME_GRACE_FRAMES);
                 self.pending_attach = Some(key.clone());
                 self.open_agent_window(&key);
-                self.set_footer(format!("opening agent on {key}…"));
+                // Single-candidate fast path: the multi-repo selector never appeared,
+                // so name the verb that summons it — otherwise giving one agent several
+                // repos is undiscoverable on a single-repo project (CF-20).
+                let choose = self.keymap.verb_label(Action::ChooseRepos);
+                self.set_footer(format!("opening agent on {key}…  ({choose} to add repos)"));
             }
             None => {
                 self.status_msg = Some(if self.demo {
@@ -3397,6 +3433,7 @@ impl App {
                     project_id,
                     issue,
                     backend,
+                    ..
                 } => {
                     self.stashed_backends
                         .entry(project_id)
@@ -3590,13 +3627,24 @@ impl App {
             }
             // `project_id` is ignored while the cockpit is single-project; ENG-401
             // shards the fleet by project and binds it here.
-            AppEvent::AgentSpawned { issue, backend, .. } => {
+            AppEvent::AgentSpawned {
+                issue,
+                backend,
+                repos,
+                ..
+            } => {
                 self.restore_ask_issue_if_needed(&issue);
                 // Clear the double-launch guard (set by the button AND by a resume).
                 self.pending_launch.remove(&issue);
                 // A real relaunch revives the issue — clear any reaped tombstone.
                 self.reaped.remove(&issue);
                 self.fleet.insert(issue.clone(), AgentStatus::Spawning);
+                // Record the repo set the supervisor checked out so the agent's
+                // header can name its repos/worktrees. A resume reports its full
+                // rehydrated set here too, so this stays accurate across restarts.
+                if !repos.is_empty() {
+                    self.agent_repos.insert(issue.clone(), repos);
+                }
                 self.backends.insert(issue.clone(), backend);
                 self.flash
                     .insert(issue.clone(), (Flash::Launched, self.frame + FLASH_FRAMES));
@@ -3745,6 +3793,9 @@ impl App {
                 let teardown_ask = self.ask_agents.remove(&issue);
                 self.reaped.insert(issue.clone());
                 self.fleet.remove(&issue);
+                // The agent's worktrees are torn down with it — drop its repo set so a
+                // stale badge can't linger past the agent that owned it.
+                self.agent_repos.remove(&issue);
                 // FEAT-B step 9: drop the quiet-running overlay stamp with the fleet
                 // entry so a reaped issue can never resurface as "recently active"
                 // (tick_frame also ages it out, but the reap clears it immediately).
@@ -5931,7 +5982,8 @@ mod tests {
             project_id: "proj-b".into(),
             issue: "ENG-9".into(),
             backend: FakeBackend::new("ENG-9") as Arc<dyn AgentBackend>,
-        });
+            repos: Vec::new(),
+});
         assert!(
             !applied,
             "a backgrounded project's event doesn't repaint the active view"
@@ -6056,6 +6108,36 @@ mod tests {
             .ensure_preview("ZAP-205", CoinMode::Chat, &a.graph);
         a.aim_spine("ZAP-205".into());
         assert_eq!(a.agent_spawn_size(), Some((38, 76)));
+    }
+
+    #[test]
+    fn alt_arrows_switch_windows_even_when_a_chat_owns_the_keyboard() {
+        let mut a = app();
+        // Pin the opening preview into a permanent coin, then focus a fresh chat
+        // coin — the band that forwards every key to the agent's PTY.
+        a.windows.focus_preview();
+        a.windows.pin_preview();
+        a.windows
+            .ensure_preview("ZAP-205", CoinMode::Chat, &a.graph);
+        a.windows.focus_preview();
+        assert!(
+            matches!(
+                a.windows.focused_kind(),
+                WindowKind::Coin {
+                    mode: CoinMode::Chat,
+                    ..
+                }
+            ),
+            "precondition: a chat is focused, so a bare key would go to the PTY"
+        );
+        let before = a.windows.focus;
+        // Alt-← resolves as the global switch ABOVE PTY forwarding — it moves focus
+        // rather than being typed into claude.
+        a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_ne!(
+            a.windows.focus, before,
+            "Alt-arrow switched the window from inside a focused chat"
+        );
     }
 
     // ── The spine ──────────────────────────────────────────────────────────
@@ -6432,7 +6514,8 @@ mod tests {
             project_id: "proj-b".into(),
             issue: "ENG-9".into(),
             backend: FakeBackend::new("ENG-9") as Arc<dyn AgentBackend>,
-        };
+            repos: Vec::new(),
+};
         app.apply_event(spawn);
         app.apply_event(AppEvent::AgentNeedsYou {
             project_id: "proj-b".into(),
@@ -7174,6 +7257,33 @@ mod tests {
     }
 
     #[test]
+    fn agent_spawned_records_repo_set_and_reap_clears_it() {
+        let mut app = app();
+        let fake = FakeBackend::new("ENG-7");
+        app.apply_event(AppEvent::AgentSpawned {
+            project_id: String::new(),
+            issue: "ENG-7".into(),
+            backend: fake as Arc<dyn AgentBackend>,
+            repos: vec!["pulse".into(), "cortex".into(), "lindep".into()],
+        });
+        assert_eq!(
+            app.agent_repos.get("ENG-7").map(Vec::as_slice),
+            Some(["pulse".to_string(), "cortex".to_string(), "lindep".to_string()].as_slice()),
+            "the multi-repo set the supervisor reported is recorded so the header can name it"
+        );
+        // Reaping the agent tears down its worktrees — the repo set goes with it so no
+        // stale badge can outlive the agent that owned it.
+        app.apply_event(AppEvent::AgentReaped {
+            project_id: String::new(),
+            issue: "ENG-7".into(),
+        });
+        assert!(
+            !app.agent_repos.contains_key("ENG-7"),
+            "reap drops the repo set"
+        );
+    }
+
+    #[test]
     fn a_late_hook_cannot_resurrect_a_reaped_agent() {
         let mut app = app();
         let fake = FakeBackend::new("ZAP-204");
@@ -7181,6 +7291,7 @@ mod tests {
             project_id: String::new(),
             issue: "ZAP-204".into(),
             backend: fake as Arc<dyn AgentBackend>,
+            repos: Vec::new(),
         });
         app.apply_event(AppEvent::AgentStatusChanged {
             project_id: String::new(),
@@ -7220,6 +7331,7 @@ mod tests {
             project_id: String::new(),
             issue: "ZAP-204".into(),
             backend: fake2 as Arc<dyn AgentBackend>,
+            repos: Vec::new(),
         });
         assert!(app.apply_event(AppEvent::AgentNeedsYou {
             project_id: String::new(),
@@ -7648,6 +7760,7 @@ mod tests {
             project_id: String::new(),
             issue: "ZAP-205".into(),
             backend: fake as Arc<dyn AgentBackend>,
+            repos: Vec::new(),
         });
         assert!(app.pending_attach.is_none());
         assert_eq!(app.windows.focused_kind().agent_issue(), Some("ZAP-205"));
@@ -7663,6 +7776,7 @@ mod tests {
             project_id: String::new(),
             issue: "ZAP-205".into(),
             backend: fake as Arc<dyn AgentBackend>,
+            repos: Vec::new(),
         });
         // No pending_attach / pending_launch → the roster gains it, focus stays put.
         assert_eq!(app.windows.focus, focus_before);
@@ -7761,6 +7875,7 @@ mod tests {
             project_id: String::new(),
             issue: "ZAP-205".into(),
             backend: fake as Arc<dyn AgentBackend>,
+            repos: Vec::new(),
         });
         assert_eq!(
             app.resuming_count(),

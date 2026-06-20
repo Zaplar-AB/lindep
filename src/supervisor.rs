@@ -911,6 +911,7 @@ async fn supervise(task: &AgentTask) {
             project_id: task.project_id.clone(),
             issue: task.issue.clone(),
             backend: Arc::clone(&backend),
+            repos: materialized_handles.clone(),
         });
 
         // The process is up but hasn't *done* anything yet, so it stays `Spawning`
