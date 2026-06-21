@@ -68,11 +68,33 @@ pub fn run_for_project(project: &ProjectRef) -> io::Result<(String, bool)> {
             true,
         )
     } else {
-        // Cancelled, or completed but nothing actually differed from the existing
-        // binding — either way the on-disk config is unchanged, so don't nudge a
-        // pointless restart.
-        ("configuration unchanged".to_string(), false)
+        // Cancelled, or completed but nothing actually differed. Both leave the on-disk
+        // config intact, but they are not the same to the user: someone who added a repo
+        // / changed the prefix and then hit Esc had real edits thrown away, and "nothing
+        // changed" would be a lie. Distinguish them with the SAME render-and-compare
+        // write_binding's no-op path uses (so toml_edit reformatting never reads as a
+        // spurious edit); an unreadable/unparseable registry degrades to the
+        // conservative "unchanged" rather than panicking out of the cockpit.
+        let differs = registry::binding_differs(
+            &wizard.layout,
+            &wizard.new_repos(),
+            &wizard.project_draft(),
+            &wizard.scratch,
+        )
+        .unwrap_or(false);
+        (cancel_footer(differs).to_string(), false)
     })
+}
+
+/// Footer wording for leaving the re-config wizard without a write. When the draft
+/// genuinely differs from the on-disk binding, it owns up to the discarded edits while
+/// still reassuring that the saved config is intact; otherwise the plain "unchanged".
+fn cancel_footer(differs: bool) -> &'static str {
+    if differs {
+        "edits discarded — configuration unchanged"
+    } else {
+        "configuration unchanged"
+    }
 }
 
 /// The wizard's steps, in order. [`Step::Primary`] is skipped when the project has a
@@ -1622,6 +1644,57 @@ mod tests {
         );
         // The reused repo writes no new [[repo]] block.
         assert!(w.new_repos().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancel_footer_owns_up_to_discarded_edits() {
+        // The two arms of the cancel wording, pinned without driving the TUI loop.
+        assert_eq!(cancel_footer(false), "configuration unchanged");
+        assert_eq!(
+            cancel_footer(true),
+            "edits discarded — configuration unchanged"
+        );
+    }
+
+    #[test]
+    fn cancelling_reconfig_reports_unchanged_then_discarded() {
+        // The signal the cancel branch reads: a freshly-loaded reconfig draft does NOT
+        // differ from the on-disk binding (so an immediate Esc says "unchanged"), but a
+        // real edit DOES (so a discard-after-edit says "edits discarded").
+        let root =
+            std::env::temp_dir().join(format!("lindep-onboard-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("registry.toml"),
+            "[[repo]]\nhandle = \"core\"\nremote = \"git@github.com:zaplar/core\"\n\n\
+             [[project]]\nid = \"p9\"\nhandle = \"core-world\"\nname = \"Core\"\n\
+             primary = \"core\"\nbranch_prefix = \"felix\"\nbase_branch = \"develop\"\n",
+        )
+        .unwrap();
+        let (reg, _) = registry::Registry::load_at(registry::Layout::new(&root));
+        let mut w = Wizard::for_project(
+            ProjectRef {
+                id: "p9".into(),
+                name: "Core".into(),
+            },
+            &reg,
+        );
+        let differs = |w: &Wizard| {
+            registry::binding_differs(&w.layout, &w.new_repos(), &w.project_draft(), &w.scratch)
+                .unwrap()
+        };
+        assert!(
+            !differs(&w),
+            "an untouched reload matches the on-disk binding (cancel ⇒ unchanged)"
+        );
+        // A real edit to a pre-populated field now reads as a discardable change.
+        w.branch_prefix = "changed".into();
+        assert!(
+            differs(&w),
+            "a changed branch_prefix differs (cancel ⇒ edits discarded)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

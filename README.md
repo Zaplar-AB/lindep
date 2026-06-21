@@ -275,7 +275,12 @@ Direct-key action names: `move-up` `move-down` `move-top` `move-bottom`
 `focus-left` `focus-right` `focus-nav` `zoom` `pin` `close` `kill` `layout`
 `open` `quit` `jump-needs-you` `context` `switch-project` `open-in-editor`
 `reclaim-mirrors` `discard-workspace` `global-view` `configure-project` `restart`
-`next-agent` `dispatch-ready` `choose-repos` `ask`.
+`next-agent` `dispatch-ready` `choose-repos` `ask` `copy-mode`.
+
+**Copy-mode** (`Ctrl-a [`, tmux-style) on a focused agent chat: scroll its scrollback
+(`↑`/`↓`, `PgUp`/`PgDn`, `g`/`G`), press `space` to start a line selection, then `y`
+(or `Enter`) to yank the highlighted lines to your clipboard via OSC52; `Esc`/`q` exits.
+OSC52 works over SSH/tmux where the host terminal allows clipboard writes.
 
 (The overlay/issue actions — `search` `help` `summary` `ledger` — are direct-only
 as of v1.7: the prefix keeps spatial pane verbs. `jump-needs-you` and `context`

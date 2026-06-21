@@ -545,18 +545,17 @@ pub struct ScratchDraft {
 /// The first block this call appends is tagged with a provenance comment; an updated
 /// project keeps its own leading comment. The write is atomic (tmp → rename), like the
 /// rest of lindep's on-disk state.
-/// Returns `Ok(true)` when the registry file was (re)written, `Ok(false)` when the
-/// prospective document was byte-identical to what's already on disk — a no-op, so
-/// nothing was written and the caller can report "configuration unchanged" instead
-/// of nudging a needless restart. The byte-compare is reliable for blocks the wizard
-/// itself wrote (this fn rebuilds them deterministically); a semantically-equal but
-/// hand-formatted block falls through to a harmless rewrite, never the reverse.
-pub fn write_binding(
+/// This is the render half — it builds the prospective document and returns it
+/// alongside the current on-disk text as `(out, existing)`, performing no write. Both
+/// [`write_binding`] (writes `out` unless it equals `existing`) and [`binding_differs`]
+/// (just compares them) layer on top, so "would saving change anything?" has exactly
+/// one definition the two callers share.
+fn render_binding(
     layout: &Layout,
     new_repos: &[RepoDraft],
     project: &ProjectDraft,
     scratch: &[ScratchDraft],
-) -> Result<bool, RegistryError> {
+) -> Result<(String, String), RegistryError> {
     use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
     let path = layout.registry_path();
@@ -697,15 +696,43 @@ pub fn write_binding(
     }
 
     let out = doc.to_string();
-    // Nothing changed (re-opened the wizard and edited nothing, or re-applied the same
-    // values): skip the write so a no-op re-config doesn't rewrite the file or nudge a
-    // pointless restart. `existing` is "" when the file is absent, which never equals a
-    // non-empty `out`, so a first-time write always proceeds.
+    Ok((out, existing))
+}
+
+/// Write the project binding into `registry.toml`, unless the prospective document is
+/// byte-identical to what's on disk — then nothing is written and `Ok(false)` is
+/// returned so the caller can report "configuration unchanged" instead of nudging a
+/// needless restart. `Ok(true)` means the file was (re)written. The byte-compare is
+/// reliable for blocks the wizard itself wrote (rebuilt deterministically); a
+/// semantically-equal but hand-formatted block falls through to a harmless rewrite.
+pub fn write_binding(
+    layout: &Layout,
+    new_repos: &[RepoDraft],
+    project: &ProjectDraft,
+    scratch: &[ScratchDraft],
+) -> Result<bool, RegistryError> {
+    let (out, existing) = render_binding(layout, new_repos, project, scratch)?;
+    // `existing` is "" when the file is absent, which never equals a non-empty `out`,
+    // so a first-time write always proceeds.
     if out == existing {
         return Ok(false);
     }
-    write_registry_atomic(&path, &out)?;
+    write_registry_atomic(&layout.registry_path(), &out)?;
     Ok(true)
+}
+
+/// Whether saving the current draft would actually change `registry.toml`. Reuses the
+/// exact render-and-compare [`write_binding`]'s no-op path uses, with no write side
+/// effect — so the onboarding wizard can tell "configuration unchanged" from "edits
+/// discarded" on cancel without `toml_edit` reformatting reading as a spurious edit.
+pub fn binding_differs(
+    layout: &Layout,
+    new_repos: &[RepoDraft],
+    project: &ProjectDraft,
+    scratch: &[ScratchDraft],
+) -> Result<bool, RegistryError> {
+    let (out, existing) = render_binding(layout, new_repos, project, scratch)?;
+    Ok(out != existing)
 }
 
 /// Append `handle` to a project's `candidates` set in `registry.toml`, preserving the
@@ -1911,6 +1938,73 @@ mod tests {
         );
         let after_second = std::fs::read_to_string(root.join("registry.toml")).unwrap();
         assert_eq!(after_first, after_second, "a no-op must not alter the file");
+    }
+
+    #[test]
+    fn binding_differs_agrees_with_write_binding_no_op() {
+        // `binding_differs` and `write_binding` must share one definition of "changed":
+        // after the first write, re-applying the identical draft reads as no-difference
+        // exactly as `write_binding` reports `Ok(false)` — and `binding_differs` is
+        // read-only (so the cancel path it backs never touches the file).
+        let root = temp_root("differs-noop");
+        let layout = Layout::new(&root);
+        let repo = RepoDraft {
+            handle: "core".into(),
+            remote: Some("git@github.com:zaplar/core".into()),
+            local: None,
+        };
+        let project = ProjectDraft {
+            id: "p1".into(),
+            handle: "core".into(),
+            name: "Core".into(),
+            candidates: vec!["core".into()],
+            primary: "core".into(),
+            branch_prefix: None,
+            base_branch: None,
+        };
+        write_binding(&layout, std::slice::from_ref(&repo), &project, &[]).unwrap();
+        let before = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        // The same draft (repo already registered, so no new [[repo]]) is byte-identical.
+        assert!(
+            !binding_differs(&layout, &[], &project, &[]).unwrap(),
+            "an unchanged re-apply does not differ"
+        );
+        let after = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        assert_eq!(before, after, "binding_differs must not write");
+    }
+
+    #[test]
+    fn binding_differs_detects_a_changed_field() {
+        // A real edit (a new branch_prefix) reads as a difference, with no write — the
+        // signal that lets the cancel path say "edits discarded" instead of "unchanged".
+        let root = temp_root("differs-edit");
+        let layout = Layout::new(&root);
+        let repo = RepoDraft {
+            handle: "core".into(),
+            remote: Some("git@github.com:zaplar/core".into()),
+            local: None,
+        };
+        let project = ProjectDraft {
+            id: "p1".into(),
+            handle: "core".into(),
+            name: "Core".into(),
+            candidates: vec!["core".into()],
+            primary: "core".into(),
+            branch_prefix: None,
+            base_branch: None,
+        };
+        write_binding(&layout, std::slice::from_ref(&repo), &project, &[]).unwrap();
+        let before = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        let edited = ProjectDraft {
+            branch_prefix: Some("felix".into()),
+            ..project
+        };
+        assert!(
+            binding_differs(&layout, &[], &edited, &[]).unwrap(),
+            "a changed branch_prefix differs"
+        );
+        let after = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        assert_eq!(before, after, "binding_differs must not write");
     }
 
     #[test]

@@ -1,24 +1,30 @@
 # lindep — feedback status & work log
 
-> Snapshot: 2026-06-21. Tracks every piece of feedback raised so far — what's
+> Snapshot: 2026-06-22. Tracks every piece of feedback raised so far — what's
 > **done**, what was **already in the tree**, and what's **still open**. Status
-> key: ✅ done · 🔁 already in the tree (rebuild to get it) · ⚠️ partial · ❌ not done.
+> key: ✅ done · 🔁 already in the tree (rebuild to get it) · ⚠️ partial · ❌ not
+> done · ⛔ won't-fix (deliberate decision).
 >
-> Latest push: commit `02aeb7f` on `felix/ask-dje77vri0if0-0-ad-hoc-agent` — the
-> UX punch-list campaign in §1. `cargo test` **518 passed, 0 failed**;
-> `cargo clippy --all-targets -- -D warnings` clean.
+> **This branch lands three waves of work** (so "what got done" spans §1–§3):
+> 1. **§1** — the UX punch-list campaign (`02aeb7f`): zoom focus, `Ctrl-L`, pin
+>    toggle, kill-flip, ad-hoc cleanup, the M-series.
+> 2. **§2** — the command-mode session (`7256c86`): sticky command mode, focus
+>    colours, help wrap, configurable base branch.
+> 3. **§3** — the deferred punch-list (`414db3d`): copy-mode, EAW column fix, the
+>    "✓ caught up" placeholder, cancel-with-edits wording.
 
 ## 0. Build health
 
-- `cargo build` / `cargo clippy -D warnings` — clean.
-- `cargo test` — **518 passed, 0 failed**.
+- `cargo build` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — **532 passed, 0 failed**.
 
 If a complaint below reads ✅/🔁 but you still see it, you're on an old binary —
 **rebuild** (`cargo install --path lindep`).
 
 ---
 
-## 1. Latest campaign — UX punch-list + ad-hoc cleanup ✅ (this session, `02aeb7f`)
+## 1. Wave 1 — UX punch-list + ad-hoc cleanup ✅ (`02aeb7f`)
 
 The v1.7 UX-audit follow-ups, plus two bugs you reported live (zoom focus, ad-hoc
 rows) and a rendering escape hatch. Designed/verified with a multi-agent
@@ -37,7 +43,8 @@ ratatui's per-frame diff can't know the terminal desynced, and nothing forced a
 clear. `Ctrl-L` now drops the diff baseline (`terminal.clear()` + repaint) via the
 global-chord band, so it works even inside a focused chat. Code: `keymap.rs`
 `Action::Redraw` + `GLOBAL_DEFAULTS`, `app.rs` `request_redraw`/`take_force_redraw`,
-`main.rs` loop. The deep EAW width audit (root cause) is still open (§4). +1 test.
+`main.rs` loop. The §3b column fix tightens our own glyph columns; the deeper
+per-terminal EAW audit (root cause) is still open (§5). +1 test.
 
 ### 1c. Pin is a real toggle (H2) ✅
 `Ctrl-A p` on a focused **pinned** coin now **unpins** it (symmetric with the
@@ -98,26 +105,73 @@ project), not a launch alias.
 
 ---
 
-## 2. Earlier this session 🔁 (already committed — rebuild to get these)
-
-Committed in `7256c86`, documented in code:
+## 2. Wave 2 — command mode & base branch ✅ (`7256c86`)
 
 - **Sticky command mode** (`Ctrl-A` arms a mode that chains the window-arrangement
   verbs — zoom/close/layout/restart — with bare keys; drops back out on a focus
   move/pin/flip/launch, `Esc`, a second prefix, or landing on a chat). `app.rs`
-  `on_prefix_key` / `verb_chains_in_command_mode`.
+  `on_prefix_key` / `verb_chains_in_command_mode`. Note: this re-introduces command
+  mode, deliberately removed in v1.7 (ENG-562) — intentional, documented in code.
 - **Command-mode amber wash + two-signal colours** — armed = the whole focused
   surface goes amber; at rest **violet = focus**, **green = selection** (kept
   distinct; the unify-them experiment was reverted because it breaks on a focused
   pinned agent). `theme.rs` / `ui.rs`.
-- **Help `?` overlay wraps** long descriptions instead of clipping.
+- **Help `?` overlay wraps** long descriptions instead of clipping, and the scroll
+  range is sized to the real wrapped height so nothing is cut off. `ui.rs`
+  `render_help`.
 - **Configurable per-project `base_branch`** — a new issue branch forks from a
-  freshly-fetched `origin/<base>` instead of local `HEAD`, with a safe fall-through;
-  set in the wizard or `Ctrl-A o`. `worktree.rs` `resolve_base`.
+  freshly-fetched `origin/<base>` instead of local `HEAD`, with a safe fall-through
+  (`origin/<base>` → `<base>` → `origin/HEAD` → `HEAD`) so a typo or an absent
+  branch never blocks a launch; set in the onboarding wizard or `Ctrl-A o`.
+  `worktree.rs` `resolve_base`/`is_valid_base`, `registry.rs`, `workspace.rs`,
+  `onboard.rs`. +6 tests.
 
 ---
 
-## 3. Already in the tree 🔁 (reported broken, but the current code handles them)
+## 3. Wave 3 — deferred punch-list ✅ (`414db3d`)
+
+The small/safe deferred items, plus copy-mode. Two items were scoped for this pass
+but are **not yet implemented** — idle backstop and transient-footer expiry — and
+stay open in §5.
+
+### 3a. Per-window copy-mode (`Ctrl-a [`) ✅ — was §5's "copy/selection scoped to a pane"
+`Ctrl-a [` on a focused chat enters tmux-style copy-mode: scroll the agent's
+scrollback (`↑↓`, `PgUp`/`PgDn`, `g`/`G`), `space` to start a line selection, `y`
+(or `Enter`) to yank the highlighted lines to the host clipboard via a
+dependency-free **OSC52** escape, `Esc`/`q` to exit. A violet border + `⧉ COPY`
+chip mark the latched pane, and leaving copy-mode snaps the terminal back to the
+live bottom. This is the "real fix" §5 used to describe — it sidesteps the native
+rectangular-drag-spans-every-pane problem by selecting within the one focused pane.
+Code: `app.rs` (`CopyMode`, `enter_copy_mode`/`handle_copy_key`/`yank_copy_selection`,
+`status_text`), `ui.rs` `render_copy_pane`, `keymap.rs` `Action::CopyMode`, `main.rs`
+OSC52 drain. +5 tests (handler + render) plus a base64 vector test.
+
+### 3b. EAW column-alignment fix ✅
+Status/priority glyph columns render through a fixed-width `cell()` field sharing
+one `disp_w()` authority with `truncate()`, so a glyph that measures wide in the
+renderer's table can't stagger the KEY/title columns. Byte-identical for today's
+one-cell glyphs; a hard invariant for future ones. `ui.rs`. +2 tests. (The *deeper*
+per-terminal EAW audit behind the §1b stagger is still open — §5.)
+
+### 3c. "✓ caught up" placeholder (B0a) ✅
+An empty NEEDS-YOU band now shows a standing, non-selectable `✓ caught up` row
+instead of the section silently vanishing, so clearing your last alert reads as
+"you're clear", not "did it lose my agent?". `ui.rs` `render_banded_spine`. +2 tests.
+
+### 3d. Cancel-with-edits wording ✅
+The re-config cancel path now says **"edits discarded — configuration unchanged"**
+when the draft actually differs (vs a plain "configuration unchanged" no-op), via a
+read-only `registry::binding_differs` predicate that shares `write_binding`'s
+render-and-compare so `toml_edit` reformatting never reads as a spurious edit.
+`registry.rs` / `onboard.rs`. +4 tests.
+
+> **B0b** (the pin/unpin overload) landed in Wave 1 as §1c — `Ctrl-A p` is now a
+> real toggle. Together with **B0a** above, both of the audit's "B0" design calls
+> are resolved.
+
+---
+
+## 4. Already in the tree 🔁 (reported broken, but the current code handles them)
 
 | # | Your report | Reality |
 |---|-------------|---------|
@@ -130,19 +184,16 @@ Committed in `7256c86`, documented in code:
 
 ---
 
-## 4. Still open
+## 5. Still open
 
 | # | Item | Status | Notes |
 |---|------|--------|-------|
-| 4 | Agent goes idle but doesn't show idle | ❌ | `Running→Idle` happens only via Claude's `Stop` hook (`notify.rs`). No quiescence backstop, so a missed/late hook leaves it stuck on WORKING. **Highest-value small fix:** a timer demoting to Idle after N s of no output + no hook. |
-| — | **Copy/selection scoped to the focused window** | ❌ (new) | You want a drag-select to grab only the focused pane. Today the app **doesn't capture the mouse** (`ratatui::init` = raw + alt screen + bracketed paste, *not* mouse capture), so your **terminal** selects — and a rectangular drag spans the side-by-side rail/mosaic columns, grabbing every pane. **Now:** zoom the pane (`Ctrl-A z`) so it fills the screen (native selection then covers only it — §1a helps); or use **Alt/Option+drag** (block selection) to isolate one column-pane. **Real fix (copy-mode):** capture the mouse, track a drag scoped to the focused rect, highlight it, write to the clipboard via **OSC 52**. Buildable, but a real feature: while active it disables the terminal's native selection + scrollback (so it'd be a toggle/mode), and the `claude` PTY panes need a mouse-forwarding decision. |
-| — | EAW double-width width audit | ❌ | The root cause behind the §1b stagger — a per-terminal width-accounting pass. `Ctrl-L` is the pragmatic hatch until then. |
+| 4 | Agent goes idle but doesn't show idle | ❌ | `Running→Idle` happens only via Claude's `Stop` hook (`notify.rs`). No quiescence backstop, so a missed/late hook leaves it stuck on WORKING. The intended `QUIESCENCE_FRAMES` (~120 s) timer in `tick_frame` was scoped for Wave 3 but **not yet implemented** — highest-value small next step. |
+| — | EAW double-width width audit (deep) | ❌ | §3b aligns *our* glyph columns; the root cause behind the §1b stagger — a per-terminal width-accounting pass that agrees with the terminal's own EAW mode — remains. `Ctrl-L` (§1b) is the pragmatic hatch until then. |
+| — | Transient-footer expiry | ❌ | Footer/status lines don't auto-time-out — the render only repaints on events, so a transient message can linger. Intended design: `Footer { text, expires_at }` with a ~3 s TTL reaped in `tick_frame`; the renderer already reads the footer through one `App::status_text()` accessor so it can land behind that. Scoped for Wave 3 but not implemented. |
 | — | **Vertical pipeline** (auto-run instructions on agent start) | ❌ | Agents launch as a blank interactive `claude` — no prompt/issue text/skill injected. The furthest-from-done piece of the vision. |
 | — | **Horizontal auto-dispatch** | ⚠️ | Manual `Ctrl-A g` batch-to-cap only; no auto-draining background queue. |
 | — | Broader staleness policy | ⚠️ | `base_branch` (§2) covers fork-from-fresh; auto-pull of an *existing* branch + an "N behind" chip remain open. |
-| — | Transient-footer expiry | ❌ | Footer/status lines don't auto-time-out — the render only repaints on events, so a transient message can linger until the next redraw. (Deferred from the v1.7 audit, Part C.) |
-| — | Cancel-with-edits wording | ❌ | The confirm wording when cancelling an action that has unsaved edits. (Deferred from the v1.7 audit, Part C.) |
-| — | B0a / B0b design calls | ❌ | Two UI design decisions punted in the v1.7 audit (Part C); specifics need a re-read of the audit notes. |
 
 > **Deliberately skipped (not open):** **H1** — the several launch chords
 > (`Enter` / `Space` / `Ctrl-A Enter` / `Ctrl-A Space`) are kept on purpose (you
@@ -150,12 +201,14 @@ Committed in `7256c86`, documented in code:
 
 ---
 
-## 5. Suggested order of attack
+## 6. Suggested order of attack
 
-1. **Idle backstop** (§4 item 4) — small, daily annoyance, self-contained.
-2. **Copy-mode** (§4) — if per-window copy matters day-to-day; decide the
-   native-selection trade-off first.
-3. **Vertical pipeline MVP** (§4) — even auto-injecting the issue text unblocks
-   the rest of the agent-workflow vision.
-4. **Broader staleness policy** then the **horizontal auto-dispatch loop** (§4).
-5. EAW width audit (§4) — replace the `Ctrl-L` hatch with a real fix.
+1. **Idle backstop** (§5 item 4) — small, daily annoyance, self-contained; the one
+   piece scoped for Wave 3 that didn't land.
+2. **Transient-footer expiry** (§5) — also scoped but unbuilt; `status_text()` is
+   already the seam it slots behind.
+3. **Vertical pipeline MVP** (§5) — even auto-injecting the issue text unblocks the
+   rest of the agent-workflow vision.
+4. **Broader staleness policy** then the **horizontal auto-dispatch loop** (§5).
+5. **Deep EAW width audit** (§5) — replace the `Ctrl-L` hatch and the §3b column
+   guard with a real per-terminal pass.

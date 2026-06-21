@@ -876,6 +876,48 @@ fn disable_bracketed_paste() {
     );
 }
 
+/// Minimal standard base64 (RFC 4648, with `=` padding) for OSC52 clipboard payloads —
+/// avoids pulling a crate for one self-contained function.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::base64_encode;
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"hi"), "aGk=");
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        // OSC52 carries arbitrary bytes (a yanked multi-line block).
+        assert_eq!(base64_encode(b"line one\nline two"), "bGluZSBvbmUKbGluZSB0d28=");
+    }
+}
+
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx) -> io::Result<()> {
     use std::time::Instant;
     use tokio::sync::mpsc::error::TryRecvError;
@@ -960,6 +1002,19 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
                 // the user may still be driving the UI, so keep looping.
                 Err(TryRecvError::Disconnected) => break,
             }
+        }
+
+        // A copy-mode yank parks the text here; push it to the host's clipboard with an
+        // OSC52 escape (dependency-free, works over SSH/tmux where the host allows it —
+        // mirroring the bracketed-paste DECSET above). A host that ignores OSC52 just
+        // no-ops; the "copied N lines" footer still confirms the selection was taken.
+        if let Some(text) = app.pending_clipboard.take() {
+            use std::io::Write;
+            let payload = base64_encode(text.as_bytes());
+            let mut out = io::stdout();
+            let _ = out.write_all(format!("\x1b]52;c;{payload}\x07").as_bytes());
+            let _ = out.flush();
+            dirty = true;
         }
 
         // Advance the animation frame on the wall-clock cadence while something

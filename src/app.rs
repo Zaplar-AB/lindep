@@ -166,6 +166,21 @@ enum CommandStep {
     ExitReprocess,
 }
 
+/// A focused agent chat latched into tmux-style copy-mode: its keys scroll the
+/// scrollback and select lines to yank, instead of typing into the child. `scroll` is
+/// the vt100 scrollback offset (0 = the live bottom, larger = further back into
+/// history); `cursor` is the line cursor's row *within the visible grid*; and `anchor`,
+/// when set, marks the other end of an inclusive line selection (`None` = the cursor row
+/// alone). The renderer ([`crate::ui`]'s `render_copy_pane`) is the single writer of the
+/// clamped scroll offset — it caps `scroll` at the real backlog and writes the clamped
+/// value back here — so this handler only ever *requests* a scroll and stays in range.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyMode {
+    pub scroll: usize,
+    pub cursor: usize,
+    pub anchor: Option<usize>,
+}
+
 pub struct App {
     pub graph: Graph,
     pub order: Vec<String>,
@@ -243,6 +258,14 @@ pub struct App {
     /// Backend handles for agents we launched, keyed by issue. Used to render
     /// and drive an agent's PTY.
     pub backends: HashMap<String, Arc<dyn AgentBackend>>,
+    /// Per-issue copy-mode state (tmux-style scrollback selection on a focused chat).
+    /// An entry's presence latches that issue's chat into copy-mode: its keys scroll/
+    /// select instead of forwarding to the PTY. Absent = the chat types normally.
+    pub copy: HashMap<String, CopyMode>,
+    /// A yanked copy-mode selection awaiting delivery to the host clipboard. The render
+    /// loop drains it once and pushes it out as an OSC52 escape, so the app never has to
+    /// depend on a platform clipboard crate.
+    pub pending_clipboard: Option<String>,
     /// Last frame at which each agent produced PTY output. Used only as a short
     /// visual settle window so an otherwise-idle agent does not read as quiet while
     /// buffered output is still painting.
@@ -515,6 +538,8 @@ impl App {
             agent_repos: HashMap::new(),
             fleet: HashMap::new(),
             backends: HashMap::new(),
+            copy: HashMap::new(),
+            pending_clipboard: None,
             last_output: HashMap::new(),
             pending_attach: None,
             frame: 0,
@@ -1000,13 +1025,20 @@ impl App {
                 issue,
                 mode: CoinMode::Chat,
             } => {
-                // Typing into the very agent that needs you is the strongest "I'm
-                // handling it" signal: drop the sticky footer alert now. The
-                // per-issue NeedsYou status clears the moment the agent resumes
-                // (the UserPromptSubmit / PostToolUse hooks), so the roster/header
-                // stay honest until then.
-                self.needs_you_alert = false;
-                self.forward_to_agent(&issue, key);
+                // Copy-mode latches this chat to its scrollback: its keys scroll/select/
+                // yank rather than typing into the child. Checked before the PTY forward
+                // so a copy-mode `j`/`y`/Esc can't leak a stray keystroke into the agent.
+                if self.copy.contains_key(&issue) {
+                    self.handle_copy_key(&issue, key);
+                } else {
+                    // Typing into the very agent that needs you is the strongest "I'm
+                    // handling it" signal: drop the sticky footer alert now. The
+                    // per-issue NeedsYou status clears the moment the agent resumes
+                    // (the UserPromptSubmit / PostToolUse hooks), so the roster/header
+                    // stay honest until then.
+                    self.needs_you_alert = false;
+                    self.forward_to_agent(&issue, key);
+                }
             }
             // A coin's deps face navigates exactly like the old Deps pane. Esc pops
             // the re-root history (the one window where Esc conventionally pops a
@@ -1287,6 +1319,7 @@ impl App {
             Action::DispatchReady => self.dispatch_ready(),
             Action::ChooseRepos => self.dispatch_selection(true),
             Action::AskAgent => self.ask_spawn(),
+            Action::CopyMode => self.enter_copy_mode(),
             // The rest are direct (Spine/Deps) actions, never prefix verbs.
             _ => {}
         }
@@ -3148,6 +3181,169 @@ impl App {
     }
 
     /// Forward a key to a specific agent's PTY.
+    /// Enter copy-mode on the focused agent chat (`Ctrl-a [`). Latches that chat into
+    /// tmux-style scrollback selection; a non-chat focus (Spine/Deps/Fleet) has no agent
+    /// scrollback to copy, so it just reports why. Starts at the live bottom (`scroll` 0)
+    /// with the cursor on the top visible row and nothing selected.
+    fn enter_copy_mode(&mut self) {
+        let WindowKind::Coin {
+            issue,
+            mode: CoinMode::Chat,
+        } = self.windows.focused_kind().clone()
+        else {
+            self.set_footer("copy-mode needs a focused agent chat — Tab to a chat first".into());
+            return;
+        };
+        if !self.backends.contains_key(&issue) {
+            self.set_footer(format!("no live agent on {issue} to copy from"));
+            return;
+        }
+        self.copy.insert(issue, CopyMode::default());
+        self.set_footer(
+            "copy-mode · ↑/↓ PgUp/PgDn g/G scroll · space select · y/⏎ yank · Esc/q exit".into(),
+        );
+    }
+
+    /// Drive copy-mode keys for a chat already latched into it. Movement keys scroll the
+    /// scrollback and walk a line cursor; `space` toggles a line-selection anchor; `y`/
+    /// `Enter` parks the selection in `pending_clipboard` (the render loop emits the
+    /// OSC52) and exits; `Esc`/`q` exits. Any other key is swallowed — copy-mode owns the
+    /// keyboard, so a stray key neither leaks into the child nor falls through to a verb.
+    fn handle_copy_key(&mut self, issue: &str, key: KeyEvent) {
+        let Some(backend) = self.backends.get(issue).map(Arc::clone) else {
+            // The backend was reaped out from under copy-mode: drop the mode rather than
+            // trap the keyboard against a gone agent.
+            self.copy.remove(issue);
+            self.set_footer(format!("agent on {issue} is gone — left copy-mode"));
+            return;
+        };
+        // The visible grid height bounds the line cursor; a page leaves one row of
+        // overlap for orientation. Read it once from the live parser.
+        let srows = backend
+            .parser()
+            .read()
+            .ok()
+            .map_or(0, |g| g.screen().size().0 as usize);
+        let last = srows.saturating_sub(1);
+        let page = last.max(1);
+
+        // Exit keys end copy-mode and snap the terminal back to the live bottom — copy
+        // scrolled the shared parser into history, so leaving must reset it or the live
+        // pane would stay frozen on the scrolled-up view.
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.copy.remove(issue);
+            Self::reset_scrollback(&backend);
+            self.set_footer("copy-mode: exited".into());
+            return;
+        }
+        // Yank reads the current selection, parks it for the clipboard, and exits.
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+            self.yank_copy_selection(issue, &backend);
+            return;
+        }
+
+        // Movement/selection: a self-contained mutation of the `cm` entry (no `self`
+        // method calls inside, so the `get_mut` borrow stays clean).
+        if let Some(cm) = self.copy.get_mut(issue) {
+            cm.cursor = cm.cursor.min(last);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if cm.cursor > 0 {
+                        cm.cursor -= 1;
+                    } else {
+                        // At the top edge, pull one more line of history into view.
+                        cm.scroll = cm.scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if cm.cursor < last {
+                        cm.cursor += 1;
+                    } else if cm.scroll > 0 {
+                        // At the bottom edge, release one line back toward live.
+                        cm.scroll -= 1;
+                    }
+                }
+                KeyCode::PageUp => cm.scroll = cm.scroll.saturating_add(page),
+                KeyCode::PageDown => cm.scroll = cm.scroll.saturating_sub(page),
+                KeyCode::Char('g') | KeyCode::Home => {
+                    // Oldest history: request a huge scroll (the renderer clamps it to the
+                    // real backlog and writes the clamped value back) and park at the top.
+                    cm.scroll = usize::MAX;
+                    cm.cursor = 0;
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    cm.scroll = 0; // the live bottom
+                    cm.cursor = last;
+                }
+                KeyCode::Char(' ') => {
+                    // Toggle the selection anchor: start a line selection at the cursor,
+                    // or clear it on a second press.
+                    cm.anchor = if cm.anchor.is_some() {
+                        None
+                    } else {
+                        Some(cm.cursor)
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Copy the current copy-mode selection — the `anchor..=cursor` line span, or the
+    /// cursor line alone when nothing is anchored — from `issue`'s scrollback into
+    /// `pending_clipboard`, then leave copy-mode and snap back to the live bottom. The
+    /// render loop drains `pending_clipboard` and emits the OSC52. A whitespace-only
+    /// selection is treated as nothing to copy.
+    fn yank_copy_selection(&mut self, issue: &str, backend: &Arc<dyn AgentBackend>) {
+        let Some(cm) = self.copy.get(issue).cloned() else {
+            return;
+        };
+        let text = {
+            let parser = backend.parser();
+            let Ok(mut guard) = parser.write() else {
+                self.set_footer("copy-mode: could not read the scrollback".into());
+                return;
+            };
+            guard.screen_mut().set_scrollback(cm.scroll);
+            let (srows, scols) = guard.screen().size();
+            let last = (srows as usize).saturating_sub(1);
+            let cursor = cm.cursor.min(last);
+            let (lo, hi) = match cm.anchor {
+                Some(a) => (a.min(cursor), a.max(cursor).min(last)),
+                None => (cursor, cursor),
+            };
+            guard
+                .screen()
+                .rows(0, scols)
+                .skip(lo)
+                .take(hi - lo + 1)
+                .map(|r| r.trim_end().to_string()) // shed the grid's right-pad spaces
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        self.copy.remove(issue);
+        Self::reset_scrollback(backend);
+        if text.trim().is_empty() {
+            self.set_footer("copy-mode: nothing to copy".into());
+            return;
+        }
+        let lines = text.lines().count().max(1);
+        self.pending_clipboard = Some(text);
+        self.set_footer(format!(
+            "copied {lines} line{}",
+            if lines == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Return an agent's terminal to the live bottom (scrollback 0). Copy-mode scrolls
+    /// the shared vt100 parser into history; leaving it must snap back or the live pane
+    /// would stay frozen on the scrolled-up view.
+    fn reset_scrollback(backend: &Arc<dyn AgentBackend>) {
+        if let Ok(mut guard) = backend.parser().write() {
+            guard.screen_mut().set_scrollback(0);
+        }
+    }
+
     fn forward_to_agent(&mut self, issue: &str, key: KeyEvent) {
         let bytes = backend::key_to_bytes(key);
         if bytes.is_empty() {
@@ -4199,6 +4395,13 @@ impl App {
     /// "⇡N unpushed" chip. Mirrors [`Self::elsewhere_needs_you`].
     pub fn unpushed_count(&self) -> usize {
         self.unpushed.values().map(HashSet::len).sum()
+    }
+
+    /// The transient footer/status line the detail bar shows, if any. A thin accessor
+    /// over `status_msg` so the renderer reads it through one path — a future
+    /// footer-with-TTL can land behind this without touching `ui.rs`.
+    pub fn status_text(&self) -> Option<&str> {
+        self.status_msg.as_deref()
     }
 
     fn set_footer(&mut self, text: String) {
@@ -6426,6 +6629,123 @@ mod tests {
             !a.take_force_redraw(),
             "the redraw request is consumed once — the loop clears + repaints one frame"
         );
+    }
+
+    // ── Copy-mode (tmux-style scrollback selection) ──────────────────────────
+
+    /// Focus a fresh **Chat** coin on `issue` — the band that forwards keys to a PTY —
+    /// by pinning the opening preview out of the way and aiming a new chat preview here.
+    fn focus_chat(a: &mut App, issue: &str) {
+        a.windows.focus_preview();
+        a.windows.pin_preview();
+        a.windows.ensure_preview(issue, CoinMode::Chat, &a.graph);
+        a.windows.focus_preview();
+        assert!(
+            matches!(
+                a.windows.focused_kind(),
+                WindowKind::Coin { mode: CoinMode::Chat, .. }
+            ),
+            "precondition: a chat coin is focused"
+        );
+    }
+
+    #[test]
+    fn copy_mode_enters_only_on_a_focused_chat_with_a_live_agent() {
+        let mut a = app();
+        // The spine is focused by default — nothing to copy from.
+        a.enter_copy_mode();
+        assert!(a.copy.is_empty(), "no copy-mode without a focused chat");
+        assert!(a.status_text().unwrap().contains("needs a focused agent chat"));
+
+        // A focused chat, but no backend yet (a just-pressed button): still refuse.
+        focus_chat(&mut a, "ZAP-205");
+        a.enter_copy_mode();
+        assert!(a.copy.is_empty(), "no copy-mode without a live backend");
+        assert!(a.status_text().unwrap().contains("no live agent"));
+
+        // With a live backend, copy-mode latches on the focused chat.
+        a.backends
+            .insert("ZAP-205".into(), FakeBackend::new("ZAP-205") as Arc<dyn AgentBackend>);
+        a.enter_copy_mode();
+        assert!(
+            a.copy.contains_key("ZAP-205"),
+            "copy-mode latches on the focused chat with a live agent"
+        );
+    }
+
+    #[test]
+    fn copy_mode_keys_drive_the_selection_and_never_reach_the_pty() {
+        let mut a = app();
+        focus_chat(&mut a, "ZAP-205");
+        let fake = FakeBackend::new("ZAP-205");
+        a.backends
+            .insert("ZAP-205".into(), fake.clone() as Arc<dyn AgentBackend>);
+        a.enter_copy_mode();
+
+        // `j` walks the line cursor down — routed through the real `on_key`, which must
+        // hand the key to copy-mode (band 6 Chat) rather than the agent's PTY.
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(a.copy.get("ZAP-205").unwrap().cursor, 1);
+        // `space` anchors a selection at the cursor; a second press clears it.
+        a.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(a.copy.get("ZAP-205").unwrap().anchor, Some(1));
+        a.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(a.copy.get("ZAP-205").unwrap().anchor, None);
+
+        // None of those keystrokes leaked into the child — copy-mode owns the keyboard.
+        assert!(
+            fake.inputs.lock().unwrap().is_empty(),
+            "copy-mode keys must never be forwarded to the agent PTY"
+        );
+
+        // `q` leaves copy-mode (and the chat types into the PTY again).
+        a.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!a.copy.contains_key("ZAP-205"), "q exits copy-mode");
+    }
+
+    #[test]
+    fn copy_mode_yank_parks_the_selected_lines_and_exits() {
+        let mut a = app();
+        focus_chat(&mut a, "ZAP-205");
+        let fake = FakeBackend::new("ZAP-205");
+        fake.parser()
+            .write()
+            .unwrap()
+            .process(b"alpha\r\nbravo\r\ncharlie\r\n");
+        a.backends
+            .insert("ZAP-205".into(), fake as Arc<dyn AgentBackend>);
+        a.enter_copy_mode();
+        // Select the three printed rows: cursor on row 0, anchor on row 2.
+        {
+            let cm = a.copy.get_mut("ZAP-205").unwrap();
+            cm.cursor = 0;
+            cm.anchor = Some(2);
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!a.copy.contains_key("ZAP-205"), "a yank exits copy-mode");
+        let clip = a
+            .pending_clipboard
+            .take()
+            .expect("the yank parks an OSC52 payload for the render loop");
+        assert_eq!(clip, "alpha\nbravo\ncharlie", "the selected block is captured verbatim");
+    }
+
+    #[test]
+    fn copy_mode_yank_of_blank_lines_copies_nothing() {
+        let mut a = app();
+        focus_chat(&mut a, "ZAP-205");
+        // A live agent that printed nothing — the visible grid is all blanks.
+        a.backends
+            .insert("ZAP-205".into(), FakeBackend::new("ZAP-205") as Arc<dyn AgentBackend>);
+        a.enter_copy_mode();
+        a.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!a.copy.contains_key("ZAP-205"), "yank still exits copy-mode");
+        assert!(
+            a.pending_clipboard.is_none(),
+            "a whitespace-only selection copies nothing"
+        );
+        assert!(a.status_text().unwrap().contains("nothing to copy"));
     }
 
     // ── The spine ──────────────────────────────────────────────────────────

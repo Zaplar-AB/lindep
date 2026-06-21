@@ -166,6 +166,9 @@ pub enum Action {
     ChooseRepos,
     /// Start an ad-hoc agent that is not tied to a Linear issue.
     AskAgent,
+    /// Enter copy-mode on the focused agent chat: scroll its scrollback and yank lines to
+    /// the clipboard (tmux-style). In-mode keys are handled by the Chat band, not the keymap.
+    CopyMode,
 }
 
 /// `(action, config name, default keys)` for the **direct** keys consulted when
@@ -246,6 +249,7 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::DispatchReady, "dispatch-ready", &["g"]),
     (Action::ChooseRepos, "choose-repos", &["c"]),
     (Action::AskAgent, "ask", &["?"]),
+    (Action::CopyMode, "copy-mode", &["["]),
 ];
 
 /// `(action, config name, default keys)` for the **global** chords (window-switch
