@@ -140,6 +140,13 @@ Committed in `7256c86`, documented in code:
 | — | **Vertical pipeline** (auto-run instructions on agent start) | ❌ | Agents launch as a blank interactive `claude` — no prompt/issue text/skill injected. The furthest-from-done piece of the vision. |
 | — | **Horizontal auto-dispatch** | ⚠️ | Manual `Ctrl-A g` batch-to-cap only; no auto-draining background queue. |
 | — | Broader staleness policy | ⚠️ | `base_branch` (§2) covers fork-from-fresh; auto-pull of an *existing* branch + an "N behind" chip remain open. |
+| — | Transient-footer expiry | ❌ | Footer/status lines don't auto-time-out — the render only repaints on events, so a transient message can linger until the next redraw. (Deferred from the v1.7 audit, Part C.) |
+| — | Cancel-with-edits wording | ❌ | The confirm wording when cancelling an action that has unsaved edits. (Deferred from the v1.7 audit, Part C.) |
+| — | B0a / B0b design calls | ❌ | Two UI design decisions punted in the v1.7 audit (Part C); specifics need a re-read of the audit notes. |
+
+> **Deliberately skipped (not open):** **H1** — the several launch chords
+> (`Enter` / `Space` / `Ctrl-A Enter` / `Ctrl-A Space`) are kept on purpose (you
+> like the redundancy; see §1i). Not an oversight.
 
 ---
 
