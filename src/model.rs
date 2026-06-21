@@ -149,6 +149,35 @@ impl Graph {
         self.nodes.insert(issue.key.clone(), issue);
     }
 
+    /// Remove a node and every reference to it, returning whether it existed.
+    ///
+    /// Intended for synthetic, **edgeless** ad-hoc (`ask-*`) nodes that exist only
+    /// while their agent does — so the Spine drops the row once the agent is reaped.
+    /// Every adjacency, cycle, and cache entry naming `key` is pruned so the graph
+    /// stays internally consistent even if `key` had edges; the cycle and transitive
+    /// *caches* are not recomputed, so removing a node that participates in edges
+    /// would leave those stale — re-[`finalize`](Self::finalize) in that case.
+    /// (Ad-hoc nodes are always edgeless, so no current caller needs to.)
+    pub fn remove_issue(&mut self, key: &str) -> bool {
+        if self.nodes.remove(key).is_none() {
+            return false;
+        }
+        self.order.retain(|k| k.as_str() != key);
+        self.blocks.remove(key);
+        self.blocked_by.remove(key);
+        for list in self.blocks.values_mut().chain(self.blocked_by.values_mut()) {
+            list.retain(|k| k.as_str() != key);
+        }
+        self.edges
+            .retain(|(blocker, blocked)| blocker.as_str() != key && blocked.as_str() != key);
+        self.back_edges
+            .retain(|(from, to)| from.as_str() != key && to.as_str() != key);
+        self.in_cycle.remove(key);
+        self.cycles.retain(|cycle| !cycle.iter().any(|k| k.as_str() == key));
+        self.transitive_counts.remove(key);
+        true
+    }
+
     /// Ensure a referenced endpoint exists, materialising it as an external
     /// node if we never fetched it directly.
     pub fn ensure_external(&mut self, key: &str, title: &str) {
@@ -607,6 +636,34 @@ mod tests {
         g.add_edge("B", "C");
         g.finalize();
         g
+    }
+
+    #[test]
+    fn remove_issue_drops_a_node_and_every_reference_to_it() {
+        let mut g = chain(); // X-1 → A → B → C
+        let edges_before = g.edge_count();
+
+        assert!(g.remove_issue("B"), "B existed and was removed");
+        assert!(g.get("B").is_none(), "the node is gone");
+        assert!(
+            !g.keys().iter().any(|k| k.as_str() == "B"),
+            "and gone from the display order"
+        );
+        // The A→B and B→C edges go with it, from both adjacency directions.
+        assert_eq!(g.edge_count(), edges_before - 2);
+        assert!(
+            g.neighbours("A", Direction::Downstream).is_empty(),
+            "A no longer blocks B"
+        );
+        assert!(
+            g.neighbours("C", Direction::Upstream).is_empty(),
+            "C is no longer blocked by B"
+        );
+
+        assert!(
+            !g.remove_issue("B"),
+            "removing a missing node is a no-op returning false"
+        );
     }
 
     #[test]

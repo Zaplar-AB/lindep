@@ -56,7 +56,6 @@ pub struct PlaneBuilder {
     pub exe: PathBuf,
     pub hook_port: u16,
     pub hook_token: String,
-    pub base: String,
     pub rows: u16,
     pub cols: u16,
     pub max_concurrent: usize,
@@ -77,6 +76,9 @@ impl PlaneBuilder {
         provision: RepoProvision,
         store: Arc<Mutex<SessionStore>>,
     ) -> SupervisorConfig {
+        // The base lives on the per-project provision, not the workspace-shared
+        // builder; capture it before `provision` is moved into the struct below.
+        let base = provision.base.clone();
         SupervisorConfig {
             project_id: project_id.to_string(),
             worktree,
@@ -88,7 +90,7 @@ impl PlaneBuilder {
             hook_port: self.hook_port,
             hook_token: self.hook_token.clone(),
             hooks_dir,
-            base: self.base.clone(),
+            base,
             rows: self.rows,
             cols: self.cols,
             max_concurrent: self.max_concurrent,
@@ -239,7 +241,8 @@ fn materialize_session_repo(
     let mgr =
         WorktreeManager::with_layout(&clone, &provision.branch_prefix, &worktrees_root, handle)
             .map_err(|e| e.to_string())?;
-    mgr.create(issue, "", "HEAD").map_err(|e| e.to_string())?;
+    mgr.create(issue, "", &provision.base)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -430,6 +433,10 @@ fn materialize_repo_request(
         .branch_prefix
         .clone()
         .unwrap_or_else(crate::worktree::default_branch_prefix);
+    let base = descriptor
+        .base_branch
+        .clone()
+        .unwrap_or_else(|| "HEAD".to_string());
     let worktrees_root = layout.worktrees_dir(&descriptor.handle);
 
     // Best-effort, throttled mirror refresh so a (re)built clone forks off current
@@ -447,7 +454,7 @@ fn materialize_repo_request(
     // The title isn't known here; create() reuses any existing `<prefix>/<issue>…`
     // branch (cut by a sibling repo at launch) over minting a fresh one, so the
     // issue's repos stay on the same branch name.
-    if let Err(e) = mgr.create(issue, "", "HEAD") {
+    if let Err(e) = mgr.create(issue, "", &base) {
         return notify(format!("pulling `{handle}` into {issue}: {e}"));
     }
 
@@ -561,6 +568,10 @@ pub async fn build_plane(
             .branch_prefix
             .clone()
             .unwrap_or_else(crate::worktree::default_branch_prefix),
+        base: descriptor
+            .base_branch
+            .clone()
+            .unwrap_or_else(|| "HEAD".to_string()),
         primary: descriptor.primary.clone(),
         candidates: descriptor
             .candidates
@@ -1234,7 +1245,6 @@ mod tests {
             exe: PathBuf::from("lindep"),
             hook_port: 1,
             hook_token: String::new(),
-            base: "HEAD".to_string(),
             rows: 24,
             cols: 80,
             max_concurrent,
@@ -1674,6 +1684,7 @@ mod tests {
             layout: Layout::new(repo.join(".lindep")),
             project_handle: "p".to_string(),
             branch_prefix: "felix".to_string(),
+            base: "HEAD".to_string(),
             primary: "p".to_string(),
             candidates: HashMap::new(),
             scratch: Vec::new(),
@@ -1738,6 +1749,7 @@ mod tests {
             layout: layout.clone(),
             project_handle: "proj".to_string(),
             branch_prefix: "felix".to_string(),
+            base: "HEAD".to_string(),
             primary: "api".to_string(),
             candidates: HashMap::from([("api".to_string(), entry.clone())]),
             scratch: Vec::new(),

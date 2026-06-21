@@ -356,14 +356,55 @@ impl WorktreeManager {
                 branch,
             })
         } else {
+            // Brand-new branch: resolve the configured base to a fresh start-point
+            // (`origin/<base>` after a best-effort fetch, with fall-through to HEAD).
+            // Only here — resumes/recoveries above keep their committed branch, so a
+            // configured base never re-bases or orphans existing work.
             let branch = self.branch_name(issue, title);
-            self.git(&["worktree", "add", "-b", &branch, path_str.as_ref(), base])?;
+            let start = self.resolve_base(base);
+            self.git(&["worktree", "add", "-b", &branch, path_str.as_ref(), &start])?;
             Ok(Worktree {
                 issue: issue.to_string(),
                 path,
                 branch,
             })
         }
+    }
+
+    /// Resolve a configured base to a start-point `git worktree add -b` will accept,
+    /// preferring a *fresh* remote-tracking ref. Infallible: a mistyped or absent
+    /// base falls through to `HEAD` so it can never block a launch. Consulted only on
+    /// the fresh-branch path (an existing issue branch is reused regardless), so this
+    /// is the one place that pays a network fetch — and only when a base is set.
+    ///
+    /// `HEAD` (the unset default) short-circuits with no network: byte-identical to
+    /// the historical behaviour. Otherwise the clone's remote-tracking refs are
+    /// freshened (`refresh_mirror` only advances the L1 mirror, not this L2 clone),
+    /// then candidates are probed in order: `origin/<base>` → `<base>` →
+    /// `origin/HEAD` (the repo's real default) → `HEAD`.
+    fn resolve_base(&self, base: &str) -> String {
+        if base == "HEAD" {
+            return "HEAD".to_string();
+        }
+        // Best-effort: offline / a missing remote just leaves the chain to fall
+        // through to a local ref or HEAD. Never fatal to a launch.
+        let _ = self.git(&["fetch", "--prune", "origin"]);
+        let mut candidates: Vec<String> = Vec::new();
+        if !base.starts_with("origin/") {
+            candidates.push(format!("origin/{base}"));
+        }
+        candidates.push(base.to_string());
+        candidates.push("origin/HEAD".to_string());
+        candidates.push("HEAD".to_string());
+        for c in &candidates {
+            if self
+                .git(&["rev-parse", "--verify", "--quiet", &format!("{c}^{{commit}}")])
+                .is_ok()
+            {
+                return c.clone();
+            }
+        }
+        "HEAD".to_string()
     }
 
     /// Every worktree we manage (those under `.lindep/worktrees/<ISSUE>`),
@@ -619,6 +660,32 @@ fn base36(mut value: u128) -> String {
 /// otherwise a bad prefix (a space, `~`, a leading `/`) would be accepted and then
 /// fail `git worktree add -b` for *every* issue in the project, bricking it silently
 /// at first launch.
+/// Whether `base` is a safe git start-point to interpolate into
+/// `git worktree add -b <branch> <path> <base>` — a branch name, `origin/<b>`, a
+/// tag, a SHA, or `HEAD`. Rejects the empties, a leading `-` (CLI-option
+/// injection), `..`, `@{`, control/whitespace and the glob/range metacharacters.
+/// Unlike [`is_valid_branch_prefix`] it permits the mid-ref `/` of `origin/develop`.
+/// This is a pure *sanitisation* gate (no repo/network access) shared by the
+/// registry loader and the wizard; existence is checked later by `resolve_base`.
+pub fn is_valid_base(base: &str) -> bool {
+    let b = base.trim();
+    if b.is_empty()
+        || b.starts_with('-')
+        || b.starts_with('/')
+        || b.ends_with('/')
+        || b.contains("..")
+        || b.contains("@{")
+    {
+        return false;
+    }
+    if b == "HEAD" {
+        return true;
+    }
+    !b.chars().any(|c| {
+        c.is_whitespace() || c.is_control() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    })
+}
+
 pub fn is_valid_branch_prefix(prefix: &str) -> bool {
     if prefix.is_empty()
         || prefix.starts_with('/')
@@ -784,6 +851,40 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn resolve_base_passes_head_through_with_no_network() {
+        // The unset default short-circuits to HEAD verbatim — byte-identical to the
+        // historical behaviour, and (crucially) without a fetch.
+        let repo = TempRepo::new();
+        assert_eq!(repo.mgr.resolve_base("HEAD"), "HEAD");
+    }
+
+    #[test]
+    fn resolve_base_falls_through_to_a_local_branch_when_no_remote() {
+        // No origin here, so `origin/<base>` misses and the chain falls through to the
+        // verbatim local branch (`main`, which TempRepo created).
+        let repo = TempRepo::new();
+        assert_eq!(repo.mgr.resolve_base("main"), "main");
+    }
+
+    #[test]
+    fn a_bogus_base_never_blocks_a_launch() {
+        // The whole safety contract: a mistyped/absent base falls through to HEAD, so
+        // create() still cuts the branch rather than erroring the launch.
+        let repo = TempRepo::new();
+        assert_eq!(repo.mgr.resolve_base("no-such-branch"), "HEAD");
+        let wt = repo
+            .mgr
+            .create("ENG-1", "Feature", "no-such-branch")
+            .expect("a bogus base still creates a worktree (fall-through to HEAD)");
+        assert!(
+            wt.branch.starts_with("felix/") && wt.branch.contains("eng-1"),
+            "branch cut under the prefix: {}",
+            wt.branch
+        );
+        assert!(wt.path.is_dir());
     }
 
     #[test]

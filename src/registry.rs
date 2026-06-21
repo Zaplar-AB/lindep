@@ -183,6 +183,13 @@ pub struct ProjectDescriptor {
     /// Optional per-project branch namespace; `None` uses the worktree manager's
     /// compiled-in default (the git user name).
     pub branch_prefix: Option<String>,
+    /// Optional per-project base a brand-new per-issue branch forks from. `None`
+    /// keeps the historical behaviour (the clone's local `HEAD`). A name like
+    /// `develop` resolves to a *fresh* `origin/develop` (with fall-through) at
+    /// create time — see `worktree::WorktreeManager::resolve_base`. Applies only to
+    /// brand-new branches and per repo where the branch exists; repos lacking it
+    /// fork from their own default. Resumes/recoveries are unaffected.
+    pub base_branch: Option<String>,
     /// Declared scratch datastores (ENG-561), provisioned per issue at launch and
     /// torn down at discard. Empty for a project with no `[[scratch]]` entries.
     pub scratch: Vec<ScratchSpec>,
@@ -509,6 +516,7 @@ pub struct ProjectDraft {
     pub candidates: Vec<String>,
     pub primary: String,
     pub branch_prefix: Option<String>,
+    pub base_branch: Option<String>,
 }
 
 /// A scratch datastore the wizard will write as a nested `[[project.scratch]]` — the
@@ -537,18 +545,17 @@ pub struct ScratchDraft {
 /// The first block this call appends is tagged with a provenance comment; an updated
 /// project keeps its own leading comment. The write is atomic (tmp → rename), like the
 /// rest of lindep's on-disk state.
-/// Returns `Ok(true)` when the registry file was (re)written, `Ok(false)` when the
-/// prospective document was byte-identical to what's already on disk — a no-op, so
-/// nothing was written and the caller can report "configuration unchanged" instead
-/// of nudging a needless restart. The byte-compare is reliable for blocks the wizard
-/// itself wrote (this fn rebuilds them deterministically); a semantically-equal but
-/// hand-formatted block falls through to a harmless rewrite, never the reverse.
-pub fn write_binding(
+/// This is the render half — it builds the prospective document and returns it
+/// alongside the current on-disk text as `(out, existing)`, performing no write. Both
+/// [`write_binding`] (writes `out` unless it equals `existing`) and [`binding_differs`]
+/// (just compares them) layer on top, so "would saving change anything?" has exactly
+/// one definition the two callers share.
+fn render_binding(
     layout: &Layout,
     new_repos: &[RepoDraft],
     project: &ProjectDraft,
     scratch: &[ScratchDraft],
-) -> Result<bool, RegistryError> {
+) -> Result<(String, String), RegistryError> {
     use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
     let path = layout.registry_path();
@@ -626,6 +633,9 @@ pub fn write_binding(
     if let Some(bp) = &project.branch_prefix {
         ptable["branch_prefix"] = value(bp.clone());
     }
+    if let Some(bb) = &project.base_branch {
+        ptable["base_branch"] = value(bb.clone());
+    }
     if !scratch.is_empty() {
         let mut aot = ArrayOfTables::new();
         for s in scratch {
@@ -686,15 +696,43 @@ pub fn write_binding(
     }
 
     let out = doc.to_string();
-    // Nothing changed (re-opened the wizard and edited nothing, or re-applied the same
-    // values): skip the write so a no-op re-config doesn't rewrite the file or nudge a
-    // pointless restart. `existing` is "" when the file is absent, which never equals a
-    // non-empty `out`, so a first-time write always proceeds.
+    Ok((out, existing))
+}
+
+/// Write the project binding into `registry.toml`, unless the prospective document is
+/// byte-identical to what's on disk — then nothing is written and `Ok(false)` is
+/// returned so the caller can report "configuration unchanged" instead of nudging a
+/// needless restart. `Ok(true)` means the file was (re)written. The byte-compare is
+/// reliable for blocks the wizard itself wrote (rebuilt deterministically); a
+/// semantically-equal but hand-formatted block falls through to a harmless rewrite.
+pub fn write_binding(
+    layout: &Layout,
+    new_repos: &[RepoDraft],
+    project: &ProjectDraft,
+    scratch: &[ScratchDraft],
+) -> Result<bool, RegistryError> {
+    let (out, existing) = render_binding(layout, new_repos, project, scratch)?;
+    // `existing` is "" when the file is absent, which never equals a non-empty `out`,
+    // so a first-time write always proceeds.
     if out == existing {
         return Ok(false);
     }
-    write_registry_atomic(&path, &out)?;
+    write_registry_atomic(&layout.registry_path(), &out)?;
     Ok(true)
+}
+
+/// Whether saving the current draft would actually change `registry.toml`. Reuses the
+/// exact render-and-compare [`write_binding`]'s no-op path uses, with no write side
+/// effect — so the onboarding wizard can tell "configuration unchanged" from "edits
+/// discarded" on cancel without `toml_edit` reformatting reading as a spurious edit.
+pub fn binding_differs(
+    layout: &Layout,
+    new_repos: &[RepoDraft],
+    project: &ProjectDraft,
+    scratch: &[ScratchDraft],
+) -> Result<bool, RegistryError> {
+    let (out, existing) = render_binding(layout, new_repos, project, scratch)?;
+    Ok(out != existing)
 }
 
 /// Append `handle` to a project's `candidates` set in `registry.toml`, preserving the
@@ -1013,6 +1051,8 @@ struct ProjectFile {
     primary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branch_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     scratch: Vec<ScratchFile>,
 }
@@ -1134,6 +1174,26 @@ impl ProjectFile {
                     None
                 }
             });
+        // Likewise the base branch is interpolated into `git worktree add`; gate a
+        // hand-edited value the same way and drop an invalid one to `None` (= HEAD)
+        // rather than bricking launches. Existence isn't checked here — `resolve_base`
+        // probes it at create time and falls through if it's absent.
+        let base_branch = self
+            .base_branch
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| {
+                if crate::worktree::is_valid_base(s.trim()) {
+                    Some(s.trim().to_string())
+                } else {
+                    warnings.push(format!(
+                        "registry {}: project `{}` base_branch `{}` is not a valid git ref; using HEAD",
+                        here(),
+                        self.id,
+                        s
+                    ));
+                    None
+                }
+            });
         Some(ProjectDescriptor {
             project_id: self.id,
             handle: self.handle,
@@ -1141,6 +1201,7 @@ impl ProjectFile {
             candidates,
             primary: self.primary,
             branch_prefix,
+            base_branch,
             scratch,
         })
     }
@@ -1642,6 +1703,7 @@ mod tests {
             candidates: vec!["core-pms".into()],
             primary: "core-pms".into(),
             branch_prefix: None,
+            base_branch: None,
         };
         write_binding(&layout, std::slice::from_ref(&repo), &project, &[]).unwrap();
 
@@ -1681,6 +1743,7 @@ mod tests {
             candidates: vec!["api".into(), "web".into()],
             primary: "api".into(),
             branch_prefix: None,
+            base_branch: None,
         };
         write_binding(&layout, &[api, web], &project, &[]).unwrap();
 
@@ -1861,6 +1924,7 @@ mod tests {
             candidates: vec!["core".into()],
             primary: "core".into(),
             branch_prefix: None,
+            base_branch: None,
         };
         assert!(
             write_binding(&layout, std::slice::from_ref(&repo), &project, &[]).unwrap(),
@@ -1874,6 +1938,73 @@ mod tests {
         );
         let after_second = std::fs::read_to_string(root.join("registry.toml")).unwrap();
         assert_eq!(after_first, after_second, "a no-op must not alter the file");
+    }
+
+    #[test]
+    fn binding_differs_agrees_with_write_binding_no_op() {
+        // `binding_differs` and `write_binding` must share one definition of "changed":
+        // after the first write, re-applying the identical draft reads as no-difference
+        // exactly as `write_binding` reports `Ok(false)` — and `binding_differs` is
+        // read-only (so the cancel path it backs never touches the file).
+        let root = temp_root("differs-noop");
+        let layout = Layout::new(&root);
+        let repo = RepoDraft {
+            handle: "core".into(),
+            remote: Some("git@github.com:zaplar/core".into()),
+            local: None,
+        };
+        let project = ProjectDraft {
+            id: "p1".into(),
+            handle: "core".into(),
+            name: "Core".into(),
+            candidates: vec!["core".into()],
+            primary: "core".into(),
+            branch_prefix: None,
+            base_branch: None,
+        };
+        write_binding(&layout, std::slice::from_ref(&repo), &project, &[]).unwrap();
+        let before = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        // The same draft (repo already registered, so no new [[repo]]) is byte-identical.
+        assert!(
+            !binding_differs(&layout, &[], &project, &[]).unwrap(),
+            "an unchanged re-apply does not differ"
+        );
+        let after = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        assert_eq!(before, after, "binding_differs must not write");
+    }
+
+    #[test]
+    fn binding_differs_detects_a_changed_field() {
+        // A real edit (a new branch_prefix) reads as a difference, with no write — the
+        // signal that lets the cancel path say "edits discarded" instead of "unchanged".
+        let root = temp_root("differs-edit");
+        let layout = Layout::new(&root);
+        let repo = RepoDraft {
+            handle: "core".into(),
+            remote: Some("git@github.com:zaplar/core".into()),
+            local: None,
+        };
+        let project = ProjectDraft {
+            id: "p1".into(),
+            handle: "core".into(),
+            name: "Core".into(),
+            candidates: vec!["core".into()],
+            primary: "core".into(),
+            branch_prefix: None,
+            base_branch: None,
+        };
+        write_binding(&layout, std::slice::from_ref(&repo), &project, &[]).unwrap();
+        let before = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        let edited = ProjectDraft {
+            branch_prefix: Some("felix".into()),
+            ..project
+        };
+        assert!(
+            binding_differs(&layout, &[], &edited, &[]).unwrap(),
+            "a changed branch_prefix differs"
+        );
+        let after = std::fs::read_to_string(root.join("registry.toml")).unwrap();
+        assert_eq!(before, after, "binding_differs must not write");
     }
 
     #[test]
@@ -1892,6 +2023,7 @@ mod tests {
             candidates: vec!["lindep".into()],
             primary: "lindep".into(),
             branch_prefix: Some("felix".into()),
+            base_branch: None,
         };
         write_binding(&layout, &[], &project, &[]).unwrap();
 
@@ -1925,6 +2057,7 @@ mod tests {
             candidates: vec!["core".into()],
             primary: "core".into(),
             branch_prefix: Some("felix".into()),
+            base_branch: None,
         };
         write_binding(&layout, &[], &project, &[]).unwrap();
 
@@ -1960,6 +2093,7 @@ mod tests {
             candidates: vec!["api".into()],
             primary: "api".into(),
             branch_prefix: None,
+            base_branch: None,
         };
         let scratch = ScratchDraft {
             name: "db".into(),

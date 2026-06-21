@@ -32,6 +32,9 @@ pub const WELL: Color = Color::Rgb(0x14, 0x15, 0x17); // footer well
 //    "working" or "needs-you" — see ORANGE / RED. ───────────────────────────
 pub const AMBER_400: Color = Color::Rgb(0xF0, 0xAD, 0x43);
 pub const AMBER_500: Color = Color::Rgb(0xE1, 0x8C, 0x1B);
+/// Deep amber — the selected-row fill while command mode (the sticky prefix) is
+/// armed; pairs with the amber border so the whole focused surface shifts hue.
+pub const AMBER_900: Color = Color::Rgb(0x45, 0x31, 0x0E);
 
 // ── Orange — an agent actively working ("doing things"). Warm and lively like
 //    the user asked for, but a distinct hue from amber so "needs you" stays the
@@ -60,8 +63,19 @@ pub const VIOLET_200: Color = Color::Rgb(0xC4, 0xB9, 0xFA);
 /// Border style for the focused window — a steady (frame-independent) violet, so
 /// the focus ring never strobes. Pairs with `BorderType::Double` at the call
 /// site; status hue ([`window_status_hue`]) carries the *unfocused* borders.
-pub fn focus_border_style() -> Style {
-    Style::new().fg(VIOLET_400).add_modifier(Modifier::BOLD)
+pub fn focus_border_style(armed: bool) -> Style {
+    Style::new().fg(focus_accent(armed)).add_modifier(Modifier::BOLD)
+}
+
+/// The focus accent: violet at rest, amber while command mode (the sticky prefix)
+/// is armed. Used by the focused border and its title bar leader — and, *only
+/// while armed*, the selected-row fill + nav chip — so the focused surface shifts
+/// to one amber wash the moment you arm a verb, then returns to violet focus +
+/// green selection. Keeping the selection green at rest is deliberate: focus
+/// (which pane owns your keys) and selection (where the row cursor rests) are
+/// distinct signals shown at once on different panes, so they get distinct hues.
+pub fn focus_accent(armed: bool) -> Color {
+    if armed { AMBER_400 } else { VIOLET_400 }
 }
 
 /// Border hue + short label for an *unfocused* window, by its agent status — the
@@ -73,7 +87,10 @@ pub fn focus_border_style() -> Style {
 /// has arrived. needs-you *breathes* via [`needs_you_style`] at the call site.
 pub fn window_status_hue(status: Option<AgentStatus>, exited: bool) -> (Color, &'static str) {
     match status {
-        Some(AgentStatus::Spawning) => (GREEN_400, "STARTING"),
+        // Spawning shares the WORKING word with Running — both are the Working
+        // readiness band; the steady ◌ marker (vs Running's spinner) carries the
+        // "just starting" nuance non-verbally, so the title word stays unified.
+        Some(AgentStatus::Spawning) => (GREEN_400, "WORKING"),
         Some(AgentStatus::Running) => (ORANGE_400, "WORKING"),
         Some(AgentStatus::NeedsYou) => (RED_400, "NEEDS YOU"),
         Some(AgentStatus::Idle) => (STATUS_400, "IDLE"),
@@ -85,12 +102,14 @@ pub fn window_status_hue(status: Option<AgentStatus>, exited: bool) -> (Color, &
     }
 }
 
-/// Selection style for the pane that currently holds focus — the one moving,
-/// racing-green element on screen.
-pub fn cursor_active() -> Style {
+/// Selection style for the pane that currently holds focus: racing-green at rest
+/// (the GREEN_700 step above the idle GREEN_900), deep amber (AMBER_900) only
+/// while command mode is armed — so the selection keeps its own green hue, clearly
+/// distinct from the violet focus border, except during the transient armed wash.
+pub fn cursor_active(armed: bool) -> Style {
     Style::new()
-        .bg(GREEN_700)
-        .fg(GREEN_100)
+        .bg(if armed { AMBER_900 } else { GREEN_700 })
+        .fg(if armed { INK } else { GREEN_100 })
         .add_modifier(Modifier::BOLD)
 }
 
@@ -253,6 +272,44 @@ mod tests {
             glyphs.len(),
             ALL.len(),
             "two states share a marker glyph: {glyphs:?}"
+        );
+    }
+
+    #[test]
+    fn the_working_set_shares_one_user_facing_label() {
+        // ITEM 7: Spawning and Running are both the Working readiness band
+        // (AgentStatus::is_working), so their per-status window-title label must be the
+        // SAME word — a freshly-spawned agent must not read as "STARTING" in the title
+        // while the band it sits in says "WORKING". The marker glyph (◌ vs spinner)
+        // carries the start/active nuance non-verbally; the word stays unified.
+        let spawning = window_status_hue(Some(AgentStatus::Spawning), false).1;
+        let running = window_status_hue(Some(AgentStatus::Running), false).1;
+        assert_eq!(running, "WORKING", "Running renders as the canonical WORKING");
+        assert_eq!(
+            spawning, running,
+            "a spawning agent must share Running's WORKING label, not a second word"
+        );
+    }
+
+    #[test]
+    fn every_agent_status_has_exactly_one_title_label() {
+        // A status maps to exactly one user-facing title word — guard against a future
+        // edit re-introducing a per-call-site synonym (the running/working split this
+        // item closed). Each of the seven states yields a single non-empty label.
+        for s in ALL {
+            let label = window_status_hue(Some(s), false).1;
+            assert!(!label.is_empty(), "{s:?} must carry a title label");
+        }
+        // The two working-set states collapse to one word; the five others are theirs
+        // alone — so the distinct-label count over the 7 states is exactly 6.
+        let labels: HashSet<&str> = ALL
+            .iter()
+            .map(|s| window_status_hue(Some(*s), false).1)
+            .collect();
+        assert_eq!(
+            labels.len(),
+            6,
+            "Spawning+Running share WORKING; the other five are distinct: {labels:?}"
         );
     }
 

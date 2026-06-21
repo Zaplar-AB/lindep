@@ -1,8 +1,8 @@
 //! Interactive application state and input handling for the cockpit.
 //!
 //! Cockpit v3 is a tmux-style tiling window manager: a horizontal strip of
-//! focusable [`crate::window::Window`]s — the permanent **Spine** (issue list /
-//! agents roster), live **Agent** PTYs, and **Deps** trees (per-issue or the
+//! focusable [`crate::window::Window`]s — the permanent **Spine** (the issue
+//! list), live **Agent** PTYs, and **Deps** trees (per-issue or the
 //! Fleet map). The focused window gets your keys; the **prefix** (`Ctrl-a`) is
 //! the sole escape to window-manager verbs. [`crate::window::WindowSet`] is the
 //! source of truth for what's on screen; this module owns the rest of the view
@@ -101,7 +101,8 @@ pub enum Filter {
 }
 
 impl Filter {
-    const fn next(self) -> Self {
+    /// Flip the 2-state filter: all ⇄ has-deps.
+    const fn toggle(self) -> Self {
         match self {
             Filter::All => Filter::HasDeps,
             Filter::HasDeps => Filter::All,
@@ -148,6 +149,36 @@ pub enum Readiness {
     Blocked,
     /// Finished or abandoned — resolved in Linear.
     Done,
+}
+
+/// What happens to the sticky command mode after a key is resolved while armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandStep {
+    /// Stay armed — a chain-friendly window-arrangement verb fired; the next bare
+    /// key is another command.
+    Stay,
+    /// Leave command mode and swallow this key (Esc, a second prefix, a verb that
+    /// repositioned you to act on a pane, or one that opened a capturing surface).
+    Exit,
+    /// Leave command mode *and* re-run this key as a normal keystroke — so a
+    /// navigation/typing key after a chain seamlessly falls out and still does its
+    /// thing, instead of being eaten.
+    ExitReprocess,
+}
+
+/// A focused agent chat latched into tmux-style copy-mode: its keys scroll the
+/// scrollback and select lines to yank, instead of typing into the child. `scroll` is
+/// the vt100 scrollback offset (0 = the live bottom, larger = further back into
+/// history); `cursor` is the line cursor's row *within the visible grid*; and `anchor`,
+/// when set, marks the other end of an inclusive line selection (`None` = the cursor row
+/// alone). The renderer ([`crate::ui`]'s `render_copy_pane`) is the single writer of the
+/// clamped scroll offset — it caps `scroll` at the real backlog and writes the clamped
+/// value back here — so this handler only ever *requests* a scroll and stays in range.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyMode {
+    pub scroll: usize,
+    pub cursor: usize,
+    pub anchor: Option<usize>,
 }
 
 pub struct App {
@@ -227,6 +258,14 @@ pub struct App {
     /// Backend handles for agents we launched, keyed by issue. Used to render
     /// and drive an agent's PTY.
     pub backends: HashMap<String, Arc<dyn AgentBackend>>,
+    /// Per-issue copy-mode state (tmux-style scrollback selection on a focused chat).
+    /// An entry's presence latches that issue's chat into copy-mode: its keys scroll/
+    /// select instead of forwarding to the PTY. Absent = the chat types normally.
+    pub copy: HashMap<String, CopyMode>,
+    /// A yanked copy-mode selection awaiting delivery to the host clipboard. The render
+    /// loop drains it once and pushes it out as an OSC52 escape, so the app never has to
+    /// depend on a platform clipboard crate.
+    pub pending_clipboard: Option<String>,
     /// Last frame at which each agent produced PTY output. Used only as a short
     /// visual settle window so an otherwise-idle agent does not read as quiet while
     /// buffered output is still painting.
@@ -427,6 +466,10 @@ pub struct App {
     /// should be re-persisted. The render thread (the sole cockpit writer) checks
     /// it after handling input and saves, so a structural change survives a crash.
     pub cockpit_dirty: bool,
+    /// Set by the `Redraw` chord (`Ctrl-L`): asks the render loop to drop ratatui's
+    /// diff baseline (`terminal.clear()`) before the next paint, so a full repaint
+    /// wipes any cell stranded by a wide-glyph stagger. Consumed once per request.
+    pub force_redraw: bool,
 
     /// The per-issue agent ledger — a durable history of which sessions ran for an
     /// issue. Recorded from lifecycle events for *every* project (the render thread
@@ -495,6 +538,8 @@ impl App {
             agent_repos: HashMap::new(),
             fleet: HashMap::new(),
             backends: HashMap::new(),
+            copy: HashMap::new(),
+            pending_clipboard: None,
             last_output: HashMap::new(),
             pending_attach: None,
             frame: 0,
@@ -542,6 +587,7 @@ impl App {
             keymap: Keymap::default(),
             cockpit_path: None,
             cockpit_dirty: false,
+            force_redraw: false,
             ledger: Ledger::default(),
             ledger_path: None,
             ledger_dirty: false,
@@ -640,8 +686,13 @@ impl App {
         // re-aim the follower preview too, so its tree/chat doesn't keep showing the
         // now-hidden issue while you type a search (M4). reaim_preview self-guards
         // against pinned coins, and this fires only when root actually moved.
-        if !self.order.is_empty() && !self.order.contains(&self.root) {
-            self.root = self.order[0].clone();
+        // When NOTHING is visible (the empty graph: reaping an ad-hoc agent that was
+        // the only row) clear `root` rather than leave it dangling on a gone node, so
+        // the detail bar and the follower preview stop showing it. reaim_preview
+        // self-guards an empty/missing root and pinned coins; this fires only when
+        // root actually moved.
+        if !self.order.contains(&self.root) {
+            self.root = self.order.first().cloned().unwrap_or_default();
             self.reaim_preview();
         }
         self.sync_list_selection();
@@ -766,11 +817,22 @@ impl App {
             return;
         }
 
-        // 1. Mid-prefix: the next key is a window-manager verb (or a second
-        //    prefix, forwarded to a focused agent as the literal chord).
+        // 1. Command mode (the sticky prefix): once armed, keys resolve as window
+        //    verbs and we STAY armed so window-arrangement verbs (zoom/close/layout/
+        //    restart) chain without re-pressing the prefix. Anything that repositions
+        //    you to act on a pane (focus moves, pin, flip, dispatch, launch), opens a
+        //    capturing surface, or lands on a chat drops you back out; a plain
+        //    navigation/typing key falls out AND still acts (ExitReprocess), so a key
+        //    is never silently eaten.
         if self.prefix_armed {
-            self.prefix_armed = false;
-            self.on_prefix_key(key);
+            match self.on_prefix_key(key) {
+                CommandStep::Stay => self.prefix_armed = true,
+                CommandStep::Exit => self.prefix_armed = false,
+                CommandStep::ExitReprocess => {
+                    self.prefix_armed = false;
+                    self.on_key(key);
+                }
+            }
             return;
         }
 
@@ -940,6 +1002,7 @@ impl App {
             match action {
                 Action::CycleNext => self.cycle_window(true),
                 Action::CyclePrev => self.cycle_window(false),
+                Action::Redraw => self.request_redraw(),
                 _ => {}
             }
             return;
@@ -948,23 +1011,43 @@ impl App {
         // 6. Route by the focused window's kind.
         match self.windows.focused_kind().clone() {
             // A coin's chat face owns the keyboard: every key (Esc too) goes to its
-            // PTY. The prefix above is the only escape (so `Ctrl-a Tab` flips a
-            // focused chat to deps).
+            // PTY — claude's own permission UI binds Esc, so eating it here is
+            // intentional, NOT a missing back-out. This is the deliberate asymmetry
+            // with the deps face below (where Esc means "back"): the two faces of one
+            // coin treat Esc oppositely on purpose, because a chat forwards raw keys
+            // and a deps tree navigates them. The non-Esc back-outs are reachable from
+            // any focus above PTY forwarding: `Ctrl-a 0` (FocusNav) jumps home to the
+            // Spine, `Ctrl-a Tab` (ContextToggle) flips this chat to its deps face, and
+            // Alt-←/→ cycle windows — all surfaced in the chat footer hint and the help
+            // overlay so the asymmetry is visible, not a trap. The prefix is the only
+            // chord taken from the PTY here.
             WindowKind::Coin {
                 issue,
                 mode: CoinMode::Chat,
             } => {
-                // Typing into the very agent that needs you is the strongest "I'm
-                // handling it" signal: drop the sticky footer alert now. The
-                // per-issue NeedsYou status clears the moment the agent resumes
-                // (the UserPromptSubmit / PostToolUse hooks), so the roster/header
-                // stay honest until then.
-                self.needs_you_alert = false;
-                self.forward_to_agent(&issue, key);
+                // Copy-mode latches this chat to its scrollback: its keys scroll/select/
+                // yank rather than typing into the child. Checked before the PTY forward
+                // so a copy-mode `j`/`y`/Esc can't leak a stray keystroke into the agent.
+                if self.copy.contains_key(&issue) {
+                    self.handle_copy_key(&issue, key);
+                } else {
+                    // Typing into the very agent that needs you is the strongest "I'm
+                    // handling it" signal: drop the sticky footer alert now. The
+                    // per-issue NeedsYou status clears the moment the agent resumes
+                    // (the UserPromptSubmit / PostToolUse hooks), so the roster/header
+                    // stay honest until then.
+                    self.needs_you_alert = false;
+                    self.forward_to_agent(&issue, key);
+                }
             }
             // A coin's deps face navigates exactly like the old Deps pane. Esc pops
             // the re-root history (the one window where Esc conventionally pops a
             // stack), so a deep dive-in has a back-out key, not just Backspace/`b`.
+            // This is the deliberate counterpart to the chat face above: on deps Esc
+            // means "back to the Spine's view", on chat Esc is forwarded to the agent.
+            // The split is coherent — a deps tree consumes Esc as navigation, a chat
+            // hands every raw key (Esc included) to claude — and is spelled out in the
+            // help overlay so neither face's Esc surprises you.
             WindowKind::Coin {
                 mode: CoinMode::Deps,
                 ..
@@ -1058,8 +1141,13 @@ impl App {
         }
     }
 
-    /// Resolve a key pressed after the prefix.
-    fn on_prefix_key(&mut self, key: KeyEvent) {
+    /// Resolve a key pressed while in command mode (after the prefix). Returns a
+    /// [`CommandStep`] saying whether to stay armed, exit, or exit-and-reprocess.
+    /// It stays armed only for chain-friendly window-arrangement verbs (zoom, close,
+    /// layout, restart) while focus rests on a non-chat surface; a second prefix,
+    /// Esc, a verb that opened a capturing surface or repositioned you to act on a
+    /// pane all exit; and any non-verb key exits *and* re-runs as a normal keystroke.
+    fn on_prefix_key(&mut self, key: KeyEvent) -> CommandStep {
         // A window verb must never fire *underneath* a still-painted info overlay.
         // The prefix is consumed above the band-5 overlay-dismiss, so without this a
         // `Ctrl-a x`/`Ctrl-a d` armed its red confirm behind a ~40-row help card and
@@ -1072,6 +1160,12 @@ impl App {
         self.show_help = false;
         self.show_summary = false;
         self.show_ledger = false;
+
+        // Esc is the explicit "leave command mode" gesture (after closing any
+        // overlay above) — it fires nothing and simply drops you back out.
+        if key.code == KeyCode::Esc {
+            return CommandStep::Exit;
+        }
 
         // Double-prefix → send the literal prefix chord through to a focused
         // agent (a chosen prefix is never wholly unreachable by the PTY). Covers
@@ -1093,7 +1187,7 @@ impl App {
                     p = self.prefix_label()
                 ));
             }
-            return;
+            return CommandStep::Exit;
         }
         // M6: `Ctrl-a ?` toggles the help overlay from inside a Chat coin (or the
         // Fleet), where the direct `?` is swallowed by the PTY — so someone driving an
@@ -1116,20 +1210,74 @@ impl App {
             if self.show_help {
                 self.help_scroll = 0;
             }
-            return;
+            return CommandStep::Exit;
         }
         let Some(verb) = self.keymap.verb_for(key) else {
-            // M5: acknowledge an unbound prefix key instead of silently eating it and
-            // leaving the next key to land as a raw direct action.
-            self.status_msg = Some(format!(
-                "{} {}: no window command — {} for the list",
-                self.prefix_label(),
-                self.keymap.key_label(key),
-                self.keymap.label_for(Action::ToggleHelp),
-            ));
-            return;
+            // A key with no window verb drops out of command mode AND is re-run as a
+            // normal keystroke — so navigating or typing right after a chain just
+            // works, with nothing silently eaten.
+            return CommandStep::ExitReprocess;
         };
         self.dispatch_verb(verb);
+        // Stay armed only for chain-friendly window-arrangement verbs (zoom, close,
+        // layout, restart) — and only while focus rests on a non-chat surface and
+        // nothing capturing opened. Everything else (focus moves, pin, flip, launch,
+        // the modal/destructive verbs) repositions you to act on a pane, so it ends
+        // command mode and the pane — or the surface it opened — owns the keyboard.
+        let stay = Self::verb_chains_in_command_mode(verb)
+            && !self.command_mode_preempted()
+            && !self.focused_is_chat();
+        if stay {
+            CommandStep::Stay
+        } else {
+            CommandStep::Exit
+        }
+    }
+
+    /// Whether a verb chains in command mode — the window-arrangement verbs you fire
+    /// several of in a row without then interacting with a pane's contents. Verbs
+    /// that move focus/selection or open a face you'd navigate (focus l/h/0, pin,
+    /// context-flip, next-agent, jump) deliberately fall *out* of command mode,
+    /// because lindep's pane navigation (Enter, arrows, h/l, …) overlaps the verb
+    /// keys — staying armed there would hijack the very keys you'd use next.
+    fn verb_chains_in_command_mode(verb: Action) -> bool {
+        matches!(
+            verb,
+            Action::ZoomToggle
+                | Action::CloseWindow
+                | Action::LayoutToggle
+                | Action::RestartAgent
+        )
+    }
+
+    /// True when a modal, overlay, confirmation, or quit is now capturing the
+    /// keyboard — command mode must yield to it rather than swallow its keys.
+    fn command_mode_preempted(&self) -> bool {
+        self.project_switcher.is_some()
+            || self.global_view.is_some()
+            || self.repo_select.is_some()
+            || self.reclaim.is_some()
+            || self.kill_confirm.is_some()
+            || self.discard_confirm.is_some()
+            || self.repo_confirm.is_some()
+            || self.quit_confirm
+            || self.show_help
+            || self.show_summary
+            || self.show_ledger
+            || self.search_active
+            || self.should_quit
+    }
+
+    /// True when the focused window is an agent's live chat — landing here releases
+    /// command mode so the next keys type into the agent instead of firing verbs.
+    fn focused_is_chat(&self) -> bool {
+        matches!(
+            self.windows.focused_kind(),
+            WindowKind::Coin {
+                mode: CoinMode::Chat,
+                ..
+            }
+        )
     }
 
     /// Run a window-manager verb (always reached behind the prefix).
@@ -1144,7 +1292,7 @@ impl App {
                 self.after_focus_change();
             }
             Action::FocusNav => self.windows.focus_nav(),
-            Action::ZoomToggle => self.windows.toggle_zoom(),
+            Action::ZoomToggle => self.zoom_toggle(),
             Action::ContextToggle => self.flip_active_coin(),
             Action::PinWindow => self.pin_window(),
             Action::CloseWindow => self.close_window(),
@@ -1171,9 +1319,39 @@ impl App {
             Action::DispatchReady => self.dispatch_ready(),
             Action::ChooseRepos => self.dispatch_selection(true),
             Action::AskAgent => self.ask_spawn(),
+            Action::CopyMode => self.enter_copy_mode(),
             // The rest are direct (Spine/Deps) actions, never prefix verbs.
             _ => {}
         }
+    }
+
+    /// Toggle the big-pane zoom. Zooming **in** while the Spine is focused first
+    /// moves focus into the window that becomes the big pane (the selection's active
+    /// coin), so the enlarged agent actually receives keys. Zoom hides the Spine
+    /// entirely, so a Spine-focused zoom would otherwise paint an agent full-screen
+    /// while focus still sat on the now-invisible Spine — `j`/`k`/`⏎` would route to
+    /// the off-screen Spine and the zoomed agent would never take a keystroke. This is
+    /// the inverse of the M1 trap `after_focus_change` already closes when focus
+    /// *lands* on the Spine while zoomed.
+    fn zoom_toggle(&mut self) {
+        if !self.windows.zoomed && self.windows.focus == 0 {
+            let n = self.windows.windows.len();
+            match layout::rail_big_index(n, self.windows.focus, self.active_index()) {
+                // Commit focus to the pane we're about to enlarge, then lazy-resume it
+                // (shared with the focus-move verbs via `after_focus_change`).
+                Some(big) => {
+                    self.windows.focus = big;
+                    self.after_focus_change();
+                }
+                // Nothing but the Spine (no selection/preview) — zooming would blank
+                // the screen, so no-op with a footer trace instead of eating the key.
+                None => {
+                    self.set_footer("nothing to zoom — select an issue first".into());
+                    return;
+                }
+            }
+        }
+        self.windows.toggle_zoom();
     }
 
     /// One-step, wrapping window switch (Alt-←/→). Shares `after_focus_change` with
@@ -1183,6 +1361,19 @@ impl App {
     fn cycle_window(&mut self, forward: bool) {
         self.windows.cycle_focus(forward);
         self.after_focus_change();
+    }
+
+    /// Request a full repaint on the next frame (the `Ctrl-L` redraw chord). The key
+    /// event already marks the loop dirty; the render loop additionally calls
+    /// `terminal.clear()` when this is set, dropping the diff baseline so every cell
+    /// is rewritten — wiping any stray cell a wide-glyph stagger left in a PTY pane.
+    fn request_redraw(&mut self) {
+        self.force_redraw = true;
+    }
+
+    /// Taken once by the render loop: whether a full clear-and-repaint was asked for.
+    pub fn take_force_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.force_redraw)
     }
 
     /// Ask the event loop to re-open the onboarding wizard for the active project
@@ -1425,10 +1616,12 @@ impl App {
         self.preview_size.clear();
         self.search_active = false;
         self.search_query.clear();
-        // Reset the filter too (its own comment promises "everything else starts
-        // fresh"): a has-deps filter carried into a flat-backlog project would hide
-        // most of it on arrival while the footer reported the full count.
-        self.filter = Filter::All;
+        // The filter PERSISTS across the switch (unlike search above, which is a
+        // transient typed query keyed to this graph's issue ids). It is a deliberate
+        // 2-state mode the user toggled and can flip back with one `f`; carrying it
+        // lets a has-deps view follow you between projects. A fully-hidden arrival is
+        // self-explaining — `rebuild_order` (below) re-applies the filter and the
+        // empty-list footer/message both say to clear it — so nothing is silently lost.
         self.needs_you_alert = false;
 
         // Seed the fleet from the restored live backends BEFORE the async re-emit
@@ -1581,8 +1774,8 @@ impl App {
             Action::PinWindow => self.pin_window(),
             Action::JumpCycle => self.jump_to_cycle(),
             Action::JumpNeedsYou => self.jump_to_needs_you(),
-            Action::CycleFilter => {
-                self.filter = self.filter.next();
+            Action::ToggleFilter => {
+                self.filter = self.filter.toggle();
                 self.rebuild_order();
                 // Every state-changing direct action leaves a one-line trace, so the
                 // footer is a reliable "that did something" signal (B0d) — and an empty
@@ -1781,8 +1974,10 @@ impl App {
         }
     }
 
-    /// Focus the preview coin in its Deps face — dive into the selection's
-    /// dependency tree.
+    /// Focus the preview coin in its Deps face — jump straight to the selection's
+    /// dependency tree. The deterministic "→ deps" alternate to the primary
+    /// `Tab` flip ([`flip_active_coin`]): `d` always lands on deps, whatever face
+    /// the coin currently shows, whereas Tab toggles chat⇄deps.
     fn open_deps_for_selection(&mut self) {
         if self.root.is_empty() {
             self.status_msg = Some("no issue selected".into());
@@ -1846,7 +2041,11 @@ impl App {
     /// Reclaims the backend of an agent we re-aimed off, if it's now dead and
     /// unreferenced.
     fn reaim_preview(&mut self) {
-        if self.root.is_empty() {
+        // Never seed a preview on a node that isn't in the graph — an empty root, or a
+        // root left dangling by a node that was just removed (a reaped ad-hoc agent).
+        // Without the graph.get guard a stale, non-empty root re-creates a ghost coin
+        // on the dead issue (caught in adversarial review).
+        if self.root.is_empty() || self.graph.get(&self.root).is_none() {
             return;
         }
         // If the selection already has a pinned coin, that coin IS the active view
@@ -2635,8 +2834,26 @@ impl App {
             });
             return;
         }
-        // An already-pinned coin / Fleet → unpin = undock (close it; a live agent
-        // keeps running — re-open it by selecting its Spine row and pressing Enter).
+        // A focused *pinned coin* → `p` toggles it off: UNPIN = undock by identity,
+        // mirroring the Spine `p` toggle (H2). Instant, no confirm. `undock_issue`
+        // keeps a live agent's backend for re-find and reaims the preview, so the
+        // issue you were looking at is demoted to a follower preview instead of
+        // vanishing — and focus is left to the structural fallback, never forced to
+        // the Spine (you weren't browsing, you were inside the coin). Ctrl-a w still
+        // *closes* (the way you dismiss the non-pinnable Fleet / ad-hoc windows).
+        if let Some(issue) = self.windows.focused().issue().map(str::to_string) {
+            let running = self.fleet.get(&issue).is_some_and(AgentStatus::is_live);
+            self.undock_issue(&issue);
+            self.cockpit_dirty = true;
+            self.set_footer(if running {
+                format!("unpinned {issue} · still running — select it & ⏎ to re-open")
+            } else {
+                format!("unpinned {issue}")
+            });
+            return;
+        }
+        // A focused non-coin docked window (the Fleet overview, ad-hoc panes) has no
+        // issue identity to unpin — close it.
         self.close_window();
     }
 
@@ -2681,8 +2898,6 @@ impl App {
         self.reaim_preview();
     }
 
-    /// Arm a confirmed kill of the focused agent (`Ctrl-a x`). Kill is destructive
-    /// and separate from close, so it's never a single keystroke.
     /// True when `issue` has a restored/live backend `Arc` whose process hasn't
     /// exited — ground truth even in the switch-back window where the fleet entry
     /// hasn't been re-emitted yet, so a discard/kill can never act on a live agent
@@ -2693,6 +2908,19 @@ impl App {
             .is_some_and(|b| !matches!(b.status(), Lifecycle::Exited(_)))
     }
 
+    // Destructive-cluster confirm split (H3) — the rule the verbs below share, so it
+    // never reads as accidental: confirm ONLY the irreversible, data-losing verbs;
+    // keep the recoverable ones a single keystroke.
+    //   kill (Ctrl-a x)  -> confirm: stops a running process, losing in-flight work.
+    //   discard (Ctrl-a d) -> confirm: pushes branches + removes worktrees (data loss).
+    //   close (Ctrl-a w) / unpin (p toggle) -> instant: undock only; a live agent keeps
+    //     running and re-opens with ⏎, so nothing is lost.
+    //   restart (Ctrl-a r) -> instant: refused while the agent is live (`restart_agent`),
+    //     so it only ever acts on an already-dead agent — nothing live to lose.
+
+    /// Arm a confirmed kill of the focused agent (`Ctrl-a x`). Kill is destructive
+    /// and data-losing (it stops a running process), so — unlike close/unpin/restart
+    /// — it's never a single keystroke; see the destructive-cluster note above.
     fn arm_kill(&mut self) {
         // A coin carries its agent on either face, so kill works from chat or deps.
         // From the Spine/roster (no agent window focused) it targets the selected
@@ -2878,13 +3106,28 @@ impl App {
                 // lands. Reuses the shared `reaped` set discard already seeds; a real
                 // relaunch (AgentSpawned) clears it.
                 self.reaped.insert(issue.clone());
-                // Kill also undocks the agent's window — pinned coins included.
-                // Close is "undock, agent keeps running"; kill is "stop it and put
-                // it away", so a killed agent never lingers as a dead EXITED card
-                // you have to dismiss by hand.
-                let closed = self.undock_issue(&issue);
-                self.status_msg = Some(if closed {
-                    format!("killing agent on {issue} · window closed")
+                // Kill flips the agent's coin onto its deps face *in place* — pinned
+                // coins and the transient preview alike (ITEM 10). Close is "undock,
+                // agent keeps running"; kill is "stop it and show what's next", so the
+                // window stays exactly where it was (never blanked/removed) and lands
+                // on the dependency tree instead of a dead EXITED card. The pinned
+                // coin's now-dead chat PTY is retained until the coin is actually
+                // closed (it can still flip back) — `references_agent` + the reap path
+                // already free a preview's PTY once it's on a deps face and the agent
+                // is reaped, so no extra reclaim is needed here.
+                let (touched, flipped_pinned) =
+                    self.windows.flip_issue_to_deps(&issue, &self.graph);
+                if flipped_pinned {
+                    self.cockpit_dirty = true; // a docked coin's persisted face changed
+                }
+                if !touched {
+                    // Killed from the roster with no coin aimed here (e.g. a pinned coin
+                    // lives elsewhere): keep the strip sensible by re-aiming the preview,
+                    // exactly as the old teardown did when it removed nothing.
+                    self.reaim_preview();
+                }
+                self.status_msg = Some(if flipped_pinned {
+                    format!("killing agent on {issue} · showing deps")
                 } else {
                     format!("killing agent on {issue}…")
                 });
@@ -2938,6 +3181,169 @@ impl App {
     }
 
     /// Forward a key to a specific agent's PTY.
+    /// Enter copy-mode on the focused agent chat (`Ctrl-a [`). Latches that chat into
+    /// tmux-style scrollback selection; a non-chat focus (Spine/Deps/Fleet) has no agent
+    /// scrollback to copy, so it just reports why. Starts at the live bottom (`scroll` 0)
+    /// with the cursor on the top visible row and nothing selected.
+    fn enter_copy_mode(&mut self) {
+        let WindowKind::Coin {
+            issue,
+            mode: CoinMode::Chat,
+        } = self.windows.focused_kind().clone()
+        else {
+            self.set_footer("copy-mode needs a focused agent chat — Tab to a chat first".into());
+            return;
+        };
+        if !self.backends.contains_key(&issue) {
+            self.set_footer(format!("no live agent on {issue} to copy from"));
+            return;
+        }
+        self.copy.insert(issue, CopyMode::default());
+        self.set_footer(
+            "copy-mode · ↑/↓ PgUp/PgDn g/G scroll · space select · y/⏎ yank · Esc/q exit".into(),
+        );
+    }
+
+    /// Drive copy-mode keys for a chat already latched into it. Movement keys scroll the
+    /// scrollback and walk a line cursor; `space` toggles a line-selection anchor; `y`/
+    /// `Enter` parks the selection in `pending_clipboard` (the render loop emits the
+    /// OSC52) and exits; `Esc`/`q` exits. Any other key is swallowed — copy-mode owns the
+    /// keyboard, so a stray key neither leaks into the child nor falls through to a verb.
+    fn handle_copy_key(&mut self, issue: &str, key: KeyEvent) {
+        let Some(backend) = self.backends.get(issue).map(Arc::clone) else {
+            // The backend was reaped out from under copy-mode: drop the mode rather than
+            // trap the keyboard against a gone agent.
+            self.copy.remove(issue);
+            self.set_footer(format!("agent on {issue} is gone — left copy-mode"));
+            return;
+        };
+        // The visible grid height bounds the line cursor; a page leaves one row of
+        // overlap for orientation. Read it once from the live parser.
+        let srows = backend
+            .parser()
+            .read()
+            .ok()
+            .map_or(0, |g| g.screen().size().0 as usize);
+        let last = srows.saturating_sub(1);
+        let page = last.max(1);
+
+        // Exit keys end copy-mode and snap the terminal back to the live bottom — copy
+        // scrolled the shared parser into history, so leaving must reset it or the live
+        // pane would stay frozen on the scrolled-up view.
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.copy.remove(issue);
+            Self::reset_scrollback(&backend);
+            self.set_footer("copy-mode: exited".into());
+            return;
+        }
+        // Yank reads the current selection, parks it for the clipboard, and exits.
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+            self.yank_copy_selection(issue, &backend);
+            return;
+        }
+
+        // Movement/selection: a self-contained mutation of the `cm` entry (no `self`
+        // method calls inside, so the `get_mut` borrow stays clean).
+        if let Some(cm) = self.copy.get_mut(issue) {
+            cm.cursor = cm.cursor.min(last);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if cm.cursor > 0 {
+                        cm.cursor -= 1;
+                    } else {
+                        // At the top edge, pull one more line of history into view.
+                        cm.scroll = cm.scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if cm.cursor < last {
+                        cm.cursor += 1;
+                    } else if cm.scroll > 0 {
+                        // At the bottom edge, release one line back toward live.
+                        cm.scroll -= 1;
+                    }
+                }
+                KeyCode::PageUp => cm.scroll = cm.scroll.saturating_add(page),
+                KeyCode::PageDown => cm.scroll = cm.scroll.saturating_sub(page),
+                KeyCode::Char('g') | KeyCode::Home => {
+                    // Oldest history: request a huge scroll (the renderer clamps it to the
+                    // real backlog and writes the clamped value back) and park at the top.
+                    cm.scroll = usize::MAX;
+                    cm.cursor = 0;
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    cm.scroll = 0; // the live bottom
+                    cm.cursor = last;
+                }
+                KeyCode::Char(' ') => {
+                    // Toggle the selection anchor: start a line selection at the cursor,
+                    // or clear it on a second press.
+                    cm.anchor = if cm.anchor.is_some() {
+                        None
+                    } else {
+                        Some(cm.cursor)
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Copy the current copy-mode selection — the `anchor..=cursor` line span, or the
+    /// cursor line alone when nothing is anchored — from `issue`'s scrollback into
+    /// `pending_clipboard`, then leave copy-mode and snap back to the live bottom. The
+    /// render loop drains `pending_clipboard` and emits the OSC52. A whitespace-only
+    /// selection is treated as nothing to copy.
+    fn yank_copy_selection(&mut self, issue: &str, backend: &Arc<dyn AgentBackend>) {
+        let Some(cm) = self.copy.get(issue).cloned() else {
+            return;
+        };
+        let text = {
+            let parser = backend.parser();
+            let Ok(mut guard) = parser.write() else {
+                self.set_footer("copy-mode: could not read the scrollback".into());
+                return;
+            };
+            guard.screen_mut().set_scrollback(cm.scroll);
+            let (srows, scols) = guard.screen().size();
+            let last = (srows as usize).saturating_sub(1);
+            let cursor = cm.cursor.min(last);
+            let (lo, hi) = match cm.anchor {
+                Some(a) => (a.min(cursor), a.max(cursor).min(last)),
+                None => (cursor, cursor),
+            };
+            guard
+                .screen()
+                .rows(0, scols)
+                .skip(lo)
+                .take(hi - lo + 1)
+                .map(|r| r.trim_end().to_string()) // shed the grid's right-pad spaces
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        self.copy.remove(issue);
+        Self::reset_scrollback(backend);
+        if text.trim().is_empty() {
+            self.set_footer("copy-mode: nothing to copy".into());
+            return;
+        }
+        let lines = text.lines().count().max(1);
+        self.pending_clipboard = Some(text);
+        self.set_footer(format!(
+            "copied {lines} line{}",
+            if lines == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Return an agent's terminal to the live bottom (scrollback 0). Copy-mode scrolls
+    /// the shared vt100 parser into history; leaving it must snap back or the live pane
+    /// would stay frozen on the scrolled-up view.
+    fn reset_scrollback(backend: &Arc<dyn AgentBackend>) {
+        if let Ok(mut guard) = backend.parser().write() {
+            guard.screen_mut().set_scrollback(0);
+        }
+    }
+
     fn forward_to_agent(&mut self, issue: &str, key: KeyEvent) {
         let bytes = backend::key_to_bytes(key);
         if bytes.is_empty() {
@@ -3801,6 +4207,19 @@ impl App {
                 // (tick_frame also ages it out, but the reap clears it immediately).
                 self.last_output.remove(&issue);
                 self.drop_preview_sizes_for(&issue);
+                // An ad-hoc (ask-*) agent's synthetic Spine node lives only as long as
+                // its agent — it's not a Linear issue you'd revisit. On reap (a kill or a
+                // natural finish) drop the node first so the Spine re-aims its selection
+                // off it, then close any coin still showing it — so the throwaway row and
+                // its window both disappear instead of stranding a dead, edgeless row you
+                // can't get rid of. A real issue's row outlives its agent and is kept. Run
+                // before the backend check below so the now-unreferenced backend is freed.
+                if crate::worktree::is_synthetic_ask_id(&issue) {
+                    if self.graph.remove_issue(&issue) {
+                        self.rebuild_order();
+                    }
+                    self.undock_issue(&issue);
+                }
                 // Keep the backend only while a window still shows it.
                 if !self.windows.references_agent(&issue) {
                     self.backends.remove(&issue);
@@ -3976,6 +4395,13 @@ impl App {
     /// "⇡N unpushed" chip. Mirrors [`Self::elsewhere_needs_you`].
     pub fn unpushed_count(&self) -> usize {
         self.unpushed.values().map(HashSet::len).sum()
+    }
+
+    /// The transient footer/status line the detail bar shows, if any. A thin accessor
+    /// over `status_msg` so the renderer reads it through one path — a future
+    /// footer-with-TTL can land behind this without touching `ui.rs`.
+    pub fn status_text(&self) -> Option<&str> {
+        self.status_msg.as_deref()
     }
 
     fn set_footer(&mut self, text: String) {
@@ -4511,8 +4937,13 @@ impl App {
                     .map(|(p, i, _)| (p.clone(), i.clone()));
                 self.global_view = None;
                 if let Some((project_id, issue)) = target {
-                    // Attach-ready (re-root + select), not auto-attached — Enter on a
-                    // row lands you on the issue; press the button / `t` to take over.
+                    // Enter overloads three ways across surfaces: on the Spine it
+                    // dispatches the selection (the attach/spawn button), on a deps
+                    // face it re-roots the tree, and here — the global view — it
+                    // re-roots WITHOUT attach. So this is attach-ready (re-root +
+                    // select), not auto-attached: Enter on a row only lands you on
+                    // the issue. Take over with the attach/spawn button
+                    // (Enter / `Ctrl-a Enter`); `t` is the ledger, not take-over.
                     self.land_on(&project_id, &issue, false);
                 }
             }
@@ -4705,8 +5136,12 @@ mod tests {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
-    /// Press the prefix (`Ctrl-a`) then `code` — i.e. invoke a window verb.
+    /// Press the prefix (`Ctrl-a`) then `code` — i.e. invoke a single window verb.
+    /// Resets command mode first so each call is an independent prefixed chord; the
+    /// sticky chaining (where one arm fires several bare verbs) is exercised
+    /// directly with `on_key`/`press` in its own tests.
     fn verb(app: &mut App, code: KeyCode) {
+        app.prefix_armed = false;
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         press(app, code);
     }
@@ -5522,6 +5957,30 @@ mod tests {
     }
 
     #[test]
+    fn the_filter_persists_across_a_project_switch() {
+        // M2: the `f` filter is a deliberate 2-state mode, not a transient query, so
+        // it must follow the user between projects (search, being a typed query keyed
+        // to this graph's ids, still resets — asserted alongside).
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        a.filter = Filter::HasDeps;
+        a.search_query = "needle".into();
+        a.search_active = true;
+
+        a.activate_project(project("proj-b", "Beta"), demo::graph());
+
+        assert_eq!(
+            a.filter,
+            Filter::HasDeps,
+            "the has-deps filter carries into the newly-activated project"
+        );
+        assert!(
+            a.search_query.is_empty() && !a.search_active,
+            "the transient search query still resets on a switch"
+        );
+    }
+
+    #[test]
     fn a_discard_right_after_switch_back_is_refused_for_a_live_agent() {
         // H2: the switch-back window must not let `Ctrl-a d` discard a live agent's
         // worktree. The fleet is seeded from the restored live Arc, so the discard is
@@ -6140,6 +6599,155 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ctrl_l_requests_a_full_redraw_even_from_inside_a_focused_chat() {
+        let mut a = app();
+        // Focus a chat coin — the band that forwards every key to the agent's PTY.
+        a.windows.focus_preview();
+        a.windows.pin_preview();
+        a.windows
+            .ensure_preview("ZAP-205", CoinMode::Chat, &a.graph);
+        a.windows.focus_preview();
+        assert!(
+            matches!(
+                a.windows.focused_kind(),
+                WindowKind::Coin {
+                    mode: CoinMode::Chat,
+                    ..
+                }
+            ),
+            "precondition: a chat is focused, so a bare key would go to the PTY"
+        );
+        // Ctrl-L resolves as the global redraw ABOVE PTY forwarding — it requests a full
+        // repaint instead of being typed into claude.
+        a.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert!(
+            a.take_force_redraw(),
+            "Ctrl-L from inside a chat requested a full redraw"
+        );
+        assert!(
+            !a.take_force_redraw(),
+            "the redraw request is consumed once — the loop clears + repaints one frame"
+        );
+    }
+
+    // ── Copy-mode (tmux-style scrollback selection) ──────────────────────────
+
+    /// Focus a fresh **Chat** coin on `issue` — the band that forwards keys to a PTY —
+    /// by pinning the opening preview out of the way and aiming a new chat preview here.
+    fn focus_chat(a: &mut App, issue: &str) {
+        a.windows.focus_preview();
+        a.windows.pin_preview();
+        a.windows.ensure_preview(issue, CoinMode::Chat, &a.graph);
+        a.windows.focus_preview();
+        assert!(
+            matches!(
+                a.windows.focused_kind(),
+                WindowKind::Coin { mode: CoinMode::Chat, .. }
+            ),
+            "precondition: a chat coin is focused"
+        );
+    }
+
+    #[test]
+    fn copy_mode_enters_only_on_a_focused_chat_with_a_live_agent() {
+        let mut a = app();
+        // The spine is focused by default — nothing to copy from.
+        a.enter_copy_mode();
+        assert!(a.copy.is_empty(), "no copy-mode without a focused chat");
+        assert!(a.status_text().unwrap().contains("needs a focused agent chat"));
+
+        // A focused chat, but no backend yet (a just-pressed button): still refuse.
+        focus_chat(&mut a, "ZAP-205");
+        a.enter_copy_mode();
+        assert!(a.copy.is_empty(), "no copy-mode without a live backend");
+        assert!(a.status_text().unwrap().contains("no live agent"));
+
+        // With a live backend, copy-mode latches on the focused chat.
+        a.backends
+            .insert("ZAP-205".into(), FakeBackend::new("ZAP-205") as Arc<dyn AgentBackend>);
+        a.enter_copy_mode();
+        assert!(
+            a.copy.contains_key("ZAP-205"),
+            "copy-mode latches on the focused chat with a live agent"
+        );
+    }
+
+    #[test]
+    fn copy_mode_keys_drive_the_selection_and_never_reach_the_pty() {
+        let mut a = app();
+        focus_chat(&mut a, "ZAP-205");
+        let fake = FakeBackend::new("ZAP-205");
+        a.backends
+            .insert("ZAP-205".into(), fake.clone() as Arc<dyn AgentBackend>);
+        a.enter_copy_mode();
+
+        // `j` walks the line cursor down — routed through the real `on_key`, which must
+        // hand the key to copy-mode (band 6 Chat) rather than the agent's PTY.
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(a.copy.get("ZAP-205").unwrap().cursor, 1);
+        // `space` anchors a selection at the cursor; a second press clears it.
+        a.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(a.copy.get("ZAP-205").unwrap().anchor, Some(1));
+        a.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(a.copy.get("ZAP-205").unwrap().anchor, None);
+
+        // None of those keystrokes leaked into the child — copy-mode owns the keyboard.
+        assert!(
+            fake.inputs.lock().unwrap().is_empty(),
+            "copy-mode keys must never be forwarded to the agent PTY"
+        );
+
+        // `q` leaves copy-mode (and the chat types into the PTY again).
+        a.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!a.copy.contains_key("ZAP-205"), "q exits copy-mode");
+    }
+
+    #[test]
+    fn copy_mode_yank_parks_the_selected_lines_and_exits() {
+        let mut a = app();
+        focus_chat(&mut a, "ZAP-205");
+        let fake = FakeBackend::new("ZAP-205");
+        fake.parser()
+            .write()
+            .unwrap()
+            .process(b"alpha\r\nbravo\r\ncharlie\r\n");
+        a.backends
+            .insert("ZAP-205".into(), fake as Arc<dyn AgentBackend>);
+        a.enter_copy_mode();
+        // Select the three printed rows: cursor on row 0, anchor on row 2.
+        {
+            let cm = a.copy.get_mut("ZAP-205").unwrap();
+            cm.cursor = 0;
+            cm.anchor = Some(2);
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!a.copy.contains_key("ZAP-205"), "a yank exits copy-mode");
+        let clip = a
+            .pending_clipboard
+            .take()
+            .expect("the yank parks an OSC52 payload for the render loop");
+        assert_eq!(clip, "alpha\nbravo\ncharlie", "the selected block is captured verbatim");
+    }
+
+    #[test]
+    fn copy_mode_yank_of_blank_lines_copies_nothing() {
+        let mut a = app();
+        focus_chat(&mut a, "ZAP-205");
+        // A live agent that printed nothing — the visible grid is all blanks.
+        a.backends
+            .insert("ZAP-205".into(), FakeBackend::new("ZAP-205") as Arc<dyn AgentBackend>);
+        a.enter_copy_mode();
+        a.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!a.copy.contains_key("ZAP-205"), "yank still exits copy-mode");
+        assert!(
+            a.pending_clipboard.is_none(),
+            "a whitespace-only selection copies nothing"
+        );
+        assert!(a.status_text().unwrap().contains("nothing to copy"));
+    }
+
     // ── The spine ──────────────────────────────────────────────────────────
 
     #[test]
@@ -6328,6 +6936,43 @@ mod tests {
     }
 
     #[test]
+    fn esc_on_a_chat_coin_is_forwarded_to_the_agent_not_treated_as_back() {
+        // D2: the chat face deliberately eats Esc into the PTY (claude binds Esc), so
+        // it must reach the agent as the escape byte AND leave focus on the chat — it
+        // is NOT a back-out. The non-Esc back (`Ctrl-a 0`) is covered separately.
+        let mut app = app();
+        let fake = register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // focus the agent's chat
+        assert_eq!(app.windows.focused_kind().agent_issue(), Some("ZAP-204"));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            fake.inputs.lock().unwrap().last().unwrap(),
+            &vec![0x1b],
+            "Esc on a chat is forwarded to the PTY as the escape byte"
+        );
+        assert_eq!(
+            app.windows.focused_kind().agent_issue(),
+            Some("ZAP-204"),
+            "Esc on a chat does not back out — focus stays on the chat"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_zero_is_the_non_esc_back_from_a_chat() {
+        // D2: because Esc on a chat goes to the agent, the obvious non-Esc back must
+        // work — `Ctrl-a 0` (FocusNav) jumps focus home to the Spine (window 0).
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        press(&mut app, KeyCode::Enter); // focus the agent's chat
+        assert_ne!(app.windows.focus, 0, "focus is on the chat, not the Spine");
+        verb(&mut app, KeyCode::Char('0')); // Ctrl-a 0 = FocusNav = back to the Spine
+        assert_eq!(
+            app.windows.focus, 0,
+            "Ctrl-a 0 returns focus to the Spine from a chat — the non-Esc back-out"
+        );
+    }
+
+    #[test]
     fn a_paste_into_a_chat_is_wrapped_so_claude_does_not_submit_each_line() {
         // CF-8: a multi-line paste must reach claude as one bracketed-paste block, not
         // as N newline-terminated submits.
@@ -6439,6 +7084,70 @@ mod tests {
             app.windows.preview().map(|(issue, _)| issue),
             Some("ZAP-204".to_string()),
             "unpinning the selected issue re-seeds its preview"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_p_on_a_focused_pinned_coin_unpins_and_keeps_the_live_agent() {
+        // H2: `Ctrl-a p` is now a full pin/unpin TOGGLE on a focused window, symmetric
+        // with the Spine `p`. A second `p` on the focused pinned coin UNPINS it —
+        // instantly (no confirm), the live agent keeps running (its backend is kept
+        // for re-find), and the issue is demoted back to a follower preview so it
+        // never vanishes.
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        press(&mut app, KeyCode::Enter); // active window → chat coin on ZAP-204
+        verb(&mut app, KeyCode::Char('p')); // first p: pin = graduate to a permanent tab
+        assert!(
+            app.windows.pinned_coin_index("ZAP-204").is_some(),
+            "precondition: the focused coin is pinned"
+        );
+        let pinned = app.windows.pinned_coin_index("ZAP-204").unwrap();
+        app.windows.focus = pinned; // focus the pinned coin (graduate keeps focus, but be explicit)
+        verb(&mut app, KeyCode::Char('p')); // second p on the focused pinned coin: UNPIN (toggle)
+        assert!(
+            app.windows.pinned_coin_index("ZAP-204").is_none(),
+            "a second Ctrl-a p on the focused pinned coin unpins it"
+        );
+        assert!(
+            app.kill_confirm.is_none() && app.discard_confirm.is_none(),
+            "unpin is instant — it never arms a confirmation"
+        );
+        assert!(
+            app.backends.contains_key("ZAP-204"),
+            "the live agent keeps running (its backend is kept for re-find)"
+        );
+        assert_eq!(
+            app.windows.preview().map(|(issue, _)| issue),
+            Some("ZAP-204".to_string()),
+            "the unpinned issue is demoted to the follower preview, not gone"
+        );
+        assert!(
+            app.cockpit_dirty,
+            "unpinning a docked window re-persists the layout"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_p_on_the_fleet_window_still_closes_it() {
+        // H2: the toggle only applies to a pinned *coin* (it has an issue identity to
+        // unpin). A non-pinnable docked window — the Fleet overview — has no issue, so
+        // `Ctrl-a p` falls through to close it, exactly like `Ctrl-a w` (close stays
+        // the way you dismiss the Fleet / ad-hoc windows).
+        let mut app = app();
+        app.open_fleet(); // opens AND focuses the single Fleet overview window
+        assert!(
+            matches!(app.windows.focused_kind(), WindowKind::Fleet),
+            "precondition: the Fleet window is focused"
+        );
+        verb(&mut app, KeyCode::Char('p')); // Ctrl-a p on the Fleet → close, not unpin
+        assert!(
+            !app.windows
+                .windows
+                .iter()
+                .any(|w| matches!(w.kind, WindowKind::Fleet)),
+            "Ctrl-a p on the Fleet closes it (the Fleet isn't a pinnable coin)"
         );
     }
 
@@ -6576,6 +7285,74 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_kill_flips_a_pinned_coin_to_its_deps_face_instead_of_removing_it() {
+        // ITEM 10: a confirmed kill on a PINNED coin must keep the window in place
+        // and land it on the deps face — not tear the tile out (jarring).
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        app.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        press(&mut app, KeyCode::Enter); // active coin → chat on ZAP-204
+        verb(&mut app, KeyCode::Char('p')); // pin = graduate to a permanent tab
+        let idx = app
+            .windows
+            .pinned_coin_index("ZAP-204")
+            .expect("precondition: ZAP-204 has a pinned coin");
+        let id_before = app.windows.windows[idx].id;
+        let len_before = app.windows.windows.len();
+
+        verb(&mut app, KeyCode::Char('x')); // Ctrl-a x = kill (arms confirm)
+        assert_eq!(app.kill_confirm.as_deref(), Some("ZAP-204"));
+        press(&mut app, KeyCode::Char('y')); // confirm
+
+        assert!(app.kill_confirm.is_none(), "the kill resolved");
+        assert_eq!(app.windows.windows.len(), len_before, "the pinned tile stays — not removed");
+        let idx = app
+            .windows
+            .pinned_coin_index("ZAP-204")
+            .expect("the pinned coin remains after the kill");
+        assert_eq!(app.windows.windows[idx].id, id_before, "same window, same slot");
+        assert!(
+            matches!(
+                app.windows.windows[idx].kind,
+                WindowKind::Coin { mode: CoinMode::Deps, .. }
+            ),
+            "the killed coin now shows its deps face",
+        );
+        assert!(app.reaped.contains("ZAP-204"), "the killed agent is tombstoned");
+        assert!(app.cockpit_dirty, "the pinned coin's new deps face is re-persisted");
+    }
+
+    #[test]
+    fn confirmed_kill_flips_the_transient_preview_to_its_deps_face() {
+        // ITEM 10: the preview case must be uniform with the pinned case — flip,
+        // don't churn the preview away. The preview keeps its WindowId.
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        app.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        press(&mut app, KeyCode::Enter); // active coin → chat preview on ZAP-204
+        let id_before = app
+            .windows
+            .preview_index()
+            .map(|i| app.windows.windows[i].id)
+            .expect("a chat preview exists for ZAP-204");
+
+        verb(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert!(app.kill_confirm.is_none());
+        let (issue, mode) = app.windows.preview().expect("the preview stays in place");
+        assert_eq!(issue, "ZAP-204", "the preview still shows the killed issue");
+        assert_eq!(mode, CoinMode::Deps, "now on its deps face");
+        assert_eq!(
+            app.windows.preview_index().map(|i| app.windows.windows[i].id),
+            Some(id_before),
+            "the preview keeps its WindowId (window unchanged, just flipped)",
+        );
+    }
+
+    #[test]
     fn close_reclaims_a_dead_agents_backend() {
         let mut app = app();
         let fake = register(&mut app, "ZAP-204");
@@ -6624,6 +7401,71 @@ mod tests {
         press(&mut app, KeyCode::Char('z'));
         assert!(app.kill_confirm.is_none(), "kill cancelled");
         assert!(app.windows.references_agent("ZAP-204"));
+    }
+
+    #[test]
+    fn the_destructive_cluster_confirms_only_the_irreversible_verbs() {
+        // H3 invariant: of the destructive cluster, only the data-losing verbs (kill,
+        // discard) arm a confirm; the recoverable ones (close, restart) are instant.
+        // Each press targets the same live agent; we assert the confirm gate, then
+        // reset so the next verb starts clean.
+        // Close (Ctrl-a w): undock a live agent — recoverable (re-open with ⏎), so instant.
+        // Each verb runs in its own scope so the fresh `app()` factory isn't shadowed by
+        // a prior `app` binding.
+        {
+            let mut app = app();
+            register(&mut app, "ZAP-204");
+            app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+            press(&mut app, KeyCode::Enter); // focus the live agent
+            verb(&mut app, KeyCode::Char('p')); // graduate to a pinned coin so close has a window
+            verb(&mut app, KeyCode::Char('w')); // close
+            assert!(
+                !app.confirm_pending(),
+                "close is recoverable (undock) — it must never arm a confirm"
+            );
+        }
+
+        // Restart (Ctrl-a r) on a live agent: refused (not a destructive act), so instant.
+        {
+            let mut app = app();
+            register(&mut app, "ZAP-204");
+            app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+            press(&mut app, KeyCode::Enter);
+            verb(&mut app, KeyCode::Char('r')); // restart
+            assert!(
+                !app.confirm_pending(),
+                "restart only acts on a dead agent — it must never arm a confirm"
+            );
+        }
+
+        // Kill (Ctrl-a x): stops a running process — irreversible, so it DOES confirm.
+        {
+            let mut app = app();
+            register(&mut app, "ZAP-204");
+            app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+            press(&mut app, KeyCode::Enter);
+            verb(&mut app, KeyCode::Char('x')); // kill
+            assert_eq!(
+                app.kill_confirm.as_deref(),
+                Some("ZAP-204"),
+                "kill is irreversible — it must arm a confirm"
+            );
+        }
+
+        // Discard (Ctrl-a d): push branches + remove worktrees — data loss, so it confirms.
+        // (Discard is refused while live, so kill the agent first by marking it exited.)
+        {
+            let mut app = app();
+            let fake = register(&mut app, "ZAP-204");
+            fake.finish(Some(0)); // the agent exited — its worktree is now discardable
+            app.aim_spine("ZAP-204".into());
+            verb(&mut app, KeyCode::Char('d')); // discard
+            assert_eq!(
+                app.discard_confirm.as_deref(),
+                Some("ZAP-204"),
+                "discard is data-losing — it must arm a confirm"
+            );
+        }
     }
 
     #[test]
@@ -6738,6 +7580,27 @@ mod tests {
         assert_eq!(app.windows.focused().deps.as_ref().unwrap().root, target);
         press(&mut app, KeyCode::Char('b')); // back
         assert_eq!(app.windows.focused().deps.as_ref().unwrap().root, "ZAP-204");
+    }
+
+    #[test]
+    fn esc_on_a_deps_coin_pops_the_re_root_history() {
+        // D2: on a coin's deps face Esc means "back" — it pops the re-root stack just
+        // like Backspace/`b`, the deliberate opposite of Esc on a chat (which goes to
+        // the agent). Mirrors `a_focused_deps_window_re_roots_and_back_returns` but
+        // pins the Esc path specifically.
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('l')); // focus the deps preview (roots at ZAP-204)
+        let target = app.windows.focused().deps.as_ref().unwrap().up_rows[0]
+            .key
+            .clone();
+        press(&mut app, KeyCode::Enter); // re-root onto the first blocker
+        assert_eq!(app.windows.focused().deps.as_ref().unwrap().root, target);
+        press(&mut app, KeyCode::Esc); // Esc on deps = back
+        assert_eq!(
+            app.windows.focused().deps.as_ref().unwrap().root,
+            "ZAP-204",
+            "Esc on a deps coin pops the re-root history back to the original root"
+        );
     }
 
     #[test]
@@ -6904,13 +7767,87 @@ mod tests {
     }
 
     #[test]
-    fn the_one_shot_prefix_fires_a_single_verb() {
-        // `Ctrl-a l` fires exactly one window verb (focus right). v1.7 (ENG-562)
-        // removed command mode, so the prefix is now purely one-shot.
+    fn the_sticky_prefix_chains_window_verbs() {
+        // Sticky command mode: `Ctrl-a` arms it; a chain-friendly window-arrangement
+        // verb (zoom) fires AND stays armed, so a *bare* verb (no re-press) is still
+        // resolved as a command. Zoom commits focus to the active deps coin — a
+        // non-chat surface — so command mode persists.
         let mut app = app();
-        let before = app.windows.focus;
-        verb(&mut app, KeyCode::Char('l'));
-        assert!(app.windows.focus > before, "the one-shot verb fires");
+        verb(&mut app, KeyCode::Char('z')); // Ctrl-a z → ZoomToggle, a chain verb
+        assert!(
+            app.prefix_armed,
+            "a window-arrangement verb keeps command mode armed"
+        );
+        // A bare `z` is still resolved as the verb — keys route to command mode.
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.prefix_armed, "bare verbs chain — command mode persists");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.prefix_armed, "esc ends the chain");
+    }
+
+    #[test]
+    fn focus_and_pin_verbs_release_command_mode_so_the_pane_takes_keys() {
+        // Focus moves and pin reposition you to act on a pane, whose navigation keys
+        // (Enter, arrows, b) overlap the verb keys — so these verbs DROP command mode
+        // rather than hijack the keys you'd press next.
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('l')); // FocusRight
+        assert!(!app.prefix_armed, "a focus move ends command mode");
+        verb(&mut app, KeyCode::Char('p')); // PinWindow
+        assert!(!app.prefix_armed, "pin ends command mode");
+    }
+
+    #[test]
+    fn a_navigation_key_falls_out_of_command_mode_and_still_acts() {
+        // After a chain verb leaves you armed, a plain navigation key must drop
+        // command mode AND still act (ExitReprocess) — never be silently eaten. Use
+        // `layout` (a chain verb that doesn't move focus) so focus stays on the Spine
+        // and the trailing Up still walks the selection; zoom now commits focus into
+        // the big pane, so it's exercised by its own test.
+        let mut app = app();
+        press(&mut app, KeyCode::Down); // move the selection down once
+        let moved = app.root.clone();
+        verb(&mut app, KeyCode::Char('|')); // layout — a chain verb, stays armed
+        assert!(app.prefix_armed);
+        press(&mut app, KeyCode::Up); // a non-verb nav key: exits AND moves back up
+        assert!(!app.prefix_armed, "the nav key dropped command mode");
+        assert_ne!(app.root, moved, "and it still moved the selection (not eaten)");
+    }
+
+    #[test]
+    fn command_mode_exits_on_esc_and_modal_verbs() {
+        // Esc leaves command mode cleanly.
+        let mut a = app();
+        a.prefix_armed = true;
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!a.prefix_armed, "esc exits command mode");
+
+        // A verb that arms a confirmation yields command mode to the modal.
+        let mut c = app();
+        c.fleet.insert("ZAP-210".into(), AgentStatus::Running);
+        c.aim_spine("ZAP-210".into());
+        c.windows.focus = 0;
+        verb(&mut c, KeyCode::Char('x')); // Ctrl-a x → arms a kill confirm
+        assert!(c.kill_confirm.is_some(), "the verb still fired");
+        assert!(!c.prefix_armed, "an armed confirmation preempts command mode");
+    }
+
+    #[test]
+    fn command_mode_releases_while_focused_on_a_chat() {
+        // Even a chain verb must not keep command mode armed while an agent chat is
+        // focused — the next keystrokes belong to claude, not the verb layer.
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        app.aim_spine("ZAP-204".into());
+        press(&mut app, KeyCode::Enter); // open + focus the agent's chat
+        assert!(app.focused_is_chat(), "the agent opens focused on its chat");
+        app.prefix_armed = true; // arrive in command mode with a chat focused
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)); // a chain verb
+        assert!(
+            !app.prefix_armed,
+            "a focused chat releases command mode even after a chain verb"
+        );
     }
 
     #[test]
@@ -7410,6 +8347,84 @@ mod tests {
             "its synthetic Spine node is restored"
         );
         assert_eq!(app.fleet.get(&ask), Some(&AgentStatus::NeedsYou));
+    }
+
+    #[test]
+    fn reaping_an_ad_hoc_agent_removes_its_synthetic_row() {
+        // An ad-hoc (ask-*) agent's Spine row exists only for its agent's life. When the
+        // agent is reaped (after a kill or a natural finish), its synthetic node, its
+        // Spine row, and any coin showing it must disappear — not strand a dead, edgeless
+        // row you can't get rid of.
+        let mut app = app();
+        let ask = crate::worktree::synthetic_ask_id();
+        app.ensure_ask_issue(&ask, "Ad-hoc agent");
+        app.reveal_ask_issue(&ask); // select it + rebuild the Spine
+        assert!(
+            app.graph.get(&ask).is_some() && app.order.contains(&ask),
+            "precondition: the ad-hoc agent has a synthetic node + Spine row"
+        );
+
+        app.apply_event(AppEvent::AgentReaped {
+            project_id: String::new(),
+            issue: ask.clone(),
+        });
+
+        assert!(
+            app.graph.get(&ask).is_none(),
+            "the synthetic node is gone after reap"
+        );
+        assert!(!app.order.contains(&ask), "and its Spine row disappeared");
+        assert_ne!(app.root, ask, "the selection re-aimed off the dead ad-hoc row");
+    }
+
+    #[test]
+    fn reaping_a_real_issues_agent_keeps_its_spine_row() {
+        // The flip side of the ad-hoc rule: a Linear issue outlives its agent, so a reap
+        // must NOT remove its row.
+        let mut app = app();
+        let issue = app.order[0].clone();
+        assert!(!crate::worktree::is_synthetic_ask_id(&issue));
+
+        app.apply_event(AppEvent::AgentReaped {
+            project_id: String::new(),
+            issue: issue.clone(),
+        });
+
+        assert!(
+            app.graph.get(&issue).is_some(),
+            "a real issue's node survives its agent's reap"
+        );
+        assert!(app.order.contains(&issue), "and its Spine row stays");
+    }
+
+    #[test]
+    fn reaping_the_only_ad_hoc_node_leaves_no_stale_row_or_preview() {
+        // Edge case (caught in adversarial review): when the ad-hoc agent is the ONLY
+        // node, removing it empties the Spine — rebuild_order must clear the now-dangling
+        // selection so reaim_preview can't re-seed a ghost coin on the dead node.
+        let mut app = App::new(Graph::new("P"));
+        app.set_viewport(Rect::new(0, 0, 200, 40));
+        let ask = crate::worktree::synthetic_ask_id();
+        app.ensure_ask_issue(&ask, "Ad-hoc agent");
+        app.reveal_ask_issue(&ask);
+        app.windows
+            .ensure_preview(&ask, CoinMode::Chat, &app.graph); // a live chat preview
+        assert_eq!(app.order, vec![ask.clone()], "precondition: the ask is the only row");
+
+        app.apply_event(AppEvent::AgentReaped {
+            project_id: String::new(),
+            issue: ask.clone(),
+        });
+
+        assert!(
+            app.order.is_empty(),
+            "no rows remain after the only agent is reaped"
+        );
+        assert_ne!(app.root, ask, "the selection no longer points at the dead node");
+        assert!(
+            app.windows.preview().is_none(),
+            "no ghost preview survives on the removed node"
+        );
     }
 
     #[test]
@@ -7954,6 +8969,31 @@ mod tests {
     }
 
     #[test]
+    fn zoom_from_the_spine_focuses_the_pane_it_enlarges() {
+        // The user-reported trap: zooming from the nav Spine painted the agent
+        // full-screen but left focus on the (now hidden) Spine, so keys routed to an
+        // off-screen surface. Zooming in from the Spine must move focus into the big
+        // pane so the enlarged agent is the one that takes keys.
+        let mut app = app();
+        assert_eq!(app.windows.focus, 0, "starts focused on the Spine");
+        let active = app.active_index().expect("a preview coin exists to zoom");
+        verb(&mut app, KeyCode::Char('z')); // Ctrl-a z from the Spine
+        assert!(app.windows.zoomed, "zoom is on");
+        assert_eq!(
+            app.windows.focus, active,
+            "focus followed the zoom into the enlarged pane"
+        );
+        assert!(
+            !matches!(app.windows.focused_kind(), WindowKind::Spine),
+            "focus left the Spine, so the zoomed agent now takes keys"
+        );
+        assert!(
+            app.is_index_visible(app.windows.focus),
+            "the focused window is the big pane"
+        );
+    }
+
+    #[test]
     fn a_carded_agent_is_not_visible_for_polling() {
         // A pinned agent shown only as a rail card (not the big pane) must NOT
         // force a fast poll / repaint — the idle-quiet property.
@@ -8411,7 +9451,7 @@ mod tests {
         let mut f = Filter::All;
         let mut filters = vec![f];
         loop {
-            f = f.next();
+            f = f.toggle();
             if f == Filter::All {
                 break;
             }

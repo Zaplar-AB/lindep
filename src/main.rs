@@ -714,7 +714,6 @@ fn start_control_plane(
         exe,
         hook_port,
         hook_token,
-        base: "HEAD".to_string(),
         rows,
         cols,
         // Cockpit v3 uncaps docking, but live backends are bounded — default 12,
@@ -877,6 +876,48 @@ fn disable_bracketed_paste() {
     );
 }
 
+/// Minimal standard base64 (RFC 4648, with `=` padding) for OSC52 clipboard payloads —
+/// avoids pulling a crate for one self-contained function.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::base64_encode;
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"hi"), "aGk=");
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        // OSC52 carries arbitrary bytes (a yanked multi-line block).
+        assert_eq!(base64_encode(b"line one\nline two"), "bGluZSBvbmUKbGluZSB0d28=");
+    }
+}
+
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx) -> io::Result<()> {
     use std::time::Instant;
     use tokio::sync::mpsc::error::TryRecvError;
@@ -963,6 +1004,19 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
             }
         }
 
+        // A copy-mode yank parks the text here; push it to the host's clipboard with an
+        // OSC52 escape (dependency-free, works over SSH/tmux where the host allows it —
+        // mirroring the bracketed-paste DECSET above). A host that ignores OSC52 just
+        // no-ops; the "copied N lines" footer still confirms the selection was taken.
+        if let Some(text) = app.pending_clipboard.take() {
+            use std::io::Write;
+            let payload = base64_encode(text.as_bytes());
+            let mut out = io::stdout();
+            let _ = out.write_all(format!("\x1b]52;c;{payload}\x07").as_bytes());
+            let _ = out.flush();
+            dirty = true;
+        }
+
         // Advance the animation frame on the wall-clock cadence while something
         // is animating, forcing one repaint per frame. A still cockpit (no live
         // agents, no flash, no resume → `is_animating()` false) never advances the
@@ -977,6 +1031,13 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, mut rx: AppEventRx)
             last_tick = Instant::now();
         }
 
+        // A requested full repaint (Ctrl-L) drops ratatui's diff baseline so every
+        // cell is rewritten — the escape hatch for a stray cell a wide-glyph stagger
+        // left in a PTY pane, which the per-frame diff can't otherwise know to clear.
+        if app.take_force_redraw() {
+            terminal.clear()?;
+            dirty = true;
+        }
         if dirty {
             terminal.draw(|frame| ui::draw(app, frame))?;
         }
@@ -1227,6 +1288,94 @@ mod tests {
     }
 
     #[test]
+    fn a_focused_chat_with_a_short_frozen_grid_pins_its_input_row_to_the_pane_bottom() {
+        // ITEM 3: a focused chat whose grid is SHORTER than its pane (a frozen-short
+        // EXITED screen, or a grow-then-skipped resize) must bottom-anchor so its input
+        // row sits at the pane's bottom edge, never stranded mid-pane by a naive
+        // top-align. We drive a deliberately short (6-row) frozen grid with a unique
+        // marker on its LAST row and assert that marker lands in the LOWER half of the
+        // rendered frame — which top-align (the old behavior) could not do.
+        use crate::backend::AgentBackend; // brings `.parser()` into scope
+        let mut app = App::new(demo::graph());
+        app.windows.push(
+            WindowKind::Coin {
+                issue: "ZAP-204".into(),
+                mode: CoinMode::Chat,
+            },
+            true,
+            None,
+        ); // focused agent tab → the big pane
+        let backend = crate::backend::fake::FakeBackend::new("ZAP-204");
+        // A short grid with the "input box" on its last row; the fake's resize never
+        // reflows the parser, so this 6-row grid is what render sees.
+        {
+            let parser = backend.parser();
+            let mut guard = parser.write().unwrap();
+            guard.screen_mut().set_size(6, 80);
+            // Move the cursor to the last grid row, column 1, and draw the marker there.
+            guard.process(b"\x1b[6;1HINPUTBOX_MARK");
+        }
+        app.backends.insert(
+            "ZAP-204".into(),
+            backend as Arc<dyn crate::backend::AgentBackend>,
+        );
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        let lines: Vec<&str> = out.lines().collect();
+        let marker_row = lines
+            .iter()
+            .position(|l| l.contains("INPUTBOX_MARK"))
+            .unwrap_or_else(|| panic!("the focused chat's input row must render:\n{out}"));
+        assert!(
+            marker_row > lines.len() / 2,
+            "the input row must be bottom-anchored into the lower half (row {marker_row} of {}):\n{out}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn a_focused_exited_chat_with_a_tall_frozen_grid_keeps_its_input_row_visible() {
+        // ITEM 3: an EXITED agent's resize is skipped, so a grid that froze TALLER than
+        // its current pane must still bottom-anchor — the input row (grid's last row)
+        // survives instead of being clipped off the bottom. Guards the taller-grid
+        // branch for the exited+focused case the item names.
+        use crate::backend::AgentBackend; // brings `.parser()` into scope
+        let mut app = App::new(demo::graph());
+        app.windows.push(
+            WindowKind::Coin {
+                issue: "ZAP-204".into(),
+                mode: CoinMode::Chat,
+            },
+            true,
+            None,
+        );
+        let backend = crate::backend::fake::FakeBackend::new("ZAP-204");
+        {
+            let parser = backend.parser();
+            let mut guard = parser.write().unwrap();
+            // 200 rows guarantees the frozen grid is taller than any sane pane; the
+            // marker on the last row is what a clip would have eaten.
+            guard.screen_mut().set_size(200, 80);
+            guard.process(b"\x1b[1;1HTOP_OF_GRID\x1b[200;1HINPUTBOX_MARK");
+        }
+        backend.finish(Some(0)); // EXITED → resize is skipped, grid stays tall
+        app.backends.insert(
+            "ZAP-204".into(),
+            backend as Arc<dyn crate::backend::AgentBackend>,
+        );
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Done);
+        let out = render_snapshot(&mut app, 120, 40).expect("render");
+        assert!(
+            out.contains("INPUTBOX_MARK"),
+            "the input row of a tall frozen exited grid must survive:\n{out}"
+        );
+        assert!(
+            !out.contains("TOP_OF_GRID"),
+            "the bottom-anchor drops the grid's TOP rows, not its input row:\n{out}"
+        );
+    }
+
+    #[test]
     fn agent_windows_survive_adversarial_sizes_in_both_layouts() {
         // A strip of several windows (spine + deps + agents) must not panic at any
         // size, in either layout — the snap-to-whole-column / mosaic geometry.
@@ -1390,6 +1539,40 @@ mod tests {
         assert!(
             out.contains("config.toml"),
             "help points at the config file"
+        );
+    }
+
+    #[test]
+    fn help_overlay_names_the_three_scopes_distinctly() {
+        // M5: the per-project Fleet window (g), the cross-project all-agents screen
+        // (Ctrl-a a) and the next-agent walk (Ctrl-a j) used to share "agent(s)"/
+        // "overview" vocabulary and read as interchangeable. The help must now name
+        // each with its own lead phrase so the three are unmistakable.
+        let mut app = App::new(demo::graph());
+        app.show_help = true;
+        // The help list wraps long descriptions, so it always scrolls — the OpenFleet
+        // row sits near the top and the NextAgent / GlobalView rows near the bottom.
+        // Render the top of the overlay for the Fleet label…
+        let top = render_snapshot(&mut app, 120, 100).expect("render");
+        assert!(
+            top.contains("open the Fleet"),
+            "the g jump names the per-project Fleet window:\n{top}"
+        );
+        // The old ambiguous wording must be gone, so the labels can't drift back.
+        assert!(
+            !top.contains("global all-agents screen"),
+            "the ambiguous 'global all-agents screen' label is retired:\n{top}"
+        );
+        // …then scroll to the bottom for the lower scope rows (clamped to max_scroll).
+        app.help_scroll = u16::MAX;
+        let bottom = render_snapshot(&mut app, 120, 100).expect("render");
+        assert!(
+            bottom.contains("all agents (global)"),
+            "Ctrl-a a names the cross-project all-agents screen:\n{bottom}"
+        );
+        assert!(
+            bottom.contains("next agent"),
+            "Ctrl-a j names the next-agent walk:\n{bottom}"
         );
     }
 

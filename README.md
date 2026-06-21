@@ -148,9 +148,10 @@ twice to send a literal `Ctrl-A` through to the agent).
 | <kbd>Ctrl-A</kbd> <kbd>d</kbd> | Discard a finished issue's workspace (push branches + remove worktrees) |
 | <kbd>Ctrl-A</kbd> <kbd>m</kbd> | Reclaim disk — free unreferenced mirrors |
 | <kbd>Ctrl-A</kbd> <kbd>0</kbd> | Jump focus home to the spine |
+| <kbd>Ctrl-L</kbd> | Force a full repaint — clears any stray cell left by a wide-glyph stagger in an agent pane (works from any focus) |
 | <kbd>Ctrl-A</kbd> <kbd>q</kbd> | Quit the cockpit |
 | <kbd>n</kbd> · <kbd>Ctrl-A</kbd> <kbd>n</kbd> | Jump to the next issue whose agent needs you (works from any focus) |
-| <kbd>f</kbd> | Cycle the issue filter (all / has-deps) |
+| <kbd>f</kbd> | Toggle the issue filter (all / has-deps) |
 | <kbd>p</kbd> | Pin / unpin the selected issue straight from the spine (toggle — no prefix needed) |
 | <kbd>i</kbd> · <kbd>t</kbd> | Summary card · agent run ledger for the selected issue |
 
@@ -211,13 +212,24 @@ handle        = "lindep-core"             # the per-project dir name
 candidates    = ["lindep", "shared-proto"] # the trust boundary
 primary       = "lindep"                  # always materialised at launch
 branch_prefix = "felix"
+base_branch   = "develop"                 # OPTIONAL: fork new issue branches from
+                                          # a fresh origin/develop (default: HEAD)
 ```
+
+`base_branch` is the branch each **new** per-issue worktree forks from. Unset, it
+keeps the historical behaviour (the clone's local `HEAD`). Set to a name like
+`develop` and a brand-new issue branch is cut from a *freshly fetched*
+`origin/develop`, with a safe fall-through (`origin/<base>` → `<base>` →
+`origin/HEAD` → `HEAD`) so a typo or a branch absent from a given repo never
+blocks a launch. It applies only to brand-new branches — resuming or recovering an
+issue keeps its existing committed branch — and per repo where the branch exists.
 
 You don't have to write this by hand. The first time you open a project that
 isn't in the registry, lindep runs a short **setup wizard** — point it at a local
 clone or paste a remote URL, pick the primary repo (advanced fields like
-`branch_prefix` and per-issue scratch datastores are skippable) — and it appends
-the `[[repo]]`/`[[project]]` blocks for you, leaving any existing comments intact.
+`branch_prefix`, `base_branch` and per-issue scratch datastores are skippable) —
+and it appends the `[[repo]]`/`[[project]]` blocks for you, leaving any existing
+comments intact.
 Re-open the wizard any time on a connected project with <kbd>Ctrl-A</kbd>
 <kbd>o</kbd> to add a repo or a scratch datastore; the edit is written in place
 (your comments preserved) and applies on the next launch.
@@ -263,7 +275,12 @@ Direct-key action names: `move-up` `move-down` `move-top` `move-bottom`
 `focus-left` `focus-right` `focus-nav` `zoom` `pin` `close` `kill` `layout`
 `open` `quit` `jump-needs-you` `context` `switch-project` `open-in-editor`
 `reclaim-mirrors` `discard-workspace` `global-view` `configure-project` `restart`
-`next-agent` `dispatch-ready` `choose-repos` `ask`.
+`next-agent` `dispatch-ready` `choose-repos` `ask` `copy-mode`.
+
+**Copy-mode** (`Ctrl-a [`, tmux-style) on a focused agent chat: scroll its scrollback
+(`↑`/`↓`, `PgUp`/`PgDn`, `g`/`G`), press `space` to start a line selection, then `y`
+(or `Enter`) to yank the highlighted lines to your clipboard via OSC52; `Esc`/`q` exits.
+OSC52 works over SSH/tmux where the host terminal allows clipboard writes.
 
 (The overlay/issue actions — `search` `help` `summary` `ledger` — are direct-only
 as of v1.7: the prefix keeps spatial pane verbs. `jump-needs-you` and `context`
@@ -282,6 +299,20 @@ default.
 terminal. Press the prefix twice to send a literal `Ctrl-A` through to the focused
 agent, so it's never wholly unreachable. Pick any chord for `prefix`; if it
 shadows a direct key or verb, lindep warns at startup.
+
+**Command mode (the sticky prefix).** `Ctrl-A` arms a **command mode** that
+*stays on* so you can fire several window-arrangement verbs with bare keys —
+`Ctrl-A z w w` instead of re-prefixing each. While it's armed the whole focused
+surface turns **amber** (its border, title bar, selected row and the hint footer)
+so you always know you're in it. It chains the verbs that rearrange windows
+without then needing the pane's own keys — **zoom, close, layout, restart**.
+Everything that repositions you to *act* on a pane — a focus move, pin, the
+chat/deps flip, dispatch, launching or focusing an agent — drops you back out, as
+does landing on an **agent chat**, `Esc`, or simply any navigation/typing key
+(which also still does its thing, so a keystroke is never eaten). The split is
+deliberate: lindep's pane navigation (`Enter`, arrows, `h`/`l`) shares keys with
+the window verbs, so a mode that kept reinterpreting them would hijack the very
+keys you need next.
 
 ### Agent limits
 

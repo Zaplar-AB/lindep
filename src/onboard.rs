@@ -68,11 +68,33 @@ pub fn run_for_project(project: &ProjectRef) -> io::Result<(String, bool)> {
             true,
         )
     } else {
-        // Cancelled, or completed but nothing actually differed from the existing
-        // binding — either way the on-disk config is unchanged, so don't nudge a
-        // pointless restart.
-        ("configuration unchanged".to_string(), false)
+        // Cancelled, or completed but nothing actually differed. Both leave the on-disk
+        // config intact, but they are not the same to the user: someone who added a repo
+        // / changed the prefix and then hit Esc had real edits thrown away, and "nothing
+        // changed" would be a lie. Distinguish them with the SAME render-and-compare
+        // write_binding's no-op path uses (so toml_edit reformatting never reads as a
+        // spurious edit); an unreadable/unparseable registry degrades to the
+        // conservative "unchanged" rather than panicking out of the cockpit.
+        let differs = registry::binding_differs(
+            &wizard.layout,
+            &wizard.new_repos(),
+            &wizard.project_draft(),
+            &wizard.scratch,
+        )
+        .unwrap_or(false);
+        (cancel_footer(differs).to_string(), false)
     })
+}
+
+/// Footer wording for leaving the re-config wizard without a write. When the draft
+/// genuinely differs from the on-disk binding, it owns up to the discarded edits while
+/// still reassuring that the saved config is intact; otherwise the plain "unchanged".
+fn cancel_footer(differs: bool) -> &'static str {
+    if differs {
+        "edits discarded — configuration unchanged"
+    } else {
+        "configuration unchanged"
+    }
 }
 
 /// The wizard's steps, in order. [`Step::Primary`] is skipped when the project has a
@@ -85,6 +107,9 @@ enum Step {
     Primary,
     /// Optional per-project branch namespace — skippable (Enter on empty = default).
     BranchPrefix,
+    /// Optional per-project base branch worktrees fork from — skippable (Enter on
+    /// empty = the historical `HEAD`).
+    BaseBranch,
     /// Optional per-issue scratch datastores — skippable (Enter on empty = none).
     Scratch,
     /// Review the binding and write it.
@@ -206,6 +231,8 @@ pub struct Wizard {
     /// Cursor over [`Self::registered_repos`] for the reuse picker on the Repos step.
     existing: ListState,
     branch_prefix: String,
+    /// The live text input on [`Step::BaseBranch`]; empty = the default `HEAD`.
+    base_branch: String,
     /// Scratch datastores collected so far, and the in-progress entry.
     scratch: Vec<ScratchDraft>,
     scratch_form: ScratchForm,
@@ -251,6 +278,7 @@ impl Wizard {
             primary: ListState::default(),
             existing: ListState::default(),
             branch_prefix: String::new(),
+            base_branch: String::new(),
             scratch: Vec::new(),
             scratch_form: ScratchForm::default(),
             scratch_opt_in: false,
@@ -290,6 +318,7 @@ impl Wizard {
             let primary_idx = w.repos.iter().position(|r| r.handle == desc.primary);
             w.primary.select(Some(primary_idx.unwrap_or(0)));
             w.branch_prefix = desc.branch_prefix.clone().unwrap_or_default();
+            w.base_branch = desc.base_branch.clone().unwrap_or_default();
             w.scratch = desc
                 .scratch
                 .iter()
@@ -463,6 +492,27 @@ impl Wizard {
             return;
         }
         self.error = None;
+        self.step = Step::BaseBranch;
+    }
+
+    /// Leave the base-branch step. Empty is fine — it falls back to the historical
+    /// `HEAD` (the clone's local head) at launch. A non-empty value must be a safe
+    /// git start-point (a branch, `origin/<b>`, a tag, a SHA, `HEAD`), gated by the
+    /// same [`crate::worktree::is_valid_base`] the registry loader uses, so a bad
+    /// value is caught here rather than surfacing as a worktree-create failure.
+    /// Existence isn't checked — `resolve_base` probes it at create time and falls
+    /// through if it's absent in a given repo.
+    fn advance_from_base_branch(&mut self) {
+        let base = self.base_branch.trim();
+        if !base.is_empty() && !crate::worktree::is_valid_base(base) {
+            self.error = Some(
+                "base branch isn't a valid git ref — no spaces or ~^:?*[\\, \
+                 no leading '-' or '/', no '..'"
+                    .into(),
+            );
+            return;
+        }
+        self.error = None;
         self.step = Step::Scratch;
     }
 
@@ -527,6 +577,7 @@ impl Wizard {
             .unwrap_or_default();
         let candidates = self.repos.iter().map(|r| r.handle.clone()).collect();
         let prefix = self.branch_prefix.trim();
+        let base = self.base_branch.trim();
         ProjectDraft {
             id: self.project.id.clone(),
             handle: self.unique_handle(),
@@ -534,6 +585,7 @@ impl Wizard {
             candidates,
             primary,
             branch_prefix: (!prefix.is_empty()).then(|| prefix.to_string()),
+            base_branch: (!base.is_empty()).then(|| base.to_string()),
         }
     }
 
@@ -726,9 +778,18 @@ fn run_loop(terminal: &mut DefaultTerminal, wizard: &mut Wizard) -> io::Result<b
                 KeyCode::Char(c) if !ctrl && !alt => wizard.branch_prefix.push(c),
                 _ => {}
             },
+            Step::BaseBranch => match key.code {
+                KeyCode::Esc => wizard.step = Step::BranchPrefix,
+                KeyCode::Enter => wizard.advance_from_base_branch(),
+                KeyCode::Backspace => {
+                    wizard.base_branch.pop();
+                }
+                KeyCode::Char(c) if !ctrl && !alt => wizard.base_branch.push(c),
+                _ => {}
+            },
             Step::Scratch if !wizard.scratch_showing_form() => match key.code {
                 // The dense 7-field form is opt-in so it isn't a wall before Confirm.
-                KeyCode::Esc => wizard.step = Step::BranchPrefix,
+                KeyCode::Esc => wizard.step = Step::BaseBranch,
                 KeyCode::Char('s') if !ctrl && !alt => wizard.scratch_opt_in = true,
                 KeyCode::Enter => {
                     wizard.error = None;
@@ -737,7 +798,7 @@ fn run_loop(terminal: &mut DefaultTerminal, wizard: &mut Wizard) -> io::Result<b
                 _ => {}
             },
             Step::Scratch => match key.code {
-                KeyCode::Esc => wizard.step = Step::BranchPrefix,
+                KeyCode::Esc => wizard.step = Step::BaseBranch,
                 KeyCode::Up => wizard.scratch_form.move_focus(-1),
                 KeyCode::Down => wizard.scratch_form.move_focus(1),
                 // Enter on a blank form advances; on a filled one adds the entry.
@@ -814,8 +875,9 @@ fn draw(wizard: &mut Wizard, frame: &mut Frame) {
         Step::Repos => "1 · repos — the repo agents work in · esc = just view the graph",
         Step::Primary => "2 · primary repo",
         Step::BranchPrefix => "3 · branch prefix (optional)",
-        Step::Scratch => "4 · scratch datastores (optional)",
-        Step::Confirm => "5 · confirm",
+        Step::BaseBranch => "4 · base branch (optional)",
+        Step::Scratch => "5 · scratch datastores (optional)",
+        Step::Confirm => "6 · confirm",
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -832,6 +894,9 @@ fn draw(wizard: &mut Wizard, frame: &mut Frame) {
         Step::Repos => " path/URL · ⏎ add · ↑↓+tab reuse a repo · ⏎ empty → next · esc".into(),
         Step::Primary => " ↑↓ move · ⏎ choose primary · esc back".into(),
         Step::BranchPrefix => " type a prefix · ⏎ accept (empty = default) · esc back".into(),
+        Step::BaseBranch => {
+            " branch worktrees fork from · ⏎ accept (empty = HEAD) · esc back".into()
+        }
         Step::Scratch if !wizard.scratch_showing_form() => {
             " ⏎ skip (most projects do) · s add a datastore · esc back".into()
         }
@@ -845,6 +910,7 @@ fn draw(wizard: &mut Wizard, frame: &mut Frame) {
         Step::Repos => draw_repos(wizard, frame, body),
         Step::Primary => draw_primary(wizard, frame, body),
         Step::BranchPrefix => draw_branch_prefix(wizard, frame, body),
+        Step::BaseBranch => draw_base_branch(wizard, frame, body),
         Step::Scratch => draw_scratch(wizard, frame, body),
         Step::Confirm => draw_confirm(wizard, frame, body),
     }
@@ -962,7 +1028,7 @@ fn draw_repos(wizard: &mut Wizard, frame: &mut Frame, area: Rect) {
         let picker = List::new(picks)
             .highlight_symbol("▸ ")
             .highlight_spacing(HighlightSpacing::Always)
-            .highlight_style(theme::cursor_active());
+            .highlight_style(theme::cursor_active(false));
         frame.render_stateful_widget(picker, chunks[3], &mut wizard.existing);
     }
 }
@@ -985,7 +1051,7 @@ fn draw_primary(wizard: &mut Wizard, frame: &mut Frame, area: Rect) {
     let list = List::new(items)
         .highlight_symbol("▸ ")
         .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(theme::cursor_active());
+        .highlight_style(theme::cursor_active(false));
     frame.render_stateful_widget(list, inner, &mut wizard.primary);
 }
 
@@ -1004,6 +1070,27 @@ fn draw_branch_prefix(wizard: &Wizard, frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "  the per-project branch namespace; leave empty to use your git user name",
+            Style::new().fg(MUTED),
+        ))),
+        note,
+    );
+}
+
+fn draw_base_branch(wizard: &Wizard, frame: &mut Frame, area: Rect) {
+    let block = framed("BASE BRANCH");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [field, note] = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+    let field_line = Line::from(vec![
+        Span::styled(" base ", Style::new().fg(GREEN_400)),
+        Span::styled(wizard.base_branch.clone(), Style::new().fg(INK)),
+        Span::styled("▏", Style::new().fg(GREEN_500)),
+    ]);
+    frame.render_widget(Paragraph::new(field_line), field);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  new issue branches fork from a fresh origin/<this>; empty = HEAD (today's behaviour)",
             Style::new().fg(MUTED),
         ))),
         note,
@@ -1145,6 +1232,14 @@ fn draw_confirm(wizard: &Wizard, frame: &mut Frame, area: Rect) {
     lines.push(Line::from(vec![
         Span::styled("  branch prefix  ", Style::new().fg(MUTED)),
         Span::styled(prefix, Style::new().fg(INK)),
+    ]));
+    let base = draft
+        .base_branch
+        .clone()
+        .unwrap_or_else(|| "HEAD".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("  base branch    ", Style::new().fg(MUTED)),
+        Span::styled(base, Style::new().fg(INK)),
     ]));
     lines.push(Line::raw(""));
     if wizard.scratch.is_empty() {
@@ -1418,6 +1513,25 @@ mod tests {
     }
 
     #[test]
+    fn the_base_branch_is_optional_and_validated() {
+        let mut w = wizard(&[], &[]);
+        w.input = "git@github.com:zaplar/core.git".into();
+        w.add_repo();
+        // Empty = HEAD (None in the draft).
+        assert!(w.project_draft().base_branch.is_none(), "empty = HEAD");
+        // A valid base is carried through.
+        w.base_branch = "develop".into();
+        assert_eq!(w.project_draft().base_branch.as_deref(), Some("develop"));
+        // The advance gate rejects an invalid ref and surfaces an error rather than
+        // advancing to the next step.
+        w.step = Step::BaseBranch;
+        w.base_branch = "bad ref~".into();
+        w.advance_from_base_branch();
+        assert_eq!(w.step, Step::BaseBranch, "an invalid base stays on the step");
+        assert!(w.error.is_some(), "and surfaces an error");
+    }
+
+    #[test]
     fn the_scratch_step_gates_the_dense_form_behind_an_opt_in() {
         // NEW-13: the scratch step opens as a one-line opt-in, NOT the dense 7-field grid.
         // `scratch_showing_form` is the gate the key handler and renderer both read; it's
@@ -1507,7 +1621,7 @@ mod tests {
             root.join("registry.toml"),
             "[[repo]]\nhandle = \"core\"\nremote = \"git@github.com:zaplar/core\"\n\n\
              [[project]]\nid = \"p9\"\nhandle = \"core-world\"\nname = \"Core\"\n\
-             primary = \"core\"\nbranch_prefix = \"felix\"\n",
+             primary = \"core\"\nbranch_prefix = \"felix\"\nbase_branch = \"develop\"\n",
         )
         .unwrap();
         let (reg, _) = registry::Registry::load_at(registry::Layout::new(&root));
@@ -1518,10 +1632,11 @@ mod tests {
             },
             &reg,
         );
-        // The existing repo, primary, branch prefix and handle are carried over.
+        // The existing repo, primary, branch prefix, base branch and handle carry over.
         assert_eq!(w.repos.len(), 1);
         assert_eq!(w.repos[0].handle, "core");
         assert_eq!(w.branch_prefix, "felix");
+        assert_eq!(w.base_branch, "develop");
         assert_eq!(
             w.project_draft().handle,
             "core-world",
@@ -1529,6 +1644,57 @@ mod tests {
         );
         // The reused repo writes no new [[repo]] block.
         assert!(w.new_repos().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancel_footer_owns_up_to_discarded_edits() {
+        // The two arms of the cancel wording, pinned without driving the TUI loop.
+        assert_eq!(cancel_footer(false), "configuration unchanged");
+        assert_eq!(
+            cancel_footer(true),
+            "edits discarded — configuration unchanged"
+        );
+    }
+
+    #[test]
+    fn cancelling_reconfig_reports_unchanged_then_discarded() {
+        // The signal the cancel branch reads: a freshly-loaded reconfig draft does NOT
+        // differ from the on-disk binding (so an immediate Esc says "unchanged"), but a
+        // real edit DOES (so a discard-after-edit says "edits discarded").
+        let root =
+            std::env::temp_dir().join(format!("lindep-onboard-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("registry.toml"),
+            "[[repo]]\nhandle = \"core\"\nremote = \"git@github.com:zaplar/core\"\n\n\
+             [[project]]\nid = \"p9\"\nhandle = \"core-world\"\nname = \"Core\"\n\
+             primary = \"core\"\nbranch_prefix = \"felix\"\nbase_branch = \"develop\"\n",
+        )
+        .unwrap();
+        let (reg, _) = registry::Registry::load_at(registry::Layout::new(&root));
+        let mut w = Wizard::for_project(
+            ProjectRef {
+                id: "p9".into(),
+                name: "Core".into(),
+            },
+            &reg,
+        );
+        let differs = |w: &Wizard| {
+            registry::binding_differs(&w.layout, &w.new_repos(), &w.project_draft(), &w.scratch)
+                .unwrap()
+        };
+        assert!(
+            !differs(&w),
+            "an untouched reload matches the on-disk binding (cancel ⇒ unchanged)"
+        );
+        // A real edit to a pre-populated field now reads as a discardable change.
+        w.branch_prefix = "changed".into();
+        assert!(
+            differs(&w),
+            "a changed branch_prefix differs (cancel ⇒ edits discarded)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1545,6 +1711,7 @@ mod tests {
             Step::Repos,
             Step::Primary,
             Step::BranchPrefix,
+            Step::BaseBranch,
             Step::Scratch,
             Step::Confirm,
         ] {

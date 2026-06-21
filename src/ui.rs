@@ -18,8 +18,8 @@ use ratatui::widgets::{
 use tui_term::widget::PseudoTerminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Filter, Flash, Readiness};
-use crate::backend::Lifecycle;
+use crate::app::{App, CopyMode, Filter, Flash, Readiness};
+use crate::backend::{AgentBackend, Lifecycle};
 use crate::keymap::Action;
 use crate::layout;
 use crate::model::{Direction, Graph, Status};
@@ -157,7 +157,7 @@ fn render_global_overlay(
             // cost is predictable before you commit.
             let here = pid == active;
             let mut spans = vec![
-                Span::styled(format!("{glyph} "), gstyle),
+                Span::styled(cell(glyph, 2), gstyle),
                 Span::styled(
                     name,
                     if here {
@@ -177,7 +177,7 @@ fn render_global_overlay(
     let list = List::new(items)
         .highlight_symbol("▸ ")
         .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(theme::cursor_active());
+        .highlight_style(theme::cursor_active(false));
     frame.render_stateful_widget(list, body, &mut view.state);
 
     frame.render_widget(
@@ -523,7 +523,7 @@ fn render_card(app: &App, frame: &mut Frame, rect: Rect, idx: usize) {
     if pinned {
         title.push(Span::styled("⊙ ", Style::new().fg(ORANGE_400)));
     }
-    let block = window_block(Line::from(title), false, hue, breathe, app.frame);
+    let block = window_block(Line::from(title), false, hue, breathe, app.frame, false);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     if inner.area() > 0 {
@@ -545,21 +545,22 @@ fn window_block(
     hue: Color,
     breathe: bool,
     frame: u64,
+    armed: bool,
 ) -> Block<'static> {
     let (border_type, border_style) = if focused {
-        (BorderType::Double, theme::focus_border_style())
+        (BorderType::Double, theme::focus_border_style(armed))
     } else if breathe {
         (BorderType::Plain, theme::needs_you_style(frame))
     } else {
         (BorderType::Plain, Style::new().fg(hue))
     };
-    // The focused window gets a bright violet focus bar leading its title, so the
-    // focus is unmistakable even where a double border is subtle.
+    // The focused window gets a bright focus bar leading its title, so the focus is
+    // unmistakable even where a double border is subtle — and it flips to amber the
+    // moment command mode is armed, matching the border and the selection.
     let mut title = title;
     if focused {
-        title
-            .spans
-            .insert(0, Span::styled("▌", Style::new().fg(VIOLET_200)));
+        let bar = if armed { AMBER_400 } else { VIOLET_200 };
+        title.spans.insert(0, Span::styled("▌", Style::new().fg(bar)));
     }
     Block::default()
         .borders(Borders::ALL)
@@ -572,15 +573,24 @@ fn window_block(
 
 /// The Spine's title — the issue list, lit with its count. (v1.7 folded the
 /// agents roster into the readiness bands, so there's no longer an AGENTS tab.)
-fn spine_title(app: &App) -> Line<'static> {
+fn spine_title(app: &App, focused: bool) -> Line<'static> {
+    // The nav header chip: racing-green when the nav owns your keys (matching the
+    // green selection inside it), deep amber while command mode is armed (matching
+    // the amber border wash), and a quiet graphite when focus is elsewhere. Green at
+    // rest, not violet — selection and focus stay distinct signals (see focus_accent).
+    let (bg, fg) = if focused {
+        if app.prefix_armed { (AMBER_900, INK) } else { (GREEN_700, GREEN_100) }
+    } else {
+        (BORDER, INK)
+    };
     Line::from(Span::styled(
         format!(" ISSUES {} ", app.order.len()),
-        Style::new().fg(GREEN_100).bg(GREEN_700).bold(),
+        Style::new().fg(fg).bg(bg).bold(),
     ))
 }
 
 fn render_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bool) {
-    let block = window_block(spine_title(app), focused, BORDER, false, app.frame);
+    let block = window_block(spine_title(app, focused), focused, BORDER, false, app.frame, app.prefix_armed);
 
     // The readiness schedule is the single Spine view: bands + a ready rail.
     // Re-band first if an agent event left the order stale (the schedule orders
@@ -592,13 +602,13 @@ fn render_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bool) {
     render_banded_spine(app, frame, area, focused, block);
 }
 
-fn list_widget<'a>(items: Vec<ListItem<'a>>, block: Block<'a>, active: bool) -> List<'a> {
+fn list_widget<'a>(items: Vec<ListItem<'a>>, block: Block<'a>, active: bool, armed: bool) -> List<'a> {
     List::new(items)
         .block(block)
         .highlight_symbol(if active { "▸ " } else { "  " })
         .highlight_spacing(HighlightSpacing::Always)
         .highlight_style(if active {
-            theme::cursor_active()
+            theme::cursor_active(armed)
         } else {
             theme::cursor_idle()
         })
@@ -648,6 +658,21 @@ fn render_banded_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bo
     let mut bands: Vec<Readiness> = Vec::with_capacity(app.order.len() + 6);
     let mut selected = None;
     let mut prev_band: Option<Readiness> = None;
+    // B0a: when the NEEDS-YOU band is empty, keep a standing "✓ caught up" header rather
+    // than let the section silently vanish — clearing your last alert should read as
+    // "you're clear", not "did it lose my agent?". NEEDS-YOU is the highest band (the
+    // `Readiness` `Ord`), so it sits at the very top, ahead of the loop's bands. Stateless,
+    // like the rest of this renderer (a pure function of the current `order`). Limited to
+    // the one attention band you *must* act on — an empty IDLE/READY/BLOCKED/DONE is not an
+    // achievement, so it gets no "caught up". (We're past the whole-list-empty branch, so
+    // there is always at least one real band below this.)
+    if !app.order.iter().any(|k| app.readiness(k) == Readiness::NeedsYou) {
+        items.push(band_divider(Readiness::NeedsYou, rule_width, dispatch));
+        bands.push(Readiness::NeedsYou);
+        items.push(caught_up_item());
+        bands.push(Readiness::NeedsYou);
+        prev_band = Some(Readiness::NeedsYou);
+    }
     for key in &app.order {
         let band = app.readiness(key);
         if prev_band != Some(band) {
@@ -693,7 +718,7 @@ fn render_banded_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bo
     }
     *app.banded_list_state.offset_mut() = off;
     // The list draws without its own block (we already painted it above).
-    let list = list_widget(items, Block::default(), focused);
+    let list = list_widget(items, Block::default(), focused, app.prefix_armed);
     app.banded_list_state.select(selected);
     frame.render_stateful_widget(list, list_area, &mut app.banded_list_state);
     // Sticky header: the band of the (non-divider) topmost row the list settled on.
@@ -733,6 +758,18 @@ fn band_header(band: Readiness) -> (&'static str, &'static str, Color) {
 /// row. The READY header gets a right-aligned `dispatch` hint; DONE dims.
 fn band_divider<'a>(band: Readiness, rule_width: u16, dispatch: bool) -> ListItem<'a> {
     ListItem::new(band_divider_line(band, rule_width, dispatch))
+}
+
+/// The "✓ caught up" placeholder row for an emptied attention band (B0a). Render-only
+/// and non-selectable (it carries no `order` key, so `selected` never points at it),
+/// styled like the deps empty-state — muted italic. The leading highlight gutter is
+/// supplied by the list's `HighlightSpacing::Always`, so it lines up under the band
+/// header exactly like a real issue row.
+fn caught_up_item<'a>() -> ListItem<'a> {
+    ListItem::new(Line::from(Span::styled(
+        "✓ caught up",
+        Style::new().fg(MUTED).italic(),
+    )))
 }
 
 /// The band-header content as a bare `Line` — shared by the in-list dividers and
@@ -785,6 +822,7 @@ fn render_agent_window(
         return;
     }
     let status = display_status(app, issue, app.fleet.get(issue).copied());
+    let copy = app.copy.get(issue).cloned();
     let backend = app.backends.get(issue).map(Arc::clone);
     let exited = backend
         .as_ref()
@@ -797,10 +835,15 @@ fn render_agent_window(
         None => ("○", Style::new().fg(hue)),
     };
     let key = app.graph.get(issue).map_or(issue, |i| i.key.as_str());
+    // While command mode is armed the whole focused frame is one amber wash; an
+    // EXITED agent's status hue is *also* amber, so on the focused+armed frame the
+    // status label yields to graphite — keeping "EXITED" legible as text without it
+    // reading as a second amber semantic competing with the command-mode border.
+    let label_fg = if focused && app.prefix_armed { MUTED } else { hue };
     let mut title = vec![
         Span::raw(" "),
         Span::styled(mark, mstyle),
-        Span::styled(format!(" {label}  "), Style::new().fg(hue).bold()),
+        Span::styled(format!(" {label}  "), Style::new().fg(label_fg).bold()),
         Span::styled(format!("{key} "), Style::new().fg(INK).bold()),
     ];
     // Name the repos/worktrees this agent owns, right after the issue key (ENG-536).
@@ -817,7 +860,20 @@ fn render_agent_window(
         // app having broken; surface the latched state (and its escape key in the hint).
         title.push(Span::styled("⤢ zoom ", Style::new().fg(VIOLET_200)));
     }
-    let block = window_block(Line::from(title), focused, hue, breathe, app.frame);
+    if copy.is_some() {
+        // Copy-mode latches the pane to scrollback; chip + violet border make it obvious
+        // the keys now scroll/select instead of typing into claude.
+        title.push(Span::styled("⧉ COPY ", Style::new().fg(VIOLET_200).bold()));
+    }
+    let block_hue = if copy.is_some() { VIOLET_400 } else { hue };
+    let block = window_block(
+        Line::from(title),
+        focused,
+        block_hue,
+        breathe,
+        app.frame,
+        app.prefix_armed,
+    );
     let pane = block.inner(rect);
     frame.render_widget(block, rect);
     if pane.area() == 0 {
@@ -879,37 +935,113 @@ fn render_agent_window(
             app.preview_size.insert(id, size);
         }
     }
+    // Copy-mode: paint the scrolled scrollback window with the selection/cursor
+    // highlighted, instead of the live PseudoTerminal. The renderer is the single writer
+    // of the vt100 scroll offset, so it clamps `cm.scroll` to the real history and writes
+    // the clamped value back into App so the key handler stays in range.
+    if let Some(cm) = copy {
+        let clamped = render_copy_pane(frame, pane, &backend, &cm);
+        if clamped != cm.scroll
+            && let Some(c) = app.copy.get_mut(issue)
+        {
+            c.scroll = clamped;
+        }
+        return;
+    }
     if let Ok(parser) = backend.parser().read() {
         let screen = parser.screen();
         let (srows, _scols) = screen.size();
-        if srows > pane.height {
-            // The vt100 grid is taller than the pane — a transient after a layout
-            // change or a resize that returned `Err` (so `preview_size` stayed stale
-            // and the grid is mid-reflow) for a LIVE agent. tui-term paints top-left
-            // with no offset, so a naive paint would clip the BOTTOM rows — exactly
-            // where `claude` draws its input box. Bottom-align instead: render the full
-            // grid to a scratch buffer and blit only its bottom `pane.height` rows, so
-            // the input row (always last) always survives (A3). For a live agent this
-            // self-corrects next frame once the resize takes; for an *exited* agent the
-            // resize above is skipped (`!exited`), so a dead grid that froze taller than
-            // its current pane keeps this (bounded) blit each frame until the card closes.
-            // The scratch is sized to `pane.width`, not the grid's `_scols`: a stale/dead
-            // grid of a different width crops or blanks its right edge here exactly as the
-            // top-left `else` paint would — deliberately matching that horizontal behavior.
+        // Bottom-anchor the grid's visible window whenever a naive top-left paint could
+        // hide `claude`'s input box. We do this for a TALLER-than-pane grid (the input
+        // would be clipped off the bottom — a transient after a layout change, a resize
+        // that returned `Err` so `preview_size` stayed stale, or an *exited* agent whose
+        // resize is skipped above and whose dead grid froze tall) AND, unconditionally,
+        // for the FOCUSED chat — the one pane taking keystrokes. Anchoring the focused
+        // grid to the pane's bottom edge means its input row is pinned to where the eye
+        // expects it and can never be clipped or left floating, even when the grid is
+        // shorter than the pane (a frozen short EXITED screen, or a grow-then-skipped
+        // resize) where the old top-align stranded the input mid-pane (A3). Unfocused
+        // previews/cards keep top-align unless actually taller, so browsing stays calm
+        // and we don't pay the scratch blit on every non-focused pane.
+        if srows > pane.height || focused {
+            // `visible` is how many grid rows reach the pane; `skip` drops the grid's
+            // TOP rows when it overflows; `pad` blanks the pane's TOP rows when the grid
+            // is shorter — together they keep the grid's bottom row on the pane's bottom
+            // row in every case. The scratch is sized to `pane.width`, not the grid's
+            // `_scols`: a stale/dead grid of a different width crops or blanks its right
+            // edge exactly as a top-left paint would — deliberately matching that.
             let area = Rect::new(0, 0, pane.width, srows);
             let mut scratch = Buffer::empty(area);
             PseudoTerminal::new(screen).render(area, &mut scratch);
-            let skip = srows - pane.height;
+            let visible = srows.min(pane.height);
+            let skip = srows - visible;
+            let pad = pane.height - visible;
+            // A grid shorter than the pane leaves blank rows above it. The taller-grid
+            // path fills every pane cell, but here `pad` rows would otherwise keep stale
+            // content from a previously taller frame (the top-align path Clears via
+            // tui-term; this manual blit must Clear the padding itself).
+            if pad > 0 {
+                frame.render_widget(Clear, Rect::new(pane.x, pane.y, pane.width, pad));
+            }
             let dst = frame.buffer_mut();
-            for y in 0..pane.height {
+            for y in 0..visible {
                 for x in 0..pane.width {
-                    dst[(pane.x + x, pane.y + y)] = scratch[(x, y + skip)].clone();
+                    dst[(pane.x + x, pane.y + pad + y)] = scratch[(x, y + skip)].clone();
                 }
             }
         } else {
             frame.render_widget(PseudoTerminal::new(screen), pane);
         }
     }
+}
+
+/// Paint an agent pane in copy-mode (tmux-style): the scrollback window at `cm.scroll`
+/// as plain text, with the selection band and the line cursor highlighted. Returns the
+/// vt100-*clamped* scroll offset (it caps at the real history length) so the caller can
+/// reconcile it into `App`. The render is the one place that mutates the shared scroll
+/// offset, keeping it deterministic even as the read pump appends output.
+fn render_copy_pane(
+    frame: &mut Frame,
+    pane: Rect,
+    backend: &Arc<dyn AgentBackend>,
+    cm: &CopyMode,
+) -> usize {
+    let parser = backend.parser();
+    let Ok(mut guard) = parser.write() else {
+        return cm.scroll;
+    };
+    guard.screen_mut().set_scrollback(cm.scroll);
+    let clamped = guard.screen().scrollback();
+    let (srows, scols) = guard.screen().size();
+    let rows: Vec<String> = guard.screen().rows(0, scols).collect();
+    drop(guard);
+
+    let last = (srows as usize).saturating_sub(1);
+    let cursor = cm.cursor.min(last);
+    let (lo, hi) = match cm.anchor {
+        Some(a) => (a.min(cursor), a.max(cursor).min(last)),
+        None => (cursor, cursor),
+    };
+    let width = scols as usize;
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(r, text)| {
+            // Pad to the grid width so a highlighted row's background fills the line, not
+            // just the printed text (the common all-ASCII case; wide glyphs just clip).
+            let padded = format!("{text:<width$}");
+            let style = if r == cursor {
+                Style::new().fg(INK).bg(VIOLET_400).bold()
+            } else if r >= lo && r <= hi {
+                Style::new().fg(INK).bg(BORDER)
+            } else {
+                Style::new().fg(INK)
+            };
+            Line::from(Span::styled(padded, style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), pane);
+    clamped
 }
 
 // ── Deps windows (per-issue dependency tree) ────────────────────────────────
@@ -979,7 +1111,7 @@ fn render_deps_window(
     if app.windows.zoomed {
         title.push(Span::styled("⤢ zoom ", Style::new().fg(VIOLET_200)));
     }
-    let block = window_block(Line::from(title), focused, GREEN_500, breathe, app.frame);
+    let block = window_block(Line::from(title), focused, GREEN_500, breathe, app.frame, app.prefix_armed);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     if inner.area() == 0 {
@@ -1096,7 +1228,7 @@ fn render_tree(
         .highlight_symbol(if active { "▸ " } else { "  " })
         .highlight_spacing(HighlightSpacing::Always)
         .highlight_style(if active {
-            theme::cursor_active()
+            theme::cursor_active(app.prefix_armed)
         } else {
             theme::cursor_idle()
         });
@@ -1119,7 +1251,7 @@ fn render_fleet_window(app: &mut App, frame: &mut Frame, rect: Rect, focused: bo
     if app.windows.zoomed {
         title.push(Span::styled("⤢ zoom ", Style::new().fg(VIOLET_200)));
     }
-    let block = window_block(Line::from(title), focused, GREEN_500, false, app.frame);
+    let block = window_block(Line::from(title), focused, GREEN_500, false, app.frame, app.prefix_armed);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     if inner.area() == 0 {
@@ -1165,7 +1297,7 @@ fn render_fleet_window(app: &mut App, frame: &mut Frame, rect: Rect, focused: bo
                 } else {
                     Style::new().fg(INK)
                 };
-                spans.push(Span::styled(format!("{glyph} "), Style::new().fg(color)));
+                spans.push(Span::styled(cell(glyph, 2), Style::new().fg(color)));
                 spans.push(Span::styled(key.to_string(), key_style));
                 if let Some(status) = display_status(app, key, app.fleet.get(key).copied()) {
                     let (mark, mstyle) = theme::agent_marker(status, app.frame);
@@ -1237,7 +1369,7 @@ fn render_fleet_window(app: &mut App, frame: &mut Frame, rect: Rect, focused: bo
 // ── Detail bar + hints ───────────────────────────────────────────────────────
 
 fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
-    if let Some(msg) = &app.status_msg {
+    if let Some(msg) = app.status_text() {
         let style =
             if app.kill_confirm.is_some() || app.discard_confirm.is_some() || app.quit_confirm {
                 Style::new().fg(RED_400).bold()
@@ -1261,7 +1393,7 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
     let (glyph, color) = theme::status_glyph(issue.status);
     let mut spans = vec![
         Span::raw(" "),
-        Span::styled(format!("{glyph} "), Style::new().fg(color)),
+        Span::styled(cell(glyph, 2), Style::new().fg(color)),
         Span::styled(format!("{} ", issue.key), Style::new().fg(INK).bold()),
         Span::styled(status_label(issue.status), Style::new().fg(color)),
     ];
@@ -1317,7 +1449,7 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
         " y / ⏎ confirm quit · esc cancels".to_string()
     } else if app.prefix_armed {
         format!(
-            " {p} armed: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} layout · {} quit · {p} again → agent · {} for all",
+            " {p} COMMAND — bare keys, stays on: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} layout · {} quit · esc exits · land on a chat to type",
             vk(Action::ContextToggle),
             vk(Action::ZoomToggle),
             vk(Action::PinWindow),
@@ -1325,7 +1457,6 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
             vk(Action::KillWindow),
             vk(Action::LayoutToggle),
             vk(Action::Quit),
-            dk(Action::ToggleHelp),
         )
     } else {
         match app.windows.focused_kind() {
@@ -1351,13 +1482,14 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
                 dk(Action::ToggleHelp),
             ),
             WindowKind::Fleet => format!(
-                " the project map · {p} {} nav · {p} {} close · {} help",
+                " the Fleet (project-wide overview) · {p} {} nav · {p} {} close · {} help",
                 vk(Action::FocusNav),
                 vk(Action::CloseWindow),
                 dk(Action::ToggleHelp),
             ),
             WindowKind::Spine => format!(
-                " ↑↓ move · ⇞⇟ page · ⏎ open agent · {} deps · {} map · {} needs you · {} find · {} summary · {} ledger · {p} {} quit · {} help",
+                " ↑↓ move · ⇞⇟ page · ⏎ open agent · {} chat/deps · {} → deps · {} Fleet · {} needs you · {} find · {} summary · {} ledger · {p} {} quit · {} help",
+                dk(Action::ContextToggle),
                 dk(Action::OpenDeps),
                 dk(Action::OpenFleet),
                 dk(Action::JumpNeedsYou),
@@ -1369,9 +1501,16 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
             ),
         }
     };
+    // While command mode is armed the hint bar itself goes amber + bold, so the
+    // bottom of the screen carries the same "you're in a mode" signal as the
+    // focused border, title chip and selection above it.
+    let text_style = if app.prefix_armed {
+        Style::new().fg(AMBER_400).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(MUTED)
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(text, Style::new().fg(MUTED))))
-            .style(Style::new().bg(WELL)),
+        Paragraph::new(Line::from(Span::styled(text, text_style))).style(Style::new().bg(WELL)),
         area,
     );
 }
@@ -1399,7 +1538,7 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         (
             direct(Action::ContextToggle),
             format!(
-                "flip the current window's face: chat ↔ deps ({} {} in a chat)",
+                "flip the current window's face: chat ↔ deps — the primary gesture ({} {} reaches it from inside a chat)",
                 prefix,
                 app.keymap.verb_key_label(Action::ContextToggle)
             )
@@ -1407,11 +1546,15 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         ),
         (
             direct(Action::OpenDeps),
-            "dive into the current window's deps".into(),
+            format!(
+                "jump straight to deps (always lands there, vs {} which flips)",
+                direct(Action::ContextToggle)
+            )
+            .into(),
         ),
         (
             direct(Action::OpenFleet),
-            "open the project overview (the Fleet)".into(),
+            "open the Fleet — this project's whole-graph overview window".into(),
         ),
         (
             direct(Action::StartSearch),
@@ -1425,7 +1568,7 @@ fn render_help(app: &mut App, frame: &mut Frame) {
             direct(Action::ToggleLedger),
             "agent ledger: this issue's session history (↑↓ scroll · esc / t close)".into(),
         ),
-        (direct(Action::CycleFilter), "cycle the issue filter".into()),
+        (direct(Action::ToggleFilter), "toggle the issue filter (all ⇄ has-deps)".into()),
         (
             direct(Action::JumpNeedsYou),
             format!(
@@ -1453,6 +1596,17 @@ fn render_help(app: &mut App, frame: &mut Frame) {
             "collapse / expand the subtree".into(),
         ),
         (direct(Action::Back), "back to the previous root".into()),
+        (
+            "esc".to_string(),
+            "on deps: back to the previous root · on a chat: goes to the agent — use "
+                .to_string()
+                .into(),
+        ),
+        (
+            verb(Action::FocusNav),
+            "back to the Spine from a chat (esc there types into the agent instead)"
+                .into(),
+        ),
         (format!("— windows ({} prefix) —", prefix), "".into()),
         (
             format!("{} {}", verb(Action::FocusLeft), verb(Action::FocusRight)),
@@ -1461,6 +1615,10 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         (
             format!("{} {}", global(Action::CyclePrev), global(Action::CycleNext)),
             "switch / cycle windows — no prefix, wraps, works inside a chat".into(),
+        ),
+        (
+            global(Action::Redraw),
+            "force a full repaint — clears stray cells from a wide-glyph stagger".into(),
         ),
         (
             verb(Action::FocusNav),
@@ -1493,7 +1651,7 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         ),
         (
             verb(Action::NextAgent),
-            "walk to the next live agent".into(),
+            "next agent — step to this project's next live agent's chat".into(),
         ),
         (
             verb(Action::DispatchReady),
@@ -1522,7 +1680,7 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         ),
         (
             verb(Action::GlobalView),
-            "global all-agents screen (every project)".into(),
+            "all agents (global) — every project's live agents on one screen".into(),
         ),
         (
             verb(Action::OpenInEditor),
@@ -1597,9 +1755,18 @@ fn render_help(app: &mut App, frame: &mut Frame) {
     let inner = base.inner(area);
     let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(inner);
 
-    // Scroll the bindings (not the pinned footer); clamp the offset to the real height
-    // and write it back so an over-scroll leaves no dead presses (H3).
-    let max_scroll = (lines.len() as u16).saturating_sub(body.height);
+    // Scroll the bindings (not the pinned footer); clamp the offset to the real
+    // WRAPPED height — sum each line's char-wrap rows (ceil(width / body_w)) at the
+    // true body width — so a long description that wraps onto extra rows is fully
+    // reachable and never clipped at the right edge. (ratatui's word-wrap counter
+    // `Paragraph::line_count` is feature-gated; this is the same approach the summary
+    // card uses. Char-wrap can undercount word-wrap by a harmless trailing row.)
+    let wrap_w = body.width.max(1) as usize;
+    let wrapped = lines
+        .iter()
+        .map(|l| l.width().max(1).div_ceil(wrap_w))
+        .sum::<usize>() as u16;
+    let max_scroll = wrapped.saturating_sub(body.height);
     app.help_scroll = app.help_scroll.min(max_scroll);
     let scroll = app.help_scroll;
 
@@ -1614,7 +1781,12 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         base.title_bottom(Line::from(Span::styled(hint, Style::new().fg(MUTED))).right_aligned()),
         area,
     );
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        body,
+    );
     frame.render_widget(Paragraph::new(footer_lines), footer);
 }
 
@@ -1761,7 +1933,9 @@ fn ledger_summary_line<'a>(app: &App, issue: &str) -> Line<'a> {
     let prompts: u32 = episodes.iter().map(|e| e.needs_you).sum();
     let when = crate::ledger::ago(now, last.started_at);
     let outcome = if last.is_open() {
-        "running".to_string()
+        // An open episode is a live agent mid-task — the canonical word is "working",
+        // matching the WORKING band/title (theme::window_status_hue), not "running".
+        "working".to_string()
     } else {
         crate::ledger::outcome_label(last.outcome).to_string()
     };
@@ -1820,7 +1994,9 @@ fn render_ledger(app: &mut App, frame: &mut Frame) {
                 (
                     theme::agent_spinner(app.frame),
                     Style::new().fg(ORANGE_400).bold(),
-                    "running…".to_string(),
+                    // Canonical "working" word for a live (open) episode — matches the
+                    // WORKING band/title. Still 8 chars, so the {label:<9} pad holds.
+                    "working…".to_string(),
                 )
             } else {
                 let label = crate::ledger::outcome_label(ep.outcome);
@@ -1971,8 +2147,10 @@ fn issue_line<'a>(
     };
     let mut spans = vec![
         gutter,
-        Span::styled(format!("{glyph} "), Style::new().fg(color)),
-        Span::styled(format!("{pmark} "), Style::new().fg(pcolor)),
+        // Status + priority each occupy a fixed 2-cell field so the KEY/title columns
+        // to their right stay aligned regardless of glyph width-class (EAW audit).
+        Span::styled(cell(glyph, 2), Style::new().fg(color)),
+        Span::styled(cell(pmark, 2), Style::new().fg(pcolor)),
         Span::styled(format!("{:<8} ", issue.key), key_style),
         Span::styled(truncate(&issue.title, MAX_TITLE), title_style),
     ];
@@ -2162,8 +2340,32 @@ fn repo_badge(app: &App, issue: &str) -> Vec<Span<'static>> {
     ]
 }
 
+/// Display columns a string occupies, in the SAME (default / ambiguous=narrow) width
+/// table ratatui and vt100 lay out with — so our measurement never disagrees with the
+/// renderer. The one width authority [`truncate`] and [`cell`] share; keep all
+/// display-width arithmetic going through it so the two can't drift.
+fn disp_w(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Render `glyph` into a FIXED `cells`-wide field, right-padded with spaces, so a
+/// status/priority column can't stagger when its glyphs span width classes. Today's
+/// curated sets are all one cell in the renderer's table, so this is byte-identical to
+/// the old `format!("{glyph} ")` — but it makes the column a hard invariant: a future
+/// glyph that measures wider is clamped to `cells` (saturating) instead of pushing the
+/// rest of the row right. Note the boundary: this aligns to the table ratatui itself
+/// lays out with; a terminal whose own EAW mode disagrees with ratatui can still smear,
+/// which is unfixable without ratatui exposing its width mode.
+fn cell(glyph: &str, cells: usize) -> String {
+    let w = disp_w(glyph).min(cells);
+    let mut s = String::with_capacity(glyph.len() + (cells - w));
+    s.push_str(glyph);
+    s.extend(std::iter::repeat_n(' ', cells - w));
+    s
+}
+
 fn truncate(s: &str, max: usize) -> String {
-    if UnicodeWidthStr::width(s) <= max {
+    if disp_w(s) <= max {
         return s.to_string();
     }
     let budget = max.saturating_sub(1);
@@ -2201,6 +2403,50 @@ mod tests {
     fn truncate_respects_a_width_budget() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 5), "hell…");
+        // An ambiguous-width char (· = 1 in the renderer's default table) is measured
+        // with the same authority cell() uses, so truncate and the column never diverge.
+        assert_eq!(disp_w(&truncate("a·b·c·d", 4)), 4);
+    }
+
+    #[test]
+    fn status_and_priority_cells_are_a_fixed_field_width() {
+        use crate::model::{Priority, Status};
+        // The whole point of the EAW fix: whatever glyph a status/priority maps to, the
+        // rendered field is exactly 2 display columns — so the KEY/title columns to the
+        // right can't stagger row-to-row. This is the invariant a future wide glyph
+        // would otherwise break (and that cell() now clamps).
+        for s in [
+            Status::Triage,
+            Status::Backlog,
+            Status::Unstarted,
+            Status::Started,
+            Status::Completed,
+            Status::Canceled,
+            Status::Duplicate,
+            Status::Unknown,
+        ] {
+            let field = cell(theme::status_glyph(s).0, 2);
+            assert_eq!(disp_w(&field), 2, "status {s:?} field must be 2 cells");
+        }
+        for p in [
+            Priority::None,
+            Priority::Urgent,
+            Priority::High,
+            Priority::Medium,
+            Priority::Low,
+        ] {
+            let field = cell(theme::priority_marker(p).0, 2);
+            assert_eq!(disp_w(&field), 2, "priority {p:?} field must be 2 cells");
+        }
+    }
+
+    #[test]
+    fn cell_clamps_an_over_wide_glyph_to_the_field() {
+        // A glyph wider than the field is clamped (saturating), never pushing the row
+        // right — the safety net for a future glyph that measures > 1 cell.
+        assert_eq!(cell("x", 2), "x ");
+        assert_eq!(disp_w(&cell("漢", 2)), 2); // 漢 is width 2; clamped, not 3
+        assert_eq!(disp_w(&cell("x", 1)), 1);
     }
 
     #[test]
@@ -2352,6 +2598,77 @@ mod tests {
             out.contains("+7"),
             "the hidden-count `+7` must render in a 1-row slot, got {out:?}"
         );
+    }
+
+    #[test]
+    fn empty_needs_you_band_shows_a_caught_up_placeholder() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // B0a: with no agent needing you, the NEEDS-YOU section must not silently vanish —
+        // it shows a standing "✓ caught up" header so clearing your last alert reads as
+        // "you're clear", not "did it lose my agent?".
+        let mut app = crate::App::new(crate::demo::graph());
+        assert!(!app.order.is_empty(), "the demo project has issues");
+        let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        term.draw(|f| {
+            render_banded_spine(&mut app, f, Rect::new(0, 0, 60, 24), true, Block::default());
+        })
+        .unwrap();
+        let out = term.backend().to_string();
+        assert!(out.contains("NEEDS YOU"), "the NEEDS-YOU header shows: {out}");
+        assert!(out.contains("caught up"), "the caught-up placeholder shows: {out}");
+    }
+
+    #[test]
+    fn a_populated_needs_you_band_has_no_caught_up_placeholder() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // The placeholder is for an *empty* attention band only — once a real agent needs
+        // you, the band carries its issue and no "caught up" line appears.
+        let mut app = crate::App::new(crate::demo::graph());
+        let key = app.order[0].clone();
+        app.fleet
+            .insert(key, crate::session::AgentStatus::NeedsYou);
+        let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        term.draw(|f| {
+            render_banded_spine(&mut app, f, Rect::new(0, 0, 60, 24), true, Block::default());
+        })
+        .unwrap();
+        let out = term.backend().to_string();
+        assert!(out.contains("NEEDS YOU"), "the real needy issue shows the header");
+        assert!(
+            !out.contains("caught up"),
+            "no placeholder when the band is populated: {out}"
+        );
+    }
+
+    #[test]
+    fn copy_pane_renders_scrollback_lines_without_panicking() {
+        use crate::app::CopyMode;
+        use crate::backend::fake::FakeBackend;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // Drive a real vt100 parser, then paint it in copy-mode with a selection spanning
+        // several lines — exercises the highlight/padding/clamping path end to end.
+        let fake = FakeBackend::new("ZAP-1");
+        fake.parser()
+            .write()
+            .unwrap()
+            .process(b"alpha\r\nbravo\r\ncharlie\r\n");
+        let backend: Arc<dyn AgentBackend> = fake;
+        let cm = CopyMode {
+            scroll: 0,
+            cursor: 0,
+            anchor: Some(2),
+        };
+        let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        term.draw(|f| {
+            render_copy_pane(f, Rect::new(0, 0, 40, 24), &backend, &cm);
+        })
+        .unwrap();
+        let out = term.backend().to_string();
+        assert!(out.contains("alpha"), "scrollback content renders: {out}");
+        assert!(out.contains("charlie"), "all rows render");
     }
 
     #[test]
