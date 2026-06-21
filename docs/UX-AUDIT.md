@@ -1,179 +1,154 @@
 # lindep — feedback status & work log
 
-> Snapshot: 2026-06-21. Tracks every piece of feedback raised so far, what's
-> **done**, what was **already done** (so you may just need to rebuild), and
-> what's **still open**. Status key: ✅ done this session · 🔁 already in the
-> tree (rebuild to get it) · ⚠️ partial / known bug · ❌ not done · 🔧 in progress.
+> Snapshot: 2026-06-21. Tracks every piece of feedback raised so far — what's
+> **done**, what was **already in the tree**, and what's **still open**. Status
+> key: ✅ done · 🔁 already in the tree (rebuild to get it) · ⚠️ partial · ❌ not done.
+>
+> Latest push: commit `02aeb7f` on `felix/ask-dje77vri0if0-0-ad-hoc-agent` — the
+> UX punch-list campaign in §1. `cargo test` **518 passed, 0 failed**;
+> `cargo clippy --all-targets -- -D warnings` clean.
 
-## 0. Current build health
+## 0. Build health
 
-- `cargo build` — clean.
-- `cargo clippy` — clean (`-D warnings`).
-- `cargo test` — **494 passed, 0 failed**.
+- `cargo build` / `cargo clippy -D warnings` — clean.
+- `cargo test` — **518 passed, 0 failed**.
 
-The current tree is healthy. Several early complaints are *already fixed in this
-code* (see §2), which strongly suggests the `lindep` you were running is an older
-install — **rebuild/reinstall** (`cargo install --path lindep`) to pick them up.
-
----
-
-## 1. Implemented this session ✅
-
-### 1a. Sticky command mode (the `Ctrl-A` prefix)
-The prefix no longer fires one verb and disarms. `Ctrl-A` now **arms a command
-mode that stays on**, so you can fire several window-arrangement verbs with bare
-keys (`Ctrl-A z w w`) without re-prefixing.
-
-- Chains only the window-arrangement verbs that don't then need the pane's own
-  keys: **zoom, close, layout, restart**.
-- **Drops back out** on: a focus move, pin, chat/deps flip, dispatch, launch
-  (these reposition you to act on a pane), `Esc`, a second prefix (still forwards
-  a literal `Ctrl-A`), landing on an **agent chat**, or any non-verb key.
-- A non-verb key **exits *and* still does its thing** (`ExitReprocess`) — no
-  keystroke is ever silently eaten.
-- *Why the split:* lindep's pane navigation (`Enter`, arrows, `h`/`l`/`j`) shares
-  keys with the window verbs, so a mode that kept reinterpreting them would hijack
-  the keys you need next. The full suite caught this (6 deps tests) before it shipped.
-- Code: `app.rs` `on_key` band 1, `on_prefix_key` (returns `CommandStep`),
-  `verb_chains_in_command_mode`, `command_mode_preempted`, `focused_is_chat`.
-- Note: this **re-introduces** command mode, which was deliberately removed in
-  v1.7 (ENG-562) — intentional, documented in code.
-
-### 1b. Command-mode indicator + unified focus colour
-While command mode is armed, the **whole focused surface turns amber** (border,
-`▌` title bar, selected row, nav chip, and the hint footer) so you always know
-you're in it.
-
-- The two on-screen signals are kept **distinct**: **violet = focus** (which pane
-  owns the keyboard), **green = selection** (where the row cursor rests). They
-  coexist on different panes; only the transient command-mode amber overrides them
-  on the one focused surface.
-- *History:* you first asked to unify selection colour with the focus border, then
-  correctly realized that breaks when you focus a pinned agent (the agent's violet
-  border vs the nav's selection) — so that unification was **reverted**. A
-  multi-agent colour audit confirmed the two-signal design and caught one extra
-  collision: a focused+armed window showing an **EXITED** agent painted the status
-  label amber too (two ambers on one frame) — now the label goes graphite while armed.
-- Code: `theme.rs` `focus_accent`/`focus_border_style`/`cursor_active(armed)`;
-  `ui.rs` `window_block`, `spine_title`, `list_widget`, deps highlight, hint bar,
-  EXITED-label fix. Removed the unused `VIOLET_700`.
-
-### 1c. Help `?` overlay wraps
-Long binding descriptions used to clip at the right edge. They now **wrap**, and
-the scroll range is sized to the real wrapped height so nothing is cut off.
-Code: `ui.rs` `render_help`.
-
-**Tests:** +5 new command-mode tests; one stale one-shot test removed; README
-prefix section updated.
+If a complaint below reads ✅/🔁 but you still see it, you're on an old binary —
+**rebuild** (`cargo install --path lindep`).
 
 ---
 
-## 2. Already in the tree 🔁 (rebuild to get these)
+## 1. Latest campaign — UX punch-list + ad-hoc cleanup ✅ (this session, `02aeb7f`)
 
-These were reported as broken but the current code already handles them — likely
-an old binary. Verify after a rebuild.
+The v1.7 UX-audit follow-ups, plus two bugs you reported live (zoom focus, ad-hoc
+rows) and a rendering escape hatch. Designed/verified with a multi-agent
+fan-out + adversarial review; integrated and tested as one batch.
+
+### 1a. Zoom from the nav bar now focuses the pane it enlarges
+Zooming (`Ctrl-A z`) while the Spine was focused painted the agent full-screen
+but left focus on the now-hidden Spine, so `j`/`k`/`⏎` went to an off-screen
+surface. Zoom-in from the Spine now moves focus into the big pane (a Spine-only
+zoom no-ops with a footer instead of blanking). Code: `app.rs` `zoom_toggle`
+(mirrors the existing "landing on the Spine clears zoom" rule). +1 test.
+
+### 1b. `Ctrl-L` forces a full repaint — the stray-cell escape hatch
+"Text left on screen" is a wide-glyph (double-width) **stagger** in a PTY pane:
+ratatui's per-frame diff can't know the terminal desynced, and nothing forced a
+clear. `Ctrl-L` now drops the diff baseline (`terminal.clear()` + repaint) via the
+global-chord band, so it works even inside a focused chat. Code: `keymap.rs`
+`Action::Redraw` + `GLOBAL_DEFAULTS`, `app.rs` `request_redraw`/`take_force_redraw`,
+`main.rs` loop. The deep EAW width audit (root cause) is still open (§4). +1 test.
+
+### 1c. Pin is a real toggle (H2) ✅
+`Ctrl-A p` on a focused **pinned** coin now **unpins** it (symmetric with the
+Spine `p`), keeping the live agent alive and demoting the issue to a follower
+preview. `Ctrl-A w` (close) still dismisses non-pinnable windows (Fleet / ad-hoc).
+Code: `app.rs` `pin_window` tail split. +2 tests.
+
+### 1d. Destructive confirms are principled (H3) ✅ — your call
+Kept the split — kill/discard **confirm**, close/restart/unpin **instant** — and
+documented it as a principle (irreversible/data-losing confirms; recoverable is
+instant), with **no key moves** (your decision). Code comment on `arm_kill`.
+
+### 1e. Kill flips the coin to its deps face — in place (item 10) ✅
+A confirmed kill used to remove a pinned coin's tile entirely. It now flips the
+coin to its **deps face where it sits**, for the transient preview and a pinned
+tile alike — the window never blanks/vanishes mid-kill. Code: `window.rs`
+`flip_issue_to_deps`, `app.rs` `on_kill_confirm_key`. +4 tests.
+
+### 1f. Chat input is always visible (item 3) ✅
+A focused chat's grid is **bottom-anchored** (input row pinned to the pane bottom)
+whether the grid is taller OR shorter than the pane, with a `Clear` on the top
+padding so a shrunk/EXITED grid can't strand the input or ghost old rows. Code:
+`ui.rs` `render_agent_window`. +2 tests.
+
+### 1g. "running" vs "working" unified (item 7) ✅
+`AgentStatus::Running` reads **WORKING** everywhere (bands/titles/footers/ledger),
+and `Spawning` reads one term. Code: `theme.rs`, `ui.rs` `ledger_summary_line` /
+`render_ledger`. +1 test.
+
+### 1h. The M-series + D2 ✅
+- **M1/M4** — stale "agents roster / `r` toggle" and take-over-key comments
+  corrected (`window.rs`, `app.rs`).
+- **M2** — `f` is relabeled a **toggle** (not "cycle") and now **persists across a
+  project switch** (`keymap.rs`/`app.rs`, `Filter::toggle`). +2 tests.
+- **M3/M6** — deps entry is coherent: **`Tab`** is the primary chat↔deps flip
+  (reach it inside a chat with the prefixed form), `d` documented as "always lands
+  on deps". +1 test.
+- **M5** — **Fleet** / **all agents (global)** / **next agent** labels
+  disambiguated (`keymap.rs`, `ui.rs`). +1 test.
+- **D2** — the `Esc` asymmetry (deps = back; chat = forwarded to the agent) is
+  documented, with a clear non-`Esc` "back to Spine" (`Ctrl-A 0`). +3 tests.
+
+### 1i. Ad-hoc (`ask-*`) agents disappear when killed/reaped ✅ — your report
+A free agent (not tied to a Linear issue) is grafted as a synthetic, **edgeless**
+Spine row. Killing it left a dead, **unremovable** row — `AgentReaped` cleaned up
+the fleet/backend but never the graph node. Now the reap removes the node
+(`model.rs` `Graph::remove_issue`, which prunes every reference), closes its
+window, and re-aims the selection — **synthetic ids only**; a real issue's row
+outlives its agent. An adversarial review caught (and we fixed) the single-node
+edge case where emptying the Spine re-seeded a ghost preview; `rebuild_order` now
+clears a dangling root and `reaim_preview` refuses to seed on a missing node.
+Code: `app.rs` `AgentReaped`. +4 tests.
+
+**Skipped:** **H1** (the several launch chords — `Enter` / `Space` / `Ctrl-A
+Enter` / `Ctrl-A Space`). You like the redundancy; left as-is. `Ctrl-A c` stays the
+**repos** picker (the only way to add a second repo to an agent on a single-repo
+project), not a launch alias.
+
+---
+
+## 2. Earlier this session 🔁 (already committed — rebuild to get these)
+
+Committed in `7256c86`, documented in code:
+
+- **Sticky command mode** (`Ctrl-A` arms a mode that chains the window-arrangement
+  verbs — zoom/close/layout/restart — with bare keys; drops back out on a focus
+  move/pin/flip/launch, `Esc`, a second prefix, or landing on a chat). `app.rs`
+  `on_prefix_key` / `verb_chains_in_command_mode`.
+- **Command-mode amber wash + two-signal colours** — armed = the whole focused
+  surface goes amber; at rest **violet = focus**, **green = selection** (kept
+  distinct; the unify-them experiment was reverted because it breaks on a focused
+  pinned agent). `theme.rs` / `ui.rs`.
+- **Help `?` overlay wraps** long descriptions instead of clipping.
+- **Configurable per-project `base_branch`** — a new issue branch forks from a
+  freshly-fetched `origin/<base>` instead of local `HEAD`, with a safe fall-through;
+  set in the wizard or `Ctrl-A o`. `worktree.rs` `resolve_base`.
+
+---
+
+## 3. Already in the tree 🔁 (reported broken, but the current code handles them)
 
 | # | Your report | Reality |
 |---|-------------|---------|
-| 1 | Top band header (ready/blocked/…) not always visible | A 1-row **sticky header** always shows the top band; offset skips the top divider (`ui.rs` `render_banded_spine`). *Only the topmost* header is pinned, not all. |
-| 2 | Pin from navbar should pin the issue's view like the window | `p` (spine) and `Ctrl-A p` (window) are the **same handler**; both graduate the preview coin into a persistent, auto-resuming pinned view (`app.rs` `pin_window`). |
-| 5 | Issue summary header should wrap | Already wraps (`Paragraph … Wrap{trim:false}`, title sized to wrapped height). |
-| 6 | Separator for working/idle bands too | Every populated band gets a divider, symmetrically (`ui.rs` `render_banded_spine`). |
-| 8 | `▶` working/ready share a glyph, differ only by colour | Not a collision: READY = `▸` (violet/ink), WORKING band = `◎` (orange), working agent = animated braille spinner. Different glyphs *and* colours; there's even a regression test. |
-| 9 | `r` flips agent/issue view → worse view | The agents-roster + its `r` toggle were **removed in v1.7**; `r` is only `Ctrl-A r` = restart now. Stale *comments* still reference the old toggle (see §5 M1). |
+| 1 | Top band header not always visible | A 1-row **sticky header** pins the top band (`ui.rs` `render_banded_spine`). |
+| 2 | Pin from navbar should pin the issue's view | `p` (spine) and `Ctrl-A p` (window) share a handler; both graduate the preview into a persistent pinned view (now also a full toggle — see §1c). |
+| 5 | Issue summary header should wrap | Already wraps (title sized to wrapped height). |
+| 6 | Separator for working/idle bands too | Every populated band gets a divider, symmetrically. |
+| 8 | `▶` working/ready share a glyph | Not a collision: READY = `▸`, WORKING band = `◎`, working agent = animated spinner — different glyphs *and* colours, with a regression test. |
+| 9 | `r` flips agent/issue view → worse view | The agents-roster + its `r` toggle were removed in v1.7; `r` is only `Ctrl-A r` = restart (stale comments fixed in §1h M1). |
 
 ---
 
-## 3. Still open from your UX list ❌ / ⚠️
+## 4. Still open
 
 | # | Item | Status | Notes |
 |---|------|--------|-------|
-| 4 | Agent goes idle but doesn't show idle | ❌ | `Running→Idle` happens **only** via Claude's `Stop` hook (`notify.rs`). No quiescence backstop, so a missed/late/dropped hook leaves it stuck on WORKING. **Highest-value small fix:** a timer that demotes to Idle after N seconds of no output + no hook. |
-| 3 | Chat input box ends up "under" / off-screen | ⚠️ | A bottom-align mitigation exists (`ui.rs` ~885-908) but only when grid rows > pane rows; a failed/skipped resize or an EXITED agent's frozen-tall grid can still hide the input row. |
-| 10 | Kill-in-preview should flip the coin, not go to nothing | ⚠️ | Kill destroys the coin + rebuilds the preview; for the *selected* issue it incidentally lands on the deps face (not blank), but a **pinned** coin's tile is removed entirely. Make "flip to deps face on kill" intentional. |
-| 7 | Unify "running" vs "working" | ❌ | One state (`AgentStatus::Running`) shows as **WORKING** in bands/titles but **"running"** in footers/ledger; plus `Spawning` = "STARTING"/"resuming…"/"spawning". Terminology cleanup. |
+| 4 | Agent goes idle but doesn't show idle | ❌ | `Running→Idle` happens only via Claude's `Stop` hook (`notify.rs`). No quiescence backstop, so a missed/late hook leaves it stuck on WORKING. **Highest-value small fix:** a timer demoting to Idle after N s of no output + no hook. |
+| — | **Copy/selection scoped to the focused window** | ❌ (new) | You want a drag-select to grab only the focused pane. Today the app **doesn't capture the mouse** (`ratatui::init` = raw + alt screen + bracketed paste, *not* mouse capture), so your **terminal** selects — and a rectangular drag spans the side-by-side rail/mosaic columns, grabbing every pane. **Now:** zoom the pane (`Ctrl-A z`) so it fills the screen (native selection then covers only it — §1a helps); or use **Alt/Option+drag** (block selection) to isolate one column-pane. **Real fix (copy-mode):** capture the mouse, track a drag scoped to the focused rect, highlight it, write to the clipboard via **OSC 52**. Buildable, but a real feature: while active it disables the terminal's native selection + scrollback (so it'd be a toggle/mode), and the `claude` PTY panes need a mouse-forwarding decision. |
+| — | EAW double-width width audit | ❌ | The root cause behind the §1b stagger — a per-terminal width-accounting pass. `Ctrl-L` is the pragmatic hatch until then. |
+| — | **Vertical pipeline** (auto-run instructions on agent start) | ❌ | Agents launch as a blank interactive `claude` — no prompt/issue text/skill injected. The furthest-from-done piece of the vision. |
+| — | **Horizontal auto-dispatch** | ⚠️ | Manual `Ctrl-A g` batch-to-cap only; no auto-draining background queue. |
+| — | Broader staleness policy | ⚠️ | `base_branch` (§2) covers fork-from-fresh; auto-pull of an *existing* branch + an "N behind" chip remain open. |
 
 ---
 
-## 4. Roadmap reality-check
+## 5. Suggested order of attack
 
-| Area | Status | Notes |
-|------|--------|-------|
-| Current version works (render/build) | ✅ | Builds, clippy, 490 tests green. |
-| Worktree/git model ("main repos + worktrees, original in .lindep?") | ✅ exists | Exactly the 3-layer model: bare **mirror** (`~/.lindep/mirrors/<h>.git`, the "original" you weren't sure about) → **reference clone** (the "main repo", pushes to true remote) → per-issue **worktree**. |
-| Multiple concurrent background agents | ✅ exists | Cap **12** (configurable `[agents] max_concurrent`), workspace-wide, keep running across project switches. |
-| Staleness / pull | ⚠️ | Worktrees no longer *have* to fork from stale local HEAD — a project `base_branch` (§6) forks from a freshly fetched `origin/<base>`. Still no auto-pull of an *existing* branch and no "behind" indicator; that broader policy is open. |
-| **Vertical pipeline** (instructions auto-run on agent start) | ❌ | Agents launch as a **blank interactive `claude`** — **no prompt, no issue text, no skill** injected. The pipeline engine is marked v3/not-built. This is the furthest-from-done piece of your vision. |
-| **Horizontal auto-dispatch** (auto-start agents for READY issues) | ⚠️ | Manual `Ctrl-A g` batch up to the cap only. The auto-draining queue the keymap comment promises **doesn't exist**; no background watcher. |
-
----
-
-## 5. Additional friction found ("multiple things do the same thing") — not yet fixed
-
-Ranked. None of these are fixed yet (command mode touched the *edges* of H1/H2/H3
-but didn't resolve them).
-
-- **H1** — 4–5 chords all launch the selection (`Enter`, `Space`, `Ctrl-A Enter`,
-  `Ctrl-A Space`, and `Ctrl-A c`). High.
-- **H2** — "pin" is split-brained: spine `p` toggles, but you unpin a focused
-  window with `Ctrl-A w` (close), not `Ctrl-A p`. High. *(This is likely why item
-  2 still felt off even though pinning works.)*
-- **H3** — close / kill / discard / restart / unpin: confusable destructive
-  cluster with inconsistent confirms (`w`/`x` adjacent, opposite blast radius;
-  kill/discard confirm, close/restart don't). High.
-- **M1** — stale "agents roster / `r` toggle" doc comments (`window.rs:60`,
-  `app.rs:5`) — ties to item 9. Med.
-- **M2** — `f` filter is a 2-state residual but named "cycle"; resets on project
-  switch. Med.
-- **M3** — `Tab` overloaded (chat eats it → need `Ctrl-A Tab`); flip vs switch-side. Med.
-- **M4** — `Enter` means 3 things (dispatch / re-root / re-root-without-attach in
-  the global view); a comment mislabels the take-over key as `t` (it's the ledger). Med.
-- **M5** — "Fleet" (`g`) vs "global all-agents" (`Ctrl-A a`) vs "next agent"
-  (`Ctrl-A j`): three scopes, names don't disambiguate. Med.
-- **M6** — `d` and `Tab` both reach the deps face via different paths. Med.
-- **D2** — `Esc` opposite on the two faces of one coin (eaten on chat, "back" on deps). Low.
-
----
-
-## 6. Configurable base branch ✅ (done this session)
-
-Per-project `base_branch` on `[[project]]` — the branch a **new** per-issue
-worktree forks from, instead of the hardcoded local `HEAD`. Also closes part of
-the staleness gap (§4): a set base forks from a *freshly fetched* ref.
-
-- **Resolution:** unset = `HEAD` (today's behaviour, no network). Set (e.g.
-  `develop`) = fork from a just-in-time-fetched `origin/develop`, with a safe
-  fall-through `origin/<base>` → `<base>` → `origin/HEAD` → `HEAD` so a typo or a
-  branch missing from a given repo never blocks a launch. The fetch happens lazily
-  inside `resolve_base`, only on the brand-new-branch path and only when a base is
-  set — no network on resumes or for the default.
-- **Scope:** brand-new branches only — resumes/recoveries keep their committed
-  branch; per repo where the branch exists (a multi-repo project's other repos
-  fall through to their own default).
-- **Decisions you made:** unset ⇒ `HEAD` (opt-in, zero change for existing
-  projects); ad-hoc `ask-*` agents honour the base.
-- **Settable** in the setup wizard (new "base branch" step) and `Ctrl-A o`;
-  back-compat is clean (serde default/skip — existing `registry.toml` unchanged).
-- Code: `worktree.rs` (`resolve_base`, `is_valid_base`, create arm 3),
-  `registry.rs` (`ProjectDescriptor`/`ProjectFile`/`ProjectDraft` + loader +
-  `write_binding`), `supervisor.rs` (`RepoProvision.base`), `workspace.rs`
-  (per-project provision, two materialize sites), `onboard.rs` (wizard step),
-  `main.rs`. Verified by a multi-agent audit/design/adversarial pass; +6 tests.
-
----
-
-## 7. Suggested order of attack
-
-1. **Rebuild your install** — clears §2 (items 1, 2, 5, 6, 8, 9), and picks up the
-   command mode, colours, help wrap (§1) and the base branch (§6).
-2. **Idle backstop** (§3 item 4) — small, daily annoyance, self-contained.
-3. **Command-surface cleanup** (§5 H1/H2/H3) — the core "multiple things do the
-   same thing."
-4. **Vertical pipeline MVP** (§4) — even auto-injecting the issue text is a big
-   step; unblocks the rest of your agent-workflow vision.
-5. **Broader staleness policy** (§4) — base branch (§6) covers the fork-from-fresh
-   case; the remaining call is auto-pull of an existing branch vs an "N behind"
-   chip vs leaving it to the agent.
-6. **Horizontal auto-dispatch loop** (§4).
-7. Polish: kill-flips-coin (item 10), chat-input edge cases (item 3),
-   running/working terminology (item 7), stale-doc purge (M1).
+1. **Idle backstop** (§4 item 4) — small, daily annoyance, self-contained.
+2. **Copy-mode** (§4) — if per-window copy matters day-to-day; decide the
+   native-selection trade-off first.
+3. **Vertical pipeline MVP** (§4) — even auto-injecting the issue text unblocks
+   the rest of the agent-workflow vision.
+4. **Broader staleness policy** then the **horizontal auto-dispatch loop** (§4).
+5. EAW width audit (§4) — replace the `Ctrl-L` hatch with a real fix.
