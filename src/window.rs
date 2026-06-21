@@ -1,7 +1,7 @@
 //! The cockpit's window model — the sole owner of every window type.
 //!
 //! Cockpit v3.2 is a tmux-style tiling window manager whose panes ("windows") are
-//! live, focusable columns: the permanent **Spine** (issue list / agents roster),
+//! live, focusable columns: the permanent **Spine** (the issue list),
 //! N **Coin** windows, and the single chatless **Fleet** overview. A *coin* is one
 //! issue with two faces — its live `claude` screen (chat) and its dependency tree
 //! (deps) — flipped by `Tab`; the single *unpinned* coin is the transient preview
@@ -57,8 +57,10 @@ impl CoinMode {
 /// chatless project-overview tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowKind {
-    /// The navigation spine: the issue list or the agents roster (the `r` tab
-    /// toggle lives on it). Permanent — never closed, always window 0.
+    /// The navigation spine: the readiness-banded issue list. Permanent — never
+    /// closed, always window 0. (v1.7/ENG-563 folded the old agents roster into
+    /// the bands and dropped its `r` tab-toggle; `r` is now solely `Ctrl-A r` =
+    /// restart.)
     Spine,
     /// One issue, two faces (`Chat` / `Deps`), flipped by `Tab`. The unpinned coin
     /// is the preview (one, follows the selection); a pinned coin is a docked tab.
@@ -580,6 +582,44 @@ impl WindowSet {
         self.windows[idx].kind = WindowKind::Coin { issue, mode: next };
     }
 
+    /// Force **every** coin for `issue` (the transient preview *and* any pinned
+    /// coin) onto its `Deps` face in place — the kill verb's window teardown
+    /// (ITEM 10). Unlike [`close_issue`] the windows are kept exactly where they
+    /// sit (same `WindowId`, same slot, same focus), so a confirmed kill leaves the
+    /// issue's coin showing its dependency tree rather than blanking/removing it —
+    /// uniform for the preview and a pinned tile alike. A deps cursor is built on
+    /// demand (mirroring [`flip_coin_face`]); a coin already on its deps face is
+    /// left untouched. Returns `(touched_any, flipped_a_pinned)` so the caller can
+    /// re-aim the strip only when nothing matched and re-persist a pinned face flip.
+    pub fn flip_issue_to_deps(&mut self, issue: &str, graph: &Graph) -> (bool, bool) {
+        let mut touched = false;
+        let mut flipped_pinned = false;
+        for idx in 0..self.windows.len() {
+            // Match the coin's *identity* (not a re-rooted deps cursor's root), so a
+            // pinned coin re-rooted elsewhere for exploration isn't dragged onto a
+            // kill that isn't its own (H6/CF-9).
+            let is_target = matches!(
+                &self.windows[idx].kind,
+                WindowKind::Coin { issue: i, mode } if i.as_str() == issue && *mode == CoinMode::Chat
+            );
+            if !is_target {
+                continue;
+            }
+            touched = true;
+            if self.windows[idx].pinned {
+                flipped_pinned = true;
+            }
+            if self.windows[idx].deps.is_none() {
+                self.windows[idx].deps = Some(DepsCursor::new(issue.to_string(), graph));
+            }
+            self.windows[idx].kind = WindowKind::Coin {
+                issue: issue.to_string(),
+                mode: CoinMode::Deps,
+            };
+        }
+        (touched, flipped_pinned)
+    }
+
     /// Pin = **graduate** the focused preview coin into a permanent docked coin. If
     /// a pinned coin of the same identity already exists, the redundant preview is
     /// dropped and that coin focused (a *merge*) — so one issue is never split
@@ -1049,6 +1089,52 @@ mod tests {
             "ZAP-210",
             "the other issue's window stays"
         );
+    }
+
+    #[test]
+    fn flip_issue_to_deps_keeps_a_pinned_coin_in_place_on_its_deps_face() {
+        // ITEM 10: a confirmed kill must leave the issue's coin where it sits,
+        // showing its deps face — not remove it (the pinned-tile-vanishes bug).
+        let graph = demo::graph();
+        let mut ws = WindowSet::new();
+        ws.ensure_preview("ZAP-204", CoinMode::Chat, &graph);
+        ws.focus_preview();
+        ws.pin_preview(); // a pinned CHAT coin for ZAP-204
+        let id = ws.pinned_coin_index("ZAP-204").map(|i| ws.windows[i].id);
+        let len_before = ws.windows.len();
+
+        let (touched, flipped_pinned) = ws.flip_issue_to_deps("ZAP-204", &graph);
+        assert!(touched, "the issue's coin was flipped");
+        assert!(flipped_pinned, "the flipped coin was a docked (pinned) one");
+        assert_eq!(ws.windows.len(), len_before, "the window stays — nothing removed");
+        let idx = ws
+            .pinned_coin_index("ZAP-204")
+            .expect("the pinned coin is still present");
+        assert_eq!(
+            ws.windows[idx].kind,
+            WindowKind::Coin { issue: "ZAP-204".into(), mode: CoinMode::Deps },
+            "the pinned coin now shows its deps face",
+        );
+        assert_eq!(
+            Some(ws.windows[idx].id),
+            id,
+            "the coin keeps its WindowId (same slot, geometry, deps cursor)",
+        );
+        assert!(ws.windows[idx].deps.is_some(), "the deps cursor was built on the flip");
+    }
+
+    #[test]
+    fn flip_issue_to_deps_is_a_noop_for_a_coin_already_on_deps_or_a_different_issue() {
+        let graph = demo::graph();
+        let mut ws = WindowSet::new();
+        // A preview already on its deps face for ZAP-204.
+        ws.ensure_preview("ZAP-204", CoinMode::Deps, &graph);
+        let (touched_other, _) = ws.flip_issue_to_deps("ZAP-210", &graph);
+        assert!(!touched_other, "a different issue's kill touches nothing");
+        let (touched_self, flipped_pinned) = ws.flip_issue_to_deps("ZAP-204", &graph);
+        assert!(!touched_self, "a coin already on deps is left untouched (chat-face match)");
+        assert!(!flipped_pinned);
+        assert_eq!(ws.preview().map(|(_, m)| m), Some(CoinMode::Deps));
     }
 
     #[test]

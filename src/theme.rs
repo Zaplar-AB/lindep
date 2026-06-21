@@ -87,7 +87,10 @@ pub fn focus_accent(armed: bool) -> Color {
 /// has arrived. needs-you *breathes* via [`needs_you_style`] at the call site.
 pub fn window_status_hue(status: Option<AgentStatus>, exited: bool) -> (Color, &'static str) {
     match status {
-        Some(AgentStatus::Spawning) => (GREEN_400, "STARTING"),
+        // Spawning shares the WORKING word with Running — both are the Working
+        // readiness band; the steady ◌ marker (vs Running's spinner) carries the
+        // "just starting" nuance non-verbally, so the title word stays unified.
+        Some(AgentStatus::Spawning) => (GREEN_400, "WORKING"),
         Some(AgentStatus::Running) => (ORANGE_400, "WORKING"),
         Some(AgentStatus::NeedsYou) => (RED_400, "NEEDS YOU"),
         Some(AgentStatus::Idle) => (STATUS_400, "IDLE"),
@@ -269,6 +272,44 @@ mod tests {
             glyphs.len(),
             ALL.len(),
             "two states share a marker glyph: {glyphs:?}"
+        );
+    }
+
+    #[test]
+    fn the_working_set_shares_one_user_facing_label() {
+        // ITEM 7: Spawning and Running are both the Working readiness band
+        // (AgentStatus::is_working), so their per-status window-title label must be the
+        // SAME word — a freshly-spawned agent must not read as "STARTING" in the title
+        // while the band it sits in says "WORKING". The marker glyph (◌ vs spinner)
+        // carries the start/active nuance non-verbally; the word stays unified.
+        let spawning = window_status_hue(Some(AgentStatus::Spawning), false).1;
+        let running = window_status_hue(Some(AgentStatus::Running), false).1;
+        assert_eq!(running, "WORKING", "Running renders as the canonical WORKING");
+        assert_eq!(
+            spawning, running,
+            "a spawning agent must share Running's WORKING label, not a second word"
+        );
+    }
+
+    #[test]
+    fn every_agent_status_has_exactly_one_title_label() {
+        // A status maps to exactly one user-facing title word — guard against a future
+        // edit re-introducing a per-call-site synonym (the running/working split this
+        // item closed). Each of the seven states yields a single non-empty label.
+        for s in ALL {
+            let label = window_status_hue(Some(s), false).1;
+            assert!(!label.is_empty(), "{s:?} must carry a title label");
+        }
+        // The two working-set states collapse to one word; the five others are theirs
+        // alone — so the distinct-label count over the 7 states is exactly 6.
+        let labels: HashSet<&str> = ALL
+            .iter()
+            .map(|s| window_status_hue(Some(*s), false).1)
+            .collect();
+        assert_eq!(
+            labels.len(),
+            6,
+            "Spawning+Running share WORKING; the other five are distinct: {labels:?}"
         );
     }
 

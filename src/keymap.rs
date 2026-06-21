@@ -49,8 +49,11 @@ pub enum Action {
     PageDown,
     /// In a Deps window, flip the active tree (upstream ↔ downstream).
     SwitchSide,
-    /// Flip the context (active) window between chat and deps. Bare `Tab` when
-    /// the Spine or a Deps pane is focused; `Ctrl-a Tab` from inside a chat.
+    /// The **primary** chat⇄deps gesture: flip the context (active) window
+    /// between its chat and deps faces. Bare `Tab` when the Spine or a Deps pane
+    /// is focused; `Ctrl-a Tab` from inside a chat (where a bare Tab is the
+    /// agent's). This is the one obvious gesture for the chat/deps relationship —
+    /// [`OpenDeps`] (`d`) is the deterministic "always land on deps" shortcut.
     ContextToggle,
     /// Spine: the attach/spawn button. Deps: re-root onto the selected node.
     Enter,
@@ -58,16 +61,22 @@ pub enum Action {
     ToggleCollapse,
     /// Deps: pop the re-root history.
     Back,
-    /// Spine: open (or re-root) a per-issue dependency window for the selection.
+    /// Spine: open (or re-root) a per-issue dependency window for the selection —
+    /// the deterministic "→ deps" shortcut that always lands on the deps face,
+    /// unlike [`ContextToggle`] (`Tab`), which flips chat⇄deps. An alternate to
+    /// the primary Tab gesture, kept because jumping straight to deps without
+    /// guessing the current face is a common Spine reflex.
     OpenDeps,
-    /// Spine: open (or focus) the project-wide Fleet overview window.
+    /// Spine: open (or focus) the **Fleet** — this project's whole-graph overview
+    /// window. Single-project scope (cf. `GlobalView` = all agents (global); `NextAgent`
+    /// = next agent).
     OpenFleet,
     /// Spine: jump through issues that sit on a dependency cycle.
     JumpCycle,
     /// Jump to the next agent that needs you.
     JumpNeedsYou,
-    /// Spine: cycle the issue filter.
-    CycleFilter,
+    /// Spine: toggle the issue filter (a 2-state flip: all ⇄ has-deps).
+    ToggleFilter,
     /// Fuzzy-find issues (Spine list).
     StartSearch,
     ToggleHelp,
@@ -88,6 +97,12 @@ pub enum Action {
     /// Move focus one window back, wrapping past the Spine to the last window
     /// (`Alt-←`). The mirror of [`CycleNext`].
     CyclePrev,
+    /// Force a full repaint: clear the screen and redraw every cell (`Ctrl-L` by
+    /// default). The escape hatch for a stray cell left behind by a wide-glyph
+    /// (double-width) stagger in an agent's PTY pane — ratatui's per-frame diff
+    /// can't know the terminal desynced, so this drops the diff baseline. Global
+    /// (above PTY forwarding), so it works from inside a focused chat too.
+    Redraw,
 
     // ── Prefix verbs (any focus, behind the prefix) ───────────────────────
     FocusLeft,
@@ -125,9 +140,10 @@ pub enum Action {
     /// then remove its per-issue worktrees (keeping branches), reclaiming the
     /// checkout disk (v1.6, `Ctrl-a d`). Gated on the agent not being live.
     DiscardWorkspace,
-    /// Open the global all-agents screen — every live agent across the whole
-    /// workspace as `project · ISSUE · status`, reachable from any graph (v1.6,
-    /// `Ctrl-a a`). Enter on a row re-roots onto it (switching projects if needed).
+    /// Open **all agents (global)** — the cross-project screen listing every live
+    /// agent across the whole workspace as `project · ISSUE · status`, reachable from
+    /// any graph (v1.6, `Ctrl-a a`). Enter on a row re-roots onto it (switching
+    /// projects if needed). Distinct from `OpenFleet` (this project's Fleet window).
     GlobalView,
     /// Re-open the onboarding wizard for the active project to edit its repo binding /
     /// scratch datastores (v1.6, `Ctrl-a o`). Writes `~/.lindep/registry.toml`; the
@@ -136,8 +152,9 @@ pub enum Action {
     /// Restart the on-screen issue's agent in one press — reclaim a dead backend and
     /// relaunch, collapsing the kill→reselect→Enter ritual (CF-14).
     RestartAgent,
-    /// Walk to the next live agent (any state), focusing its chat — "how are my agents
-    /// doing" without hunting the Spine (CF-14).
+    /// **next agent** — walk to this project's next live agent (any state), focusing
+    /// its chat: "how are my agents doing" without hunting the Spine (CF-14). A
+    /// per-project step, not a screen (cf. `GlobalView` = all agents (global)).
     NextAgent,
     /// Launch every READY issue up to the concurrency cap in one press; the rest queue
     /// and auto-launch as agents finish (CF-14).
@@ -178,7 +195,7 @@ const DIRECT_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::OpenFleet, "fleet", &["g"]),
     (Action::JumpCycle, "jump-cycle", &["c"]),
     (Action::JumpNeedsYou, "jump-needs-you", &["n"]),
-    (Action::CycleFilter, "filter", &["f"]),
+    (Action::ToggleFilter, "filter", &["f"]),
     (Action::StartSearch, "search", &["/"]),
     (Action::ToggleHelp, "help", &["?"]),
     (Action::ToggleSummary, "summary", &["i"]),
@@ -231,7 +248,8 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::AskAgent, "ask", &["?"]),
 ];
 
-/// `(action, config name, default keys)` for the **global** window-switch chords,
+/// `(action, config name, default keys)` for the **global** chords (window-switch
+/// and the full-repaint redraw),
 /// reached from any focus *without* the prefix — they're checked above PTY
 /// forwarding, so they fire even inside a focused chat (the only other keys that
 /// do are the prefix itself). Kept to Alt-arrows by default: claude uses Ctrl-arrow
@@ -240,6 +258,9 @@ const VERB_DEFAULTS: &[(Action, &str, &[&str])] = &[
 const GLOBAL_DEFAULTS: &[(Action, &str, &[&str])] = &[
     (Action::CycleNext, "cycle-next", &["alt-right"]),
     (Action::CyclePrev, "cycle-prev", &["alt-left"]),
+    // Ctrl-L is the universal "redraw" chord; claude doesn't use it for prompt
+    // editing, so stealing it from the PTY costs nothing (as with the Alt-arrows).
+    (Action::Redraw, "redraw", &["ctrl-l"]),
 ];
 
 /// The default prefix chord — tmux's `Ctrl-A`, which never collides with
@@ -847,6 +868,46 @@ mod tests {
     }
 
     #[test]
+    fn deps_face_reach_is_coherent_tab_primary_d_alternate() {
+        // M3 + M6: the deps face has one PRIMARY gesture (Tab → ContextToggle),
+        // reachable from inside a chat via the prefix (Ctrl-a Tab), and `d` is a
+        // distinct, deterministic "→ deps" alternate — NOT a second face-toggle and
+        // NOT shadowing the prefixed discard (Ctrl-a d). Pin all four so a future
+        // rebind can't quietly recreate the "two mystery paths" overload.
+        let km = Keymap::default();
+        // Primary: bare Tab and Ctrl-a Tab both reach the SAME context-flip action.
+        assert_eq!(
+            km.action_for(ev(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Action::ContextToggle),
+            "bare Tab is the primary chat/deps flip (Spine / deps focus)"
+        );
+        assert_eq!(
+            km.verb_for(ev(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Action::ContextToggle),
+            "Ctrl-a Tab is the same flip — the reach from inside a chat"
+        );
+        // Alternate: direct `d` jumps to deps; it is its own action, not a flip.
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Some(Action::OpenDeps),
+            "d is the deterministic deps alternate, distinct from the Tab flip"
+        );
+        // The two reaches stay distinct actions (one flips, one always lands on deps).
+        assert_ne!(
+            km.action_for(ev(KeyCode::Char('d'), KeyModifiers::NONE)),
+            km.action_for(ev(KeyCode::Tab, KeyModifiers::NONE)),
+            "d and Tab are deliberately different actions, not one overloaded gesture"
+        );
+        // The direct `d` (deps) must not be confused with the prefixed `d` (discard):
+        // overloading across tables is fine, but they resolve to different actions.
+        assert_eq!(
+            km.verb_for(ev(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Some(Action::DiscardWorkspace),
+            "Ctrl-a d stays discard — the direct d (deps) doesn't bleed into the verb table"
+        );
+    }
+
+    #[test]
     fn pin_is_direct_and_prefixed() {
         let km = Keymap::default();
         assert_eq!(
@@ -870,6 +931,19 @@ mod tests {
             km.action_for(ev(KeyCode::Char('?'), KeyModifiers::NONE)),
             Some(Action::ToggleHelp)
         );
+    }
+
+    #[test]
+    fn the_filter_key_is_a_toggle_action() {
+        // M2: `f` is a direct 2-state toggle — the renamed action makes the verb's
+        // name (`ToggleFilter`) match its behaviour. The config name stays `filter`.
+        let km = Keymap::default();
+        assert_eq!(
+            km.action_for(ev(KeyCode::Char('f'), KeyModifiers::NONE)),
+            Some(Action::ToggleFilter)
+        );
+        // It is direct-only (a spine-list op), never a prefix verb.
+        assert_eq!(km.verb_for(ev(KeyCode::Char('f'), KeyModifiers::NONE)), None);
     }
 
     #[test]
@@ -1045,7 +1119,7 @@ mod tests {
         // 'f' rather than being left unbound.
         assert_eq!(
             km.action_for(ev(KeyCode::Char('f'), KeyModifiers::NONE)),
-            Some(Action::CycleFilter)
+            Some(Action::ToggleFilter)
         );
     }
 

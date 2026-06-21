@@ -897,28 +897,42 @@ fn render_agent_window(
     if let Ok(parser) = backend.parser().read() {
         let screen = parser.screen();
         let (srows, _scols) = screen.size();
-        if srows > pane.height {
-            // The vt100 grid is taller than the pane — a transient after a layout
-            // change or a resize that returned `Err` (so `preview_size` stayed stale
-            // and the grid is mid-reflow) for a LIVE agent. tui-term paints top-left
-            // with no offset, so a naive paint would clip the BOTTOM rows — exactly
-            // where `claude` draws its input box. Bottom-align instead: render the full
-            // grid to a scratch buffer and blit only its bottom `pane.height` rows, so
-            // the input row (always last) always survives (A3). For a live agent this
-            // self-corrects next frame once the resize takes; for an *exited* agent the
-            // resize above is skipped (`!exited`), so a dead grid that froze taller than
-            // its current pane keeps this (bounded) blit each frame until the card closes.
-            // The scratch is sized to `pane.width`, not the grid's `_scols`: a stale/dead
-            // grid of a different width crops or blanks its right edge here exactly as the
-            // top-left `else` paint would — deliberately matching that horizontal behavior.
+        // Bottom-anchor the grid's visible window whenever a naive top-left paint could
+        // hide `claude`'s input box. We do this for a TALLER-than-pane grid (the input
+        // would be clipped off the bottom — a transient after a layout change, a resize
+        // that returned `Err` so `preview_size` stayed stale, or an *exited* agent whose
+        // resize is skipped above and whose dead grid froze tall) AND, unconditionally,
+        // for the FOCUSED chat — the one pane taking keystrokes. Anchoring the focused
+        // grid to the pane's bottom edge means its input row is pinned to where the eye
+        // expects it and can never be clipped or left floating, even when the grid is
+        // shorter than the pane (a frozen short EXITED screen, or a grow-then-skipped
+        // resize) where the old top-align stranded the input mid-pane (A3). Unfocused
+        // previews/cards keep top-align unless actually taller, so browsing stays calm
+        // and we don't pay the scratch blit on every non-focused pane.
+        if srows > pane.height || focused {
+            // `visible` is how many grid rows reach the pane; `skip` drops the grid's
+            // TOP rows when it overflows; `pad` blanks the pane's TOP rows when the grid
+            // is shorter — together they keep the grid's bottom row on the pane's bottom
+            // row in every case. The scratch is sized to `pane.width`, not the grid's
+            // `_scols`: a stale/dead grid of a different width crops or blanks its right
+            // edge exactly as a top-left paint would — deliberately matching that.
             let area = Rect::new(0, 0, pane.width, srows);
             let mut scratch = Buffer::empty(area);
             PseudoTerminal::new(screen).render(area, &mut scratch);
-            let skip = srows - pane.height;
+            let visible = srows.min(pane.height);
+            let skip = srows - visible;
+            let pad = pane.height - visible;
+            // A grid shorter than the pane leaves blank rows above it. The taller-grid
+            // path fills every pane cell, but here `pad` rows would otherwise keep stale
+            // content from a previously taller frame (the top-align path Clears via
+            // tui-term; this manual blit must Clear the padding itself).
+            if pad > 0 {
+                frame.render_widget(Clear, Rect::new(pane.x, pane.y, pane.width, pad));
+            }
             let dst = frame.buffer_mut();
-            for y in 0..pane.height {
+            for y in 0..visible {
                 for x in 0..pane.width {
-                    dst[(pane.x + x, pane.y + y)] = scratch[(x, y + skip)].clone();
+                    dst[(pane.x + x, pane.y + pad + y)] = scratch[(x, y + skip)].clone();
                 }
             }
         } else {
@@ -1365,13 +1379,14 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
                 dk(Action::ToggleHelp),
             ),
             WindowKind::Fleet => format!(
-                " the project map · {p} {} nav · {p} {} close · {} help",
+                " the Fleet (project-wide overview) · {p} {} nav · {p} {} close · {} help",
                 vk(Action::FocusNav),
                 vk(Action::CloseWindow),
                 dk(Action::ToggleHelp),
             ),
             WindowKind::Spine => format!(
-                " ↑↓ move · ⇞⇟ page · ⏎ open agent · {} deps · {} map · {} needs you · {} find · {} summary · {} ledger · {p} {} quit · {} help",
+                " ↑↓ move · ⇞⇟ page · ⏎ open agent · {} chat/deps · {} → deps · {} Fleet · {} needs you · {} find · {} summary · {} ledger · {p} {} quit · {} help",
+                dk(Action::ContextToggle),
                 dk(Action::OpenDeps),
                 dk(Action::OpenFleet),
                 dk(Action::JumpNeedsYou),
@@ -1420,7 +1435,7 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         (
             direct(Action::ContextToggle),
             format!(
-                "flip the current window's face: chat ↔ deps ({} {} in a chat)",
+                "flip the current window's face: chat ↔ deps — the primary gesture ({} {} reaches it from inside a chat)",
                 prefix,
                 app.keymap.verb_key_label(Action::ContextToggle)
             )
@@ -1428,11 +1443,15 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         ),
         (
             direct(Action::OpenDeps),
-            "dive into the current window's deps".into(),
+            format!(
+                "jump straight to deps (always lands there, vs {} which flips)",
+                direct(Action::ContextToggle)
+            )
+            .into(),
         ),
         (
             direct(Action::OpenFleet),
-            "open the project overview (the Fleet)".into(),
+            "open the Fleet — this project's whole-graph overview window".into(),
         ),
         (
             direct(Action::StartSearch),
@@ -1446,7 +1465,7 @@ fn render_help(app: &mut App, frame: &mut Frame) {
             direct(Action::ToggleLedger),
             "agent ledger: this issue's session history (↑↓ scroll · esc / t close)".into(),
         ),
-        (direct(Action::CycleFilter), "cycle the issue filter".into()),
+        (direct(Action::ToggleFilter), "toggle the issue filter (all ⇄ has-deps)".into()),
         (
             direct(Action::JumpNeedsYou),
             format!(
@@ -1474,6 +1493,17 @@ fn render_help(app: &mut App, frame: &mut Frame) {
             "collapse / expand the subtree".into(),
         ),
         (direct(Action::Back), "back to the previous root".into()),
+        (
+            "esc".to_string(),
+            "on deps: back to the previous root · on a chat: goes to the agent — use "
+                .to_string()
+                .into(),
+        ),
+        (
+            verb(Action::FocusNav),
+            "back to the Spine from a chat (esc there types into the agent instead)"
+                .into(),
+        ),
         (format!("— windows ({} prefix) —", prefix), "".into()),
         (
             format!("{} {}", verb(Action::FocusLeft), verb(Action::FocusRight)),
@@ -1482,6 +1512,10 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         (
             format!("{} {}", global(Action::CyclePrev), global(Action::CycleNext)),
             "switch / cycle windows — no prefix, wraps, works inside a chat".into(),
+        ),
+        (
+            global(Action::Redraw),
+            "force a full repaint — clears stray cells from a wide-glyph stagger".into(),
         ),
         (
             verb(Action::FocusNav),
@@ -1514,7 +1548,7 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         ),
         (
             verb(Action::NextAgent),
-            "walk to the next live agent".into(),
+            "next agent — step to this project's next live agent's chat".into(),
         ),
         (
             verb(Action::DispatchReady),
@@ -1543,7 +1577,7 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         ),
         (
             verb(Action::GlobalView),
-            "global all-agents screen (every project)".into(),
+            "all agents (global) — every project's live agents on one screen".into(),
         ),
         (
             verb(Action::OpenInEditor),
@@ -1796,7 +1830,9 @@ fn ledger_summary_line<'a>(app: &App, issue: &str) -> Line<'a> {
     let prompts: u32 = episodes.iter().map(|e| e.needs_you).sum();
     let when = crate::ledger::ago(now, last.started_at);
     let outcome = if last.is_open() {
-        "running".to_string()
+        // An open episode is a live agent mid-task — the canonical word is "working",
+        // matching the WORKING band/title (theme::window_status_hue), not "running".
+        "working".to_string()
     } else {
         crate::ledger::outcome_label(last.outcome).to_string()
     };
@@ -1855,7 +1891,9 @@ fn render_ledger(app: &mut App, frame: &mut Frame) {
                 (
                     theme::agent_spinner(app.frame),
                     Style::new().fg(ORANGE_400).bold(),
-                    "running…".to_string(),
+                    // Canonical "working" word for a live (open) episode — matches the
+                    // WORKING band/title. Still 8 chars, so the {label:<9} pad holds.
+                    "working…".to_string(),
                 )
             } else {
                 let label = crate::ledger::outcome_label(ep.outcome);

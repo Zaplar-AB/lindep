@@ -148,9 +148,10 @@ twice to send a literal `Ctrl-A` through to the agent).
 | <kbd>Ctrl-A</kbd> <kbd>d</kbd> | Discard a finished issue's workspace (push branches + remove worktrees) |
 | <kbd>Ctrl-A</kbd> <kbd>m</kbd> | Reclaim disk — free unreferenced mirrors |
 | <kbd>Ctrl-A</kbd> <kbd>0</kbd> | Jump focus home to the spine |
+| <kbd>Ctrl-L</kbd> | Force a full repaint — clears any stray cell left by a wide-glyph stagger in an agent pane (works from any focus) |
 | <kbd>Ctrl-A</kbd> <kbd>q</kbd> | Quit the cockpit |
 | <kbd>n</kbd> · <kbd>Ctrl-A</kbd> <kbd>n</kbd> | Jump to the next issue whose agent needs you (works from any focus) |
-| <kbd>f</kbd> | Cycle the issue filter (all / has-deps) |
+| <kbd>f</kbd> | Toggle the issue filter (all / has-deps) |
 | <kbd>p</kbd> | Pin / unpin the selected issue straight from the spine (toggle — no prefix needed) |
 | <kbd>i</kbd> · <kbd>t</kbd> | Summary card · agent run ledger for the selected issue |
 
