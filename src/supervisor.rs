@@ -45,6 +45,9 @@ pub struct RepoProvision {
     pub layout: Layout,
     pub project_handle: String,
     pub branch_prefix: String,
+    /// Git ref a brand-new per-issue branch forks from (`HEAD` unless the project
+    /// set a `base_branch`). Resolved to a fresh `origin/<base>` at create time.
+    pub base: String,
     pub primary: String,
     pub candidates: StdHashMap<String, RepoEntry>,
     /// The project's declared scratch datastores (ENG-561), provisioned per issue at
@@ -1196,6 +1199,7 @@ mod tests {
                 layout: Layout::new(dir),
                 project_handle: "test".to_string(),
                 branch_prefix: "test".to_string(),
+                base: "HEAD".to_string(),
                 primary: "test".to_string(),
                 candidates: StdHashMap::new(),
                 scratch: Vec::new(),

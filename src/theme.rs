@@ -32,6 +32,9 @@ pub const WELL: Color = Color::Rgb(0x14, 0x15, 0x17); // footer well
 //    "working" or "needs-you" — see ORANGE / RED. ───────────────────────────
 pub const AMBER_400: Color = Color::Rgb(0xF0, 0xAD, 0x43);
 pub const AMBER_500: Color = Color::Rgb(0xE1, 0x8C, 0x1B);
+/// Deep amber — the selected-row fill while command mode (the sticky prefix) is
+/// armed; pairs with the amber border so the whole focused surface shifts hue.
+pub const AMBER_900: Color = Color::Rgb(0x45, 0x31, 0x0E);
 
 // ── Orange — an agent actively working ("doing things"). Warm and lively like
 //    the user asked for, but a distinct hue from amber so "needs you" stays the
@@ -60,8 +63,19 @@ pub const VIOLET_200: Color = Color::Rgb(0xC4, 0xB9, 0xFA);
 /// Border style for the focused window — a steady (frame-independent) violet, so
 /// the focus ring never strobes. Pairs with `BorderType::Double` at the call
 /// site; status hue ([`window_status_hue`]) carries the *unfocused* borders.
-pub fn focus_border_style() -> Style {
-    Style::new().fg(VIOLET_400).add_modifier(Modifier::BOLD)
+pub fn focus_border_style(armed: bool) -> Style {
+    Style::new().fg(focus_accent(armed)).add_modifier(Modifier::BOLD)
+}
+
+/// The focus accent: violet at rest, amber while command mode (the sticky prefix)
+/// is armed. Used by the focused border and its title bar leader — and, *only
+/// while armed*, the selected-row fill + nav chip — so the focused surface shifts
+/// to one amber wash the moment you arm a verb, then returns to violet focus +
+/// green selection. Keeping the selection green at rest is deliberate: focus
+/// (which pane owns your keys) and selection (where the row cursor rests) are
+/// distinct signals shown at once on different panes, so they get distinct hues.
+pub fn focus_accent(armed: bool) -> Color {
+    if armed { AMBER_400 } else { VIOLET_400 }
 }
 
 /// Border hue + short label for an *unfocused* window, by its agent status — the
@@ -85,12 +99,14 @@ pub fn window_status_hue(status: Option<AgentStatus>, exited: bool) -> (Color, &
     }
 }
 
-/// Selection style for the pane that currently holds focus — the one moving,
-/// racing-green element on screen.
-pub fn cursor_active() -> Style {
+/// Selection style for the pane that currently holds focus: racing-green at rest
+/// (the GREEN_700 step above the idle GREEN_900), deep amber (AMBER_900) only
+/// while command mode is armed — so the selection keeps its own green hue, clearly
+/// distinct from the violet focus border, except during the transient armed wash.
+pub fn cursor_active(armed: bool) -> Style {
     Style::new()
-        .bg(GREEN_700)
-        .fg(GREEN_100)
+        .bg(if armed { AMBER_900 } else { GREEN_700 })
+        .fg(if armed { INK } else { GREEN_100 })
         .add_modifier(Modifier::BOLD)
 }
 

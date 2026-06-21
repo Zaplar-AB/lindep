@@ -183,6 +183,13 @@ pub struct ProjectDescriptor {
     /// Optional per-project branch namespace; `None` uses the worktree manager's
     /// compiled-in default (the git user name).
     pub branch_prefix: Option<String>,
+    /// Optional per-project base a brand-new per-issue branch forks from. `None`
+    /// keeps the historical behaviour (the clone's local `HEAD`). A name like
+    /// `develop` resolves to a *fresh* `origin/develop` (with fall-through) at
+    /// create time — see `worktree::WorktreeManager::resolve_base`. Applies only to
+    /// brand-new branches and per repo where the branch exists; repos lacking it
+    /// fork from their own default. Resumes/recoveries are unaffected.
+    pub base_branch: Option<String>,
     /// Declared scratch datastores (ENG-561), provisioned per issue at launch and
     /// torn down at discard. Empty for a project with no `[[scratch]]` entries.
     pub scratch: Vec<ScratchSpec>,
@@ -509,6 +516,7 @@ pub struct ProjectDraft {
     pub candidates: Vec<String>,
     pub primary: String,
     pub branch_prefix: Option<String>,
+    pub base_branch: Option<String>,
 }
 
 /// A scratch datastore the wizard will write as a nested `[[project.scratch]]` — the
@@ -625,6 +633,9 @@ pub fn write_binding(
     ptable["primary"] = value(project.primary.clone());
     if let Some(bp) = &project.branch_prefix {
         ptable["branch_prefix"] = value(bp.clone());
+    }
+    if let Some(bb) = &project.base_branch {
+        ptable["base_branch"] = value(bb.clone());
     }
     if !scratch.is_empty() {
         let mut aot = ArrayOfTables::new();
@@ -1013,6 +1024,8 @@ struct ProjectFile {
     primary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branch_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     scratch: Vec<ScratchFile>,
 }
@@ -1134,6 +1147,26 @@ impl ProjectFile {
                     None
                 }
             });
+        // Likewise the base branch is interpolated into `git worktree add`; gate a
+        // hand-edited value the same way and drop an invalid one to `None` (= HEAD)
+        // rather than bricking launches. Existence isn't checked here — `resolve_base`
+        // probes it at create time and falls through if it's absent.
+        let base_branch = self
+            .base_branch
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| {
+                if crate::worktree::is_valid_base(s.trim()) {
+                    Some(s.trim().to_string())
+                } else {
+                    warnings.push(format!(
+                        "registry {}: project `{}` base_branch `{}` is not a valid git ref; using HEAD",
+                        here(),
+                        self.id,
+                        s
+                    ));
+                    None
+                }
+            });
         Some(ProjectDescriptor {
             project_id: self.id,
             handle: self.handle,
@@ -1141,6 +1174,7 @@ impl ProjectFile {
             candidates,
             primary: self.primary,
             branch_prefix,
+            base_branch,
             scratch,
         })
     }
@@ -1642,6 +1676,7 @@ mod tests {
             candidates: vec!["core-pms".into()],
             primary: "core-pms".into(),
             branch_prefix: None,
+            base_branch: None,
         };
         write_binding(&layout, std::slice::from_ref(&repo), &project, &[]).unwrap();
 
@@ -1681,6 +1716,7 @@ mod tests {
             candidates: vec!["api".into(), "web".into()],
             primary: "api".into(),
             branch_prefix: None,
+            base_branch: None,
         };
         write_binding(&layout, &[api, web], &project, &[]).unwrap();
 
@@ -1861,6 +1897,7 @@ mod tests {
             candidates: vec!["core".into()],
             primary: "core".into(),
             branch_prefix: None,
+            base_branch: None,
         };
         assert!(
             write_binding(&layout, std::slice::from_ref(&repo), &project, &[]).unwrap(),
@@ -1892,6 +1929,7 @@ mod tests {
             candidates: vec!["lindep".into()],
             primary: "lindep".into(),
             branch_prefix: Some("felix".into()),
+            base_branch: None,
         };
         write_binding(&layout, &[], &project, &[]).unwrap();
 
@@ -1925,6 +1963,7 @@ mod tests {
             candidates: vec!["core".into()],
             primary: "core".into(),
             branch_prefix: Some("felix".into()),
+            base_branch: None,
         };
         write_binding(&layout, &[], &project, &[]).unwrap();
 
@@ -1960,6 +1999,7 @@ mod tests {
             candidates: vec!["api".into()],
             primary: "api".into(),
             branch_prefix: None,
+            base_branch: None,
         };
         let scratch = ScratchDraft {
             name: "db".into(),

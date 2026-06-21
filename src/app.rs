@@ -150,6 +150,21 @@ pub enum Readiness {
     Done,
 }
 
+/// What happens to the sticky command mode after a key is resolved while armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandStep {
+    /// Stay armed — a chain-friendly window-arrangement verb fired; the next bare
+    /// key is another command.
+    Stay,
+    /// Leave command mode and swallow this key (Esc, a second prefix, a verb that
+    /// repositioned you to act on a pane, or one that opened a capturing surface).
+    Exit,
+    /// Leave command mode *and* re-run this key as a normal keystroke — so a
+    /// navigation/typing key after a chain seamlessly falls out and still does its
+    /// thing, instead of being eaten.
+    ExitReprocess,
+}
+
 pub struct App {
     pub graph: Graph,
     pub order: Vec<String>,
@@ -766,11 +781,22 @@ impl App {
             return;
         }
 
-        // 1. Mid-prefix: the next key is a window-manager verb (or a second
-        //    prefix, forwarded to a focused agent as the literal chord).
+        // 1. Command mode (the sticky prefix): once armed, keys resolve as window
+        //    verbs and we STAY armed so window-arrangement verbs (zoom/close/layout/
+        //    restart) chain without re-pressing the prefix. Anything that repositions
+        //    you to act on a pane (focus moves, pin, flip, dispatch, launch), opens a
+        //    capturing surface, or lands on a chat drops you back out; a plain
+        //    navigation/typing key falls out AND still acts (ExitReprocess), so a key
+        //    is never silently eaten.
         if self.prefix_armed {
-            self.prefix_armed = false;
-            self.on_prefix_key(key);
+            match self.on_prefix_key(key) {
+                CommandStep::Stay => self.prefix_armed = true,
+                CommandStep::Exit => self.prefix_armed = false,
+                CommandStep::ExitReprocess => {
+                    self.prefix_armed = false;
+                    self.on_key(key);
+                }
+            }
             return;
         }
 
@@ -1058,8 +1084,13 @@ impl App {
         }
     }
 
-    /// Resolve a key pressed after the prefix.
-    fn on_prefix_key(&mut self, key: KeyEvent) {
+    /// Resolve a key pressed while in command mode (after the prefix). Returns a
+    /// [`CommandStep`] saying whether to stay armed, exit, or exit-and-reprocess.
+    /// It stays armed only for chain-friendly window-arrangement verbs (zoom, close,
+    /// layout, restart) while focus rests on a non-chat surface; a second prefix,
+    /// Esc, a verb that opened a capturing surface or repositioned you to act on a
+    /// pane all exit; and any non-verb key exits *and* re-runs as a normal keystroke.
+    fn on_prefix_key(&mut self, key: KeyEvent) -> CommandStep {
         // A window verb must never fire *underneath* a still-painted info overlay.
         // The prefix is consumed above the band-5 overlay-dismiss, so without this a
         // `Ctrl-a x`/`Ctrl-a d` armed its red confirm behind a ~40-row help card and
@@ -1072,6 +1103,12 @@ impl App {
         self.show_help = false;
         self.show_summary = false;
         self.show_ledger = false;
+
+        // Esc is the explicit "leave command mode" gesture (after closing any
+        // overlay above) — it fires nothing and simply drops you back out.
+        if key.code == KeyCode::Esc {
+            return CommandStep::Exit;
+        }
 
         // Double-prefix → send the literal prefix chord through to a focused
         // agent (a chosen prefix is never wholly unreachable by the PTY). Covers
@@ -1093,7 +1130,7 @@ impl App {
                     p = self.prefix_label()
                 ));
             }
-            return;
+            return CommandStep::Exit;
         }
         // M6: `Ctrl-a ?` toggles the help overlay from inside a Chat coin (or the
         // Fleet), where the direct `?` is swallowed by the PTY — so someone driving an
@@ -1116,20 +1153,74 @@ impl App {
             if self.show_help {
                 self.help_scroll = 0;
             }
-            return;
+            return CommandStep::Exit;
         }
         let Some(verb) = self.keymap.verb_for(key) else {
-            // M5: acknowledge an unbound prefix key instead of silently eating it and
-            // leaving the next key to land as a raw direct action.
-            self.status_msg = Some(format!(
-                "{} {}: no window command — {} for the list",
-                self.prefix_label(),
-                self.keymap.key_label(key),
-                self.keymap.label_for(Action::ToggleHelp),
-            ));
-            return;
+            // A key with no window verb drops out of command mode AND is re-run as a
+            // normal keystroke — so navigating or typing right after a chain just
+            // works, with nothing silently eaten.
+            return CommandStep::ExitReprocess;
         };
         self.dispatch_verb(verb);
+        // Stay armed only for chain-friendly window-arrangement verbs (zoom, close,
+        // layout, restart) — and only while focus rests on a non-chat surface and
+        // nothing capturing opened. Everything else (focus moves, pin, flip, launch,
+        // the modal/destructive verbs) repositions you to act on a pane, so it ends
+        // command mode and the pane — or the surface it opened — owns the keyboard.
+        let stay = Self::verb_chains_in_command_mode(verb)
+            && !self.command_mode_preempted()
+            && !self.focused_is_chat();
+        if stay {
+            CommandStep::Stay
+        } else {
+            CommandStep::Exit
+        }
+    }
+
+    /// Whether a verb chains in command mode — the window-arrangement verbs you fire
+    /// several of in a row without then interacting with a pane's contents. Verbs
+    /// that move focus/selection or open a face you'd navigate (focus l/h/0, pin,
+    /// context-flip, next-agent, jump) deliberately fall *out* of command mode,
+    /// because lindep's pane navigation (Enter, arrows, h/l, …) overlaps the verb
+    /// keys — staying armed there would hijack the very keys you'd use next.
+    fn verb_chains_in_command_mode(verb: Action) -> bool {
+        matches!(
+            verb,
+            Action::ZoomToggle
+                | Action::CloseWindow
+                | Action::LayoutToggle
+                | Action::RestartAgent
+        )
+    }
+
+    /// True when a modal, overlay, confirmation, or quit is now capturing the
+    /// keyboard — command mode must yield to it rather than swallow its keys.
+    fn command_mode_preempted(&self) -> bool {
+        self.project_switcher.is_some()
+            || self.global_view.is_some()
+            || self.repo_select.is_some()
+            || self.reclaim.is_some()
+            || self.kill_confirm.is_some()
+            || self.discard_confirm.is_some()
+            || self.repo_confirm.is_some()
+            || self.quit_confirm
+            || self.show_help
+            || self.show_summary
+            || self.show_ledger
+            || self.search_active
+            || self.should_quit
+    }
+
+    /// True when the focused window is an agent's live chat — landing here releases
+    /// command mode so the next keys type into the agent instead of firing verbs.
+    fn focused_is_chat(&self) -> bool {
+        matches!(
+            self.windows.focused_kind(),
+            WindowKind::Coin {
+                mode: CoinMode::Chat,
+                ..
+            }
+        )
     }
 
     /// Run a window-manager verb (always reached behind the prefix).
@@ -4705,8 +4796,12 @@ mod tests {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
-    /// Press the prefix (`Ctrl-a`) then `code` — i.e. invoke a window verb.
+    /// Press the prefix (`Ctrl-a`) then `code` — i.e. invoke a single window verb.
+    /// Resets command mode first so each call is an independent prefixed chord; the
+    /// sticky chaining (where one arm fires several bare verbs) is exercised
+    /// directly with `on_key`/`press` in its own tests.
     fn verb(app: &mut App, code: KeyCode) {
+        app.prefix_armed = false;
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         press(app, code);
     }
@@ -6904,13 +6999,83 @@ mod tests {
     }
 
     #[test]
-    fn the_one_shot_prefix_fires_a_single_verb() {
-        // `Ctrl-a l` fires exactly one window verb (focus right). v1.7 (ENG-562)
-        // removed command mode, so the prefix is now purely one-shot.
+    fn the_sticky_prefix_chains_window_verbs() {
+        // Sticky command mode: `Ctrl-a` arms it; a chain-friendly window-arrangement
+        // verb (zoom) fires AND stays armed, so a *bare* verb (no re-press) is still
+        // resolved as a command. The spine is focused (not a chat), so it stays armed.
         let mut app = app();
-        let before = app.windows.focus;
-        verb(&mut app, KeyCode::Char('l'));
-        assert!(app.windows.focus > before, "the one-shot verb fires");
+        verb(&mut app, KeyCode::Char('z')); // Ctrl-a z → ZoomToggle, a chain verb
+        assert!(
+            app.prefix_armed,
+            "a window-arrangement verb keeps command mode armed"
+        );
+        // A bare `z` is still resolved as the verb — keys route to command mode.
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.prefix_armed, "bare verbs chain — command mode persists");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.prefix_armed, "esc ends the chain");
+    }
+
+    #[test]
+    fn focus_and_pin_verbs_release_command_mode_so_the_pane_takes_keys() {
+        // Focus moves and pin reposition you to act on a pane, whose navigation keys
+        // (Enter, arrows, b) overlap the verb keys — so these verbs DROP command mode
+        // rather than hijack the keys you'd press next.
+        let mut app = app();
+        verb(&mut app, KeyCode::Char('l')); // FocusRight
+        assert!(!app.prefix_armed, "a focus move ends command mode");
+        verb(&mut app, KeyCode::Char('p')); // PinWindow
+        assert!(!app.prefix_armed, "pin ends command mode");
+    }
+
+    #[test]
+    fn a_navigation_key_falls_out_of_command_mode_and_still_acts() {
+        // After a chain verb leaves you armed, a plain navigation key must drop
+        // command mode AND still act (ExitReprocess) — never be silently eaten.
+        let mut app = app();
+        press(&mut app, KeyCode::Down); // move the selection down once
+        let moved = app.root.clone();
+        verb(&mut app, KeyCode::Char('z')); // zoom — stays armed
+        assert!(app.prefix_armed);
+        press(&mut app, KeyCode::Up); // a non-verb nav key: exits AND moves back up
+        assert!(!app.prefix_armed, "the nav key dropped command mode");
+        assert_ne!(app.root, moved, "and it still moved the selection (not eaten)");
+    }
+
+    #[test]
+    fn command_mode_exits_on_esc_and_modal_verbs() {
+        // Esc leaves command mode cleanly.
+        let mut a = app();
+        a.prefix_armed = true;
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!a.prefix_armed, "esc exits command mode");
+
+        // A verb that arms a confirmation yields command mode to the modal.
+        let mut c = app();
+        c.fleet.insert("ZAP-210".into(), AgentStatus::Running);
+        c.aim_spine("ZAP-210".into());
+        c.windows.focus = 0;
+        verb(&mut c, KeyCode::Char('x')); // Ctrl-a x → arms a kill confirm
+        assert!(c.kill_confirm.is_some(), "the verb still fired");
+        assert!(!c.prefix_armed, "an armed confirmation preempts command mode");
+    }
+
+    #[test]
+    fn command_mode_releases_while_focused_on_a_chat() {
+        // Even a chain verb must not keep command mode armed while an agent chat is
+        // focused — the next keystrokes belong to claude, not the verb layer.
+        let mut app = app();
+        register(&mut app, "ZAP-204");
+        app.fleet.insert("ZAP-204".into(), AgentStatus::Running);
+        app.aim_spine("ZAP-204".into());
+        press(&mut app, KeyCode::Enter); // open + focus the agent's chat
+        assert!(app.focused_is_chat(), "the agent opens focused on its chat");
+        app.prefix_armed = true; // arrive in command mode with a chat focused
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)); // a chain verb
+        assert!(
+            !app.prefix_armed,
+            "a focused chat releases command mode even after a chain verb"
+        );
     }
 
     #[test]

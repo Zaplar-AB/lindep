@@ -459,12 +459,6 @@ impl Keymap {
         join_labels(&self.globals, action)
     }
 
-    /// Human label for an arbitrary pressed key (e.g. `W`, `↑`, `Ctrl-A`) — used to
-    /// acknowledge an unbound prefix key in the footer (M5).
-    pub fn key_label(&self, key: KeyEvent) -> String {
-        Binding::of(key).label()
-    }
-
     /// Joined labels of the direct keys bound to `action` (for help/hints):
     /// e.g. `↑ / k`. `—` when unbound.
     pub fn label_for(&self, action: Action) -> String {

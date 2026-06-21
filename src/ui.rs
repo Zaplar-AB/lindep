@@ -177,7 +177,7 @@ fn render_global_overlay(
     let list = List::new(items)
         .highlight_symbol("▸ ")
         .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(theme::cursor_active());
+        .highlight_style(theme::cursor_active(false));
     frame.render_stateful_widget(list, body, &mut view.state);
 
     frame.render_widget(
@@ -523,7 +523,7 @@ fn render_card(app: &App, frame: &mut Frame, rect: Rect, idx: usize) {
     if pinned {
         title.push(Span::styled("⊙ ", Style::new().fg(ORANGE_400)));
     }
-    let block = window_block(Line::from(title), false, hue, breathe, app.frame);
+    let block = window_block(Line::from(title), false, hue, breathe, app.frame, false);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     if inner.area() > 0 {
@@ -545,21 +545,22 @@ fn window_block(
     hue: Color,
     breathe: bool,
     frame: u64,
+    armed: bool,
 ) -> Block<'static> {
     let (border_type, border_style) = if focused {
-        (BorderType::Double, theme::focus_border_style())
+        (BorderType::Double, theme::focus_border_style(armed))
     } else if breathe {
         (BorderType::Plain, theme::needs_you_style(frame))
     } else {
         (BorderType::Plain, Style::new().fg(hue))
     };
-    // The focused window gets a bright violet focus bar leading its title, so the
-    // focus is unmistakable even where a double border is subtle.
+    // The focused window gets a bright focus bar leading its title, so the focus is
+    // unmistakable even where a double border is subtle — and it flips to amber the
+    // moment command mode is armed, matching the border and the selection.
     let mut title = title;
     if focused {
-        title
-            .spans
-            .insert(0, Span::styled("▌", Style::new().fg(VIOLET_200)));
+        let bar = if armed { AMBER_400 } else { VIOLET_200 };
+        title.spans.insert(0, Span::styled("▌", Style::new().fg(bar)));
     }
     Block::default()
         .borders(Borders::ALL)
@@ -572,15 +573,24 @@ fn window_block(
 
 /// The Spine's title — the issue list, lit with its count. (v1.7 folded the
 /// agents roster into the readiness bands, so there's no longer an AGENTS tab.)
-fn spine_title(app: &App) -> Line<'static> {
+fn spine_title(app: &App, focused: bool) -> Line<'static> {
+    // The nav header chip: racing-green when the nav owns your keys (matching the
+    // green selection inside it), deep amber while command mode is armed (matching
+    // the amber border wash), and a quiet graphite when focus is elsewhere. Green at
+    // rest, not violet — selection and focus stay distinct signals (see focus_accent).
+    let (bg, fg) = if focused {
+        if app.prefix_armed { (AMBER_900, INK) } else { (GREEN_700, GREEN_100) }
+    } else {
+        (BORDER, INK)
+    };
     Line::from(Span::styled(
         format!(" ISSUES {} ", app.order.len()),
-        Style::new().fg(GREEN_100).bg(GREEN_700).bold(),
+        Style::new().fg(fg).bg(bg).bold(),
     ))
 }
 
 fn render_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bool) {
-    let block = window_block(spine_title(app), focused, BORDER, false, app.frame);
+    let block = window_block(spine_title(app, focused), focused, BORDER, false, app.frame, app.prefix_armed);
 
     // The readiness schedule is the single Spine view: bands + a ready rail.
     // Re-band first if an agent event left the order stale (the schedule orders
@@ -592,13 +602,13 @@ fn render_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bool) {
     render_banded_spine(app, frame, area, focused, block);
 }
 
-fn list_widget<'a>(items: Vec<ListItem<'a>>, block: Block<'a>, active: bool) -> List<'a> {
+fn list_widget<'a>(items: Vec<ListItem<'a>>, block: Block<'a>, active: bool, armed: bool) -> List<'a> {
     List::new(items)
         .block(block)
         .highlight_symbol(if active { "▸ " } else { "  " })
         .highlight_spacing(HighlightSpacing::Always)
         .highlight_style(if active {
-            theme::cursor_active()
+            theme::cursor_active(armed)
         } else {
             theme::cursor_idle()
         })
@@ -693,7 +703,7 @@ fn render_banded_spine(app: &mut App, frame: &mut Frame, area: Rect, focused: bo
     }
     *app.banded_list_state.offset_mut() = off;
     // The list draws without its own block (we already painted it above).
-    let list = list_widget(items, Block::default(), focused);
+    let list = list_widget(items, Block::default(), focused, app.prefix_armed);
     app.banded_list_state.select(selected);
     frame.render_stateful_widget(list, list_area, &mut app.banded_list_state);
     // Sticky header: the band of the (non-divider) topmost row the list settled on.
@@ -797,10 +807,15 @@ fn render_agent_window(
         None => ("○", Style::new().fg(hue)),
     };
     let key = app.graph.get(issue).map_or(issue, |i| i.key.as_str());
+    // While command mode is armed the whole focused frame is one amber wash; an
+    // EXITED agent's status hue is *also* amber, so on the focused+armed frame the
+    // status label yields to graphite — keeping "EXITED" legible as text without it
+    // reading as a second amber semantic competing with the command-mode border.
+    let label_fg = if focused && app.prefix_armed { MUTED } else { hue };
     let mut title = vec![
         Span::raw(" "),
         Span::styled(mark, mstyle),
-        Span::styled(format!(" {label}  "), Style::new().fg(hue).bold()),
+        Span::styled(format!(" {label}  "), Style::new().fg(label_fg).bold()),
         Span::styled(format!("{key} "), Style::new().fg(INK).bold()),
     ];
     // Name the repos/worktrees this agent owns, right after the issue key (ENG-536).
@@ -817,7 +832,7 @@ fn render_agent_window(
         // app having broken; surface the latched state (and its escape key in the hint).
         title.push(Span::styled("⤢ zoom ", Style::new().fg(VIOLET_200)));
     }
-    let block = window_block(Line::from(title), focused, hue, breathe, app.frame);
+    let block = window_block(Line::from(title), focused, hue, breathe, app.frame, app.prefix_armed);
     let pane = block.inner(rect);
     frame.render_widget(block, rect);
     if pane.area() == 0 {
@@ -979,7 +994,7 @@ fn render_deps_window(
     if app.windows.zoomed {
         title.push(Span::styled("⤢ zoom ", Style::new().fg(VIOLET_200)));
     }
-    let block = window_block(Line::from(title), focused, GREEN_500, breathe, app.frame);
+    let block = window_block(Line::from(title), focused, GREEN_500, breathe, app.frame, app.prefix_armed);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     if inner.area() == 0 {
@@ -1096,7 +1111,7 @@ fn render_tree(
         .highlight_symbol(if active { "▸ " } else { "  " })
         .highlight_spacing(HighlightSpacing::Always)
         .highlight_style(if active {
-            theme::cursor_active()
+            theme::cursor_active(app.prefix_armed)
         } else {
             theme::cursor_idle()
         });
@@ -1119,7 +1134,7 @@ fn render_fleet_window(app: &mut App, frame: &mut Frame, rect: Rect, focused: bo
     if app.windows.zoomed {
         title.push(Span::styled("⤢ zoom ", Style::new().fg(VIOLET_200)));
     }
-    let block = window_block(Line::from(title), focused, GREEN_500, false, app.frame);
+    let block = window_block(Line::from(title), focused, GREEN_500, false, app.frame, app.prefix_armed);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     if inner.area() == 0 {
@@ -1317,7 +1332,7 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
         " y / ⏎ confirm quit · esc cancels".to_string()
     } else if app.prefix_armed {
         format!(
-            " {p} armed: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} layout · {} quit · {p} again → agent · {} for all",
+            " {p} COMMAND — bare keys, stays on: ←→ focus · {} chat/deps · {} zoom · {} pin · {} close · {} kill · {} layout · {} quit · esc exits · land on a chat to type",
             vk(Action::ContextToggle),
             vk(Action::ZoomToggle),
             vk(Action::PinWindow),
@@ -1325,7 +1340,6 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
             vk(Action::KillWindow),
             vk(Action::LayoutToggle),
             vk(Action::Quit),
-            dk(Action::ToggleHelp),
         )
     } else {
         match app.windows.focused_kind() {
@@ -1369,9 +1383,16 @@ fn render_hints(app: &App, frame: &mut Frame, area: Rect) {
             ),
         }
     };
+    // While command mode is armed the hint bar itself goes amber + bold, so the
+    // bottom of the screen carries the same "you're in a mode" signal as the
+    // focused border, title chip and selection above it.
+    let text_style = if app.prefix_armed {
+        Style::new().fg(AMBER_400).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(MUTED)
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(text, Style::new().fg(MUTED))))
-            .style(Style::new().bg(WELL)),
+        Paragraph::new(Line::from(Span::styled(text, text_style))).style(Style::new().bg(WELL)),
         area,
     );
 }
@@ -1597,9 +1618,18 @@ fn render_help(app: &mut App, frame: &mut Frame) {
     let inner = base.inner(area);
     let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(inner);
 
-    // Scroll the bindings (not the pinned footer); clamp the offset to the real height
-    // and write it back so an over-scroll leaves no dead presses (H3).
-    let max_scroll = (lines.len() as u16).saturating_sub(body.height);
+    // Scroll the bindings (not the pinned footer); clamp the offset to the real
+    // WRAPPED height — sum each line's char-wrap rows (ceil(width / body_w)) at the
+    // true body width — so a long description that wraps onto extra rows is fully
+    // reachable and never clipped at the right edge. (ratatui's word-wrap counter
+    // `Paragraph::line_count` is feature-gated; this is the same approach the summary
+    // card uses. Char-wrap can undercount word-wrap by a harmless trailing row.)
+    let wrap_w = body.width.max(1) as usize;
+    let wrapped = lines
+        .iter()
+        .map(|l| l.width().max(1).div_ceil(wrap_w))
+        .sum::<usize>() as u16;
+    let max_scroll = wrapped.saturating_sub(body.height);
     app.help_scroll = app.help_scroll.min(max_scroll);
     let scroll = app.help_scroll;
 
@@ -1614,7 +1644,12 @@ fn render_help(app: &mut App, frame: &mut Frame) {
         base.title_bottom(Line::from(Span::styled(hint, Style::new().fg(MUTED))).right_aligned()),
         area,
     );
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        body,
+    );
     frame.render_widget(Paragraph::new(footer_lines), footer);
 }
 

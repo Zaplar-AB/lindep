@@ -714,7 +714,6 @@ fn start_control_plane(
         exe,
         hook_port,
         hook_token,
-        base: "HEAD".to_string(),
         rows,
         cols,
         // Cockpit v3 uncaps docking, but live backends are bounded — default 12,

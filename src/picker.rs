@@ -308,7 +308,7 @@ pub(crate) fn render_overlay(
         let list = List::new(items)
             .highlight_symbol("▸ ")
             .highlight_spacing(HighlightSpacing::Always)
-            .highlight_style(theme::cursor_active());
+            .highlight_style(theme::cursor_active(false));
         frame.render_stateful_widget(list, body, &mut picker.state);
     }
 
@@ -424,7 +424,7 @@ pub(crate) fn render_reclaim_overlay(prompt: &mut ReclaimPrompt, frame: &mut Fra
     let list = List::new(items)
         .highlight_symbol("▸ ")
         .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(theme::cursor_active());
+        .highlight_style(theme::cursor_active(false));
     frame.render_stateful_widget(list, body, &mut prompt.state);
 
     frame.render_widget(
@@ -485,7 +485,7 @@ pub(crate) fn render_repo_overlay(picker: &mut RepoPicker, frame: &mut Frame, fu
         let list = List::new(items)
             .highlight_symbol("▸ ")
             .highlight_spacing(HighlightSpacing::Always)
-            .highlight_style(theme::cursor_active());
+            .highlight_style(theme::cursor_active(false));
         frame.render_stateful_widget(list, body, &mut add.state);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -518,7 +518,7 @@ pub(crate) fn render_repo_overlay(picker: &mut RepoPicker, frame: &mut Frame, fu
     let list = List::new(items)
         .highlight_symbol("▸ ")
         .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(theme::cursor_active());
+        .highlight_style(theme::cursor_active(false));
     frame.render_stateful_widget(list, body, &mut picker.state);
 
     frame.render_widget(
@@ -640,7 +640,7 @@ fn draw(picker: &mut Picker, frame: &mut Frame, needs_you: &std::collections::Ha
         let list = List::new(items)
             .highlight_symbol("▸ ")
             .highlight_spacing(HighlightSpacing::Always)
-            .highlight_style(theme::cursor_active());
+            .highlight_style(theme::cursor_active(false));
         frame.render_stateful_widget(list, project_inner, &mut picker.state);
     }
 
