@@ -105,8 +105,20 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
             .collect();
         let area = frame.area();
         let active = app.active_project.clone();
+        // Snapshot each row's needs-you reason (aligned to view.rows by index) before the
+        // mutable view borrow — so a NeedsYou agent in ANY project shows its ask here too.
+        let reasons: Vec<Option<String>> = app
+            .global_view
+            .as_ref()
+            .map(|v| {
+                v.rows
+                    .iter()
+                    .map(|(pid, issue, _)| app.needs_you_reason(pid, issue).map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
         if let Some(view) = app.global_view.as_mut() {
-            render_global_overlay(view, &names, &active, frame, area);
+            render_global_overlay(view, &names, &active, &reasons, frame, area);
         }
     }
 }
@@ -118,6 +130,7 @@ fn render_global_overlay(
     view: &mut crate::app::GlobalView,
     names: &std::collections::HashMap<String, String>,
     active: &str,
+    reasons: &[Option<String>],
     frame: &mut Frame,
     full: Rect,
 ) {
@@ -149,7 +162,8 @@ fn render_global_overlay(
     let items: Vec<ListItem> = view
         .rows
         .iter()
-        .map(|(pid, issue, status)| {
+        .enumerate()
+        .map(|(i, (pid, issue, status))| {
             let (glyph, gstyle) = theme::agent_marker(*status, 0);
             let name = names.get(pid).cloned().unwrap_or_else(|| pid.clone());
             // Mark rows in the project you're already inside: Enter there is a cheap
@@ -170,6 +184,11 @@ fn render_global_overlay(
             ];
             if here {
                 spans.push(Span::styled("  · here", Style::new().fg(GREEN_400)));
+            }
+            // The cross-project ask: a NeedsYou agent in any project shows what it wants,
+            // so the all-agents screen triages the whole workspace, not just names+status.
+            if let Some(Some(reason)) = reasons.get(i) {
+                spans.push(Span::styled(format!("  · ⚑ {reason}"), Style::new().fg(AMBER_400)));
             }
             ListItem::new(Line::from(spans))
         })
@@ -480,6 +499,13 @@ fn render_card(app: &App, frame: &mut Frame, rect: Rect, idx: usize) {
                 .graph
                 .get(issue)
                 .map_or(issue.as_str(), |i| i.key.as_str());
+            // A carded agent shows only this body line — no live PTY — so when it needs
+            // you, fold the ask onto it ("needs you · approve git push"). In a rail of
+            // many agents this is the only place its question surfaces until you focus it.
+            let body = match (status, app.needs_you_reason(&app.active_project, issue)) {
+                (Some(AgentStatus::NeedsYou), Some(reason)) => format!("{label} · {reason}"),
+                _ => label.to_string(),
+            };
             (
                 vec![
                     Span::raw(" "),
@@ -488,7 +514,7 @@ fn render_card(app: &App, frame: &mut Frame, rect: Rect, idx: usize) {
                 ],
                 hue,
                 status == Some(AgentStatus::NeedsYou),
-                label.to_string(),
+                body,
             )
         }
         WindowKind::Coin {
@@ -1386,7 +1412,10 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
     }
     // Describe the issue the pane shows — a re-rooted deps coin's cursor root included
     // — so the detail bar agrees with the `i` summary and the dispatch/kill verbs (H6).
-    let Some(issue) = app.detail_key().and_then(|k| app.graph.get(k)) else {
+    let Some(key) = app.detail_key() else {
+        return;
+    };
+    let Some(issue) = app.graph.get(key) else {
         return;
     };
     let g = &app.graph;
@@ -1397,6 +1426,16 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled(format!("{} ", issue.key), Style::new().fg(INK).bold()),
         Span::styled(status_label(issue.status), Style::new().fg(color)),
     ];
+    // The detail bar follows the selection and repaints every frame, so this is where a
+    // needs-you ask lives *persistently* — unlike the one-shot footer the next keystroke
+    // wipes. Lead with it (right after status), the most actionable fact about the
+    // selected issue, breathing in the needs-you hue so it reads as "act here".
+    if let Some(reason) = app.needs_you_reason(&app.active_project, key) {
+        spans.push(Span::styled(
+            format!(" · ⚑ {reason}"),
+            theme::needs_you_style(app.frame),
+        ));
+    }
     if let Some(a) = &issue.assignee {
         spans.push(Span::styled(format!(" · @{a}"), Style::new().fg(MUTED)));
     }
@@ -1832,6 +1871,14 @@ fn render_summary(app: &mut App, frame: &mut Frame) {
         meta.push(Span::styled("  · ↺ in cycle", Style::new().fg(AMBER_400)));
     }
     lines.push(Line::from(meta));
+    // The summary is full-width, so it shows the agent's ask in full (the spine row and
+    // detail bar truncate it). Sits right under the issue's identity, above its deps.
+    if let Some(reason) = app.needs_you_reason(&app.active_project, key) {
+        lines.push(Line::from(vec![
+            Span::styled("  ⚑ needs you", theme::needs_you_style(app.frame)),
+            Span::styled(format!(" — {reason}"), Style::new().fg(INK)),
+        ]));
+    }
     lines.push(Line::raw(""));
 
     for (dir, label, empty) in [
@@ -2085,6 +2132,7 @@ fn issue_line<'a>(
     ready_band: bool,
     dispatch: bool,
     selected_here: bool,
+    needs_reason: Option<&str>,
 ) -> Line<'a> {
     let Some(issue) = graph.get(key) else {
         return Line::from(key.to_string());
@@ -2145,6 +2193,19 @@ fn issue_line<'a>(
     } else {
         Style::new().fg(MUTED)
     };
+    // A needs-you row shows the agent's ASK in place of the title: in the NEEDS-YOU
+    // band the actionable question ("approve bash: git push") beats the issue title
+    // you already know, turning the band into a live to-do list you can triage off the
+    // spine without attaching to a PTY. The key (bold, left) still anchors identity and
+    // the full title stays a keystroke away (the `i` summary). Falls back to the title
+    // whenever there's no standing reason, so every other row is untouched.
+    let last = match (agent, needs_reason) {
+        (Some(AgentStatus::NeedsYou), Some(reason)) => Span::styled(
+            truncate(reason, MAX_TITLE),
+            Style::new().fg(AMBER_400).add_modifier(Modifier::ITALIC),
+        ),
+        _ => Span::styled(truncate(&issue.title, MAX_TITLE), title_style),
+    };
     let mut spans = vec![
         gutter,
         // Status + priority each occupy a fixed 2-cell field so the KEY/title columns
@@ -2152,7 +2213,7 @@ fn issue_line<'a>(
         Span::styled(cell(glyph, 2), Style::new().fg(color)),
         Span::styled(cell(pmark, 2), Style::new().fg(pcolor)),
         Span::styled(format!("{:<8} ", issue.key), key_style),
-        Span::styled(truncate(&issue.title, MAX_TITLE), title_style),
+        last,
     ];
     if graph.is_blocked(key) {
         spans.push(Span::styled(" ⊘", Style::new().fg(AMBER_400)));
@@ -2171,6 +2232,11 @@ fn issue_item<'a>(app: &App, key: &str, ready_band: bool, selected_here: bool) -
         .get(key)
         .and_then(|&(kind, until)| (app.frame < until).then_some(kind));
     let status = display_status(app, key, app.fleet.get(key).copied());
+    // Only a genuinely-flagged agent shows its ask; resolve the reason against the
+    // active project (the spine is always the active project's schedule).
+    let needs_reason = (status == Some(AgentStatus::NeedsYou))
+        .then(|| app.needs_you_reason(&app.active_project, key))
+        .flatten();
     let item = ListItem::new(issue_line(
         &app.graph,
         key,
@@ -2180,6 +2246,7 @@ fn issue_item<'a>(app: &App, key: &str, ready_band: bool, selected_here: bool) -
         ready_band,
         app.workspace.is_some(),
         selected_here,
+        needs_reason,
     ));
     // A READY-band row is the dispatch launchpad: no agent row tint — a terminal
     // agent that reverted to Ready must not paint a stale (possibly green)
@@ -2479,6 +2546,51 @@ mod tests {
     }
 
     #[test]
+    fn a_needs_you_row_shows_the_ask_in_place_of_the_title() {
+        // The NEEDS-YOU band is a live to-do list: a flagged row shows what the agent
+        // wants ("approve git push"), not the issue title you already know — so you can
+        // triage off the spine without attaching. A row with no reason keeps its title.
+        use crate::model::{Issue, Priority, Status};
+        let mut g = Graph::new("t");
+        g.add_issue(Issue {
+            key: "A".into(),
+            title: "Tokenizer cache".into(),
+            status: Status::Started,
+            priority: Priority::None,
+            assignee: None,
+            external: false,
+        });
+        g.finalize();
+        let asked = issue_line(
+            &g,
+            "A",
+            Some(AgentStatus::NeedsYou),
+            0,
+            None,
+            false,
+            true,
+            false,
+            Some("approve git push"),
+        );
+        let last = &asked.spans[asked.spans.len() - 1].content;
+        assert_eq!(last, "approve git push", "the ask replaces the title");
+        // Without a reason, the same row falls back to its title.
+        let plain = issue_line(
+            &g,
+            "A",
+            Some(AgentStatus::NeedsYou),
+            0,
+            None,
+            false,
+            true,
+            false,
+            None,
+        );
+        let last = &plain.spans[plain.spans.len() - 1].content;
+        assert_eq!(last, "Tokenizer cache", "no reason → the title still shows");
+    }
+
+    #[test]
     fn ready_band_row_shows_the_rail_not_a_terminal_agent_marker() {
         // Review regression: a terminal (Done) agent reverts its issue to the
         // READY band; the gutter must be the bright ▸ rail, never the agent's ✓
@@ -2495,7 +2607,7 @@ mod tests {
         });
         g.finalize();
         // ready_band = true, not the selected row, with a Done agent present.
-        let line = issue_line(&g, "A", Some(AgentStatus::Done), 0, None, true, true, false);
+        let line = issue_line(&g, "A", Some(AgentStatus::Done), 0, None, true, true, false, None);
         assert_eq!(
             line.spans[0].content, "▸ ",
             "a ready row shows the dispatch rail"
@@ -2507,14 +2619,14 @@ mod tests {
         );
         // On the focused-selected row the list's highlight cursor provides the
         // arrow, so the gutter is blank (no doubled ▸ ▸).
-        let sel = issue_line(&g, "A", Some(AgentStatus::Done), 0, None, true, true, true);
+        let sel = issue_line(&g, "A", Some(AgentStatus::Done), 0, None, true, true, true, None);
         assert_eq!(
             sel.spans[0].content, "  ",
             "selected ready row defers the arrow to the highlight cursor"
         );
         // H6: with no live workspace (read-only demo / degraded) the dispatch rail
         // disappears — Enter can launch nothing, so the lane shows no launchpad arrow.
-        let demo = issue_line(&g, "A", None, 0, None, true, false, false);
+        let demo = issue_line(&g, "A", None, 0, None, true, false, false, None);
         assert_eq!(
             demo.spans[0].content, "  ",
             "no dispatch rail without a workspace"
@@ -2560,6 +2672,7 @@ mod tests {
             true,
             true,
             false,
+            None,
         );
         assert_eq!(line.spans[0].content, "✗ ", "a crashed ready row shows ✗");
         assert_eq!(
@@ -2578,6 +2691,7 @@ mod tests {
             true,
             true,
             true,
+            None,
         );
         assert_eq!(sel.spans[0].content, "✗ ", "selection never hides a crash");
     }
