@@ -96,12 +96,17 @@ pub(crate) struct RepoChoice {
 }
 
 /// The "add another repo" sub-list (CF-20): registered repos the project doesn't yet
-/// list as candidates, with their own cursor. Open from the [`RepoPicker`] with `a`;
-/// picking one appends it to the checklist (checked) so this launch spans it and the
-/// confirm persists it as a new project candidate.
+/// list as candidates, with their own cursor — plus a text field for typing a brand-new
+/// repo (a URL or local path) the registry doesn't know yet, resolved the same way the
+/// onboarding wizard resolves its Repos step. Open from the [`RepoPicker`] with `a`;
+/// picking a row (empty input) or confirming a typed repo appends it to the checklist
+/// (checked) so this launch spans it and the confirm persists it as a project candidate.
 struct AddList {
     rows: Vec<RepoChoice>,
     state: ListState,
+    /// The live text input — a URL/path/handle the human is typing to add a repo the
+    /// project (and possibly the registry) doesn't list. Empty = pick from `rows`.
+    input: String,
 }
 
 /// The repo multi-select modal — a checkbox list over a project's candidate repos
@@ -159,9 +164,11 @@ impl RepoPicker {
     }
 
     /// Open the "add another repo" sub-list over `registered` minus the repos already
-    /// offered here (the project's current candidates). Returns `false` (and opens
-    /// nothing) when there's nothing left to add.
-    pub(crate) fn open_add(&mut self, registered: &[RepoChoice]) -> bool {
+    /// offered here (the project's current candidates). Always opens — even with nothing
+    /// left to pick — because the sub-list also hosts the typed-add field, the only way to
+    /// reach a repo the registry doesn't know yet (CF-20). The empty-pick-list case is a
+    /// valid state (type a URL/path), not a dead end.
+    pub(crate) fn open_add(&mut self, registered: &[RepoChoice]) {
         let here: std::collections::HashSet<&str> =
             self.rows.iter().map(|r| r.handle.as_str()).collect();
         let rows: Vec<RepoChoice> = registered
@@ -169,13 +176,53 @@ impl RepoPicker {
             .filter(|r| !here.contains(r.handle.as_str()))
             .cloned()
             .collect();
-        if rows.is_empty() {
-            return false;
-        }
         let mut state = ListState::default();
-        state.select(Some(0));
-        self.adding = Some(AddList { rows, state });
-        true
+        if !rows.is_empty() {
+            state.select(Some(0));
+        }
+        self.adding = Some(AddList {
+            rows,
+            state,
+            input: String::new(),
+        });
+    }
+
+    /// Push `c` onto the add-list's text input (typing a URL/path/handle). Inert unless
+    /// the add-list is open.
+    pub(crate) fn add_input_push(&mut self, c: char) {
+        if let Some(add) = self.adding.as_mut() {
+            add.input.push(c);
+        }
+    }
+
+    /// Backspace the add-list's text input. Inert unless the add-list is open.
+    pub(crate) fn add_input_pop(&mut self) {
+        if let Some(add) = self.adding.as_mut() {
+            add.input.pop();
+        }
+    }
+
+    /// The add-list's current text input, trimmed — empty when nothing's typed (so the
+    /// caller picks the highlighted row instead) or the add-list is closed.
+    pub(crate) fn add_input(&self) -> &str {
+        self.adding.as_ref().map_or("", |a| a.input.trim())
+    }
+
+    /// Append `choice` to the checklist as a checked, non-primary row and close the
+    /// add-list — the typed-add path's commit, after the caller has resolved and
+    /// registered the repo. Dedups: a handle already on the checklist is just re-checked.
+    pub(crate) fn push_checked_and_close(&mut self, choice: RepoChoice) {
+        self.adding = None;
+        if let Some(i) = self.rows.iter().position(|r| r.handle == choice.handle) {
+            self.checked[i] = true;
+            return;
+        }
+        self.rows.push(RepoChoice {
+            handle: choice.handle,
+            local: choice.local,
+            primary: false,
+        });
+        self.checked.push(true);
     }
 
     /// Commit the add-list cursor: append the chosen repo to the checklist as a
@@ -465,33 +512,79 @@ pub(crate) fn render_repo_overlay(picker: &mut RepoPicker, frame: &mut Frame, fu
 
     let [body, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
 
-    // The "add another repo" sub-list owns the body while it's open (CF-20): a plain
-    // list of registered repos the project doesn't yet list, picked into the checklist.
+    // The "add another repo" sub-list owns the body while it's open (CF-20): a text field
+    // for typing a brand-new repo (URL/path) above a list of registered repos the project
+    // doesn't yet list. Typing targets the field; an empty field picks the highlighted row.
     if let Some(add) = picker.adding.as_mut() {
-        let items: Vec<ListItem> = add
-            .rows
-            .iter()
-            .map(|repo| {
-                let mut spans = vec![
-                    Span::styled("+ ", Style::new().fg(GREEN_400)),
-                    Span::styled(repo.handle.clone(), Style::new().fg(INK)),
-                ];
-                if repo.local {
-                    spans.push(Span::styled("  (local)", Style::new().fg(AMBER_400)));
-                }
-                ListItem::new(Line::from(spans))
-            })
-            .collect();
-        let list = List::new(items)
-            .highlight_symbol("▸ ")
-            .highlight_spacing(HighlightSpacing::Always)
-            .highlight_style(theme::cursor_active(false));
-        frame.render_stateful_widget(list, body, &mut add.state);
+        let [field, list_area] =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(body);
+
+        // The typed-add field: a prompt, the live input, and a cursor bar. A long URL/path
+        // is windowed to its TAIL (a leading "…") so the caret end — what the human is
+        // actively typing, and where the repo name sits — stays on screen instead of
+        // scrolling off the right edge. Char-based so a multi-byte path never splits a char.
+        let budget = usize::from(field.width).saturating_sub(4); // " + " prefix + cursor bar
+        let chars: Vec<char> = add.input.chars().collect();
+        let shown: String = if budget > 1 && chars.len() > budget {
+            std::iter::once('…')
+                .chain(chars[chars.len() - (budget - 1)..].iter().copied())
+                .collect()
+        } else {
+            add.input.clone()
+        };
+        let field_line = Line::from(vec![
+            Span::styled(" + ", Style::new().fg(GREEN_400)),
+            Span::styled(shown, Style::new().fg(INK)),
+            Span::styled("▏", Style::new().fg(GREEN_500)),
+        ]);
+        let field_hint = Line::from(Span::styled(
+            "   type a URL or local path to add a new repo",
+            Style::new().fg(MUTED),
+        ));
+        frame.render_widget(Paragraph::new(vec![field_line, field_hint]), field);
+
+        if add.rows.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "   (no other registered repos — type one above)",
+                    Style::new().fg(MUTED),
+                ))),
+                list_area,
+            );
+        } else {
+            let items: Vec<ListItem> = add
+                .rows
+                .iter()
+                .map(|repo| {
+                    let mut spans = vec![
+                        Span::styled("  ", Style::new()),
+                        Span::styled(repo.handle.clone(), Style::new().fg(INK)),
+                    ];
+                    if repo.local {
+                        spans.push(Span::styled("  (local)", Style::new().fg(AMBER_400)));
+                    }
+                    ListItem::new(Line::from(spans))
+                })
+                .collect();
+            let list = List::new(items)
+                .highlight_symbol("▸ ")
+                .highlight_spacing(HighlightSpacing::Always)
+                .highlight_style(theme::cursor_active(false));
+            frame.render_stateful_widget(list, list_area, &mut add.state);
+        }
+
+        // The hint adapts to what's actually possible: typed text → ⏎ adds it; otherwise an
+        // empty pick-list (every registered repo already listed) → only typing is left, so
+        // don't dangle a "↑↓ pick" that points at nothing; else → pick the highlighted row.
+        let action = if !add.input.trim().is_empty() {
+            " ⏎ add typed repo · esc back"
+        } else if add.rows.is_empty() {
+            " type a URL/path above · esc back"
+        } else {
+            " ↑↓ pick · ⏎ add · esc back"
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                " add a repo to this project · ↑↓ move · ⏎ add · esc back",
-                Style::new().fg(MUTED),
-            ))),
+            Paragraph::new(Line::from(Span::styled(action, Style::new().fg(MUTED)))),
             hint,
         );
         return;
@@ -762,7 +855,7 @@ mod tests {
             RepoChoice { handle: "shared".into(), local: false, primary: false },
             RepoChoice { handle: "scratch".into(), local: true, primary: false },
         ];
-        assert!(p.open_add(&registered), "there are repos to add");
+        p.open_add(&registered);
         assert!(p.is_adding());
         let offered: Vec<&str> = p
             .adding
@@ -782,21 +875,39 @@ mod tests {
     }
 
     #[test]
-    fn open_add_is_false_when_every_registered_repo_is_already_listed() {
+    fn open_add_still_opens_with_an_empty_pick_list_for_the_typed_field() {
+        // CF-20 typed add: even when every registered repo is already a candidate, the
+        // add-list opens — it hosts the text field, the only path to a repo the registry
+        // doesn't know yet. The pick-list is just empty (nothing to highlight).
         let mut p = RepoPicker::new(vec![repo_named("api", true), repo_named("web", false)]);
         let registered = vec![
             RepoChoice { handle: "api".into(), local: false, primary: false },
             RepoChoice { handle: "web".into(), local: false, primary: false },
         ];
-        assert!(!p.open_add(&registered), "nothing left to add");
-        assert!(!p.is_adding(), "so the sub-list never opens");
+        p.open_add(&registered);
+        assert!(p.is_adding(), "opens for the typed field");
+        assert!(
+            p.adding.as_ref().unwrap().rows.is_empty(),
+            "but offers no rows to pick"
+        );
+
+        // Type a URL and it surfaces as the input the caller resolves; committing a
+        // resolved choice appends it checked.
+        for c in "git@github.com:zaplar/new".chars() {
+            p.add_input_push(c);
+        }
+        assert_eq!(p.add_input(), "git@github.com:zaplar/new");
+        p.push_checked_and_close(RepoChoice { handle: "new".into(), local: false, primary: false });
+        assert!(!p.is_adding(), "committing closes the sub-list");
+        assert_eq!(p.selected_handles(), vec!["api", "new"]);
     }
 
     #[test]
     fn cancel_add_adds_nothing() {
         let mut p = RepoPicker::new(vec![repo_named("api", true)]);
         let registered = vec![RepoChoice { handle: "web".into(), local: false, primary: false }];
-        assert!(p.open_add(&registered));
+        p.open_add(&registered);
+        assert!(p.is_adding());
         p.cancel_add();
         assert!(!p.is_adding());
         assert_eq!(p.selected_handles(), vec!["api"], "backing out adds no repo");
@@ -819,6 +930,35 @@ mod tests {
         assert!(out.contains("lindep"));
         assert!(out.contains("(primary)"));
         assert!(out.contains("(local)"), "a local-only repo is tagged");
+    }
+
+    #[test]
+    fn the_add_list_overlay_renders_the_typed_field_and_remaining_repos() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // api is already a candidate; shared/scratch are the addable registered repos.
+        let mut p = RepoPicker::new(vec![repo_named("api", true)]);
+        p.open_add(&[
+            RepoChoice { handle: "api".into(), local: false, primary: false },
+            RepoChoice { handle: "shared".into(), local: false, primary: false },
+        ]);
+        for c in "git@host/new".chars() {
+            p.add_input_push(c);
+        }
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| render_repo_overlay(&mut p, f, f.area()))
+            .unwrap();
+        let out = term.backend().to_string();
+        assert!(out.contains("git@host/new"), "the typed input is shown");
+        assert!(
+            out.contains("add a new repo"),
+            "the typed-add prompt is shown"
+        );
+        assert!(out.contains("shared"), "an addable registered repo is listed");
+        assert!(
+            out.contains("add typed repo"),
+            "with text typed, the hint offers to add it"
+        );
     }
 
     #[test]
