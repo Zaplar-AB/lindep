@@ -2202,7 +2202,8 @@ impl App {
             });
             self.open_agent_window(&key);
             self.set_footer(
-                "select repos for ad-hoc agent · space toggles · ⏎ launch · esc cancel".into(),
+                "select repos for ad-hoc agent · space toggles · a add repo · ⏎ launch · esc cancel"
+                    .into(),
             );
             return;
         }
@@ -2489,19 +2490,54 @@ impl App {
         if self.repo_select.is_none() {
             return;
         }
-        // While the add-list is open, keys drive IT: ↑↓ move, Enter pulls the repo into
-        // the checklist, Esc backs out to the main checklist (not the whole modal).
+        // While the add-list is open, keys drive IT: type a URL/path into the field,
+        // ↑↓ move the pick-list, Esc backs out to the main checklist (not the whole modal).
+        // Enter with text typed resolves+registers the new repo; Enter with an empty field
+        // picks the highlighted registered repo (the original CF-20 reuse path).
         if self
             .repo_select
             .as_ref()
             .is_some_and(|s| s.picker.is_adding())
         {
-            let picker = &mut self.repo_select.as_mut().expect("Some").picker;
+            // Ctrl-c still aborts the whole launch from inside the add-list (matches the
+            // main checklist), so a half-typed repo doesn't trap the human in the modal.
+            if let KeyCode::Char('c') = key.code
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                self.repo_select = None;
+                self.set_footer("launch cancelled".into());
+                return;
+            }
             match key.code {
-                KeyCode::Esc => picker.cancel_add(),
-                KeyCode::Down => picker.move_by(1),
-                KeyCode::Up => picker.move_by(-1),
-                KeyCode::Enter => picker.confirm_add(),
+                KeyCode::Esc => self.repo_select.as_mut().expect("Some").picker.cancel_add(),
+                KeyCode::Down => self.repo_select.as_mut().expect("Some").picker.move_by(1),
+                KeyCode::Up => self.repo_select.as_mut().expect("Some").picker.move_by(-1),
+                KeyCode::Backspace => {
+                    self.repo_select.as_mut().expect("Some").picker.add_input_pop()
+                }
+                KeyCode::Enter => {
+                    let typed = self
+                        .repo_select
+                        .as_ref()
+                        .expect("Some")
+                        .picker
+                        .add_input()
+                        .to_string();
+                    if typed.is_empty() {
+                        // Empty field → pick the highlighted registered repo (CF-20 reuse).
+                        self.repo_select.as_mut().expect("Some").picker.confirm_add();
+                    } else {
+                        self.add_typed_repo(&typed);
+                    }
+                }
+                // Any other printable char (no CONTROL/ALT) is input for the URL/path field.
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.repo_select.as_mut().expect("Some").picker.add_input_push(c)
+                }
                 _ => {}
             }
             return;
@@ -2517,18 +2553,19 @@ impl App {
             }
             KeyCode::Char(' ') => self.repo_select.as_mut().expect("Some").picker.toggle(),
             KeyCode::Char('a') => {
-                // Open the add-list over registered repos this project doesn't yet list.
-                // Disjoint fields (`repo_select` mut, `registered_repos` shared), so this
-                // borrow pair is fine; footer the empty case after releasing the borrow.
-                let opened = self
-                    .repo_select
+                // Open the add-list: registered repos this project doesn't yet list, ABOVE
+                // a text field for typing a brand-new repo (a URL or path) the registry
+                // doesn't know yet — the in-cockpit equivalent of the wizard's Repos step
+                // (CF-20). Disjoint fields (`repo_select` mut, `registered_repos` shared).
+                self.repo_select
                     .as_mut()
                     .expect("Some")
                     .picker
                     .open_add(&self.registered_repos);
-                if !opened {
-                    self.set_footer("no other registered repos to add".into());
-                }
+                self.set_footer(
+                    "add a repo · type a URL/path for a new one · ↑↓ pick · ⏎ add · esc back"
+                        .into(),
+                );
             }
             KeyCode::Down => self.repo_select.as_mut().expect("Some").picker.move_by(1),
             KeyCode::Up => self.repo_select.as_mut().expect("Some").picker.move_by(-1),
@@ -2617,6 +2654,83 @@ impl App {
                 self.set_footer(format!("couldn't persist repo {handle}: {e}"));
             }
         }
+    }
+
+    /// Resolve a typed repo input (a URL / local path / existing handle) from the picker's
+    /// add-list and fold it in — the in-cockpit twin of the onboarding wizard's Repos step
+    /// (CF-20). It runs the SAME resolution ([`crate::onboard::resolve_repo_input`]) the
+    /// wizard does, so a repo added here obeys identical rules. A genuinely-new repo gets a
+    /// `[[repo]]` block written and is widened into the project's candidates durably; an
+    /// exact existing handle is just added as a candidate. Either way it's checked into
+    /// THIS launch and surfaced in-session (`registered_repos` + `project_candidates`) so
+    /// it's usable with no restart. A resolve/write error footers and leaves the add-list
+    /// open (input intact) so the human can fix it. No network probe runs here — unlike the
+    /// wizard's Confirm step — so the cockpit's render thread never blocks on a remote; an
+    /// unreachable remote surfaces later as a non-fatal clone failure at materialize time.
+    fn add_typed_repo(&mut self, input: &str) {
+        let registered: Vec<String> = self
+            .registered_repos
+            .iter()
+            .map(|r| r.handle.clone())
+            .collect();
+        let resolved = match crate::onboard::resolve_repo_input(input, &registered) {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_footer(e);
+                return;
+            }
+        };
+        let active = self.active_project.clone();
+        let handle = resolved.handle.clone();
+        // Local-only when a new repo has no remote (a typed local path with no origin), or
+        // — for a reuse — whatever the registered repo already is (drives the `(local)` tag,
+        // and the agent's PR/auto-push gating downstream).
+        let local_only = match &resolved.draft {
+            Some(d) => d.remote.is_none(),
+            None => self
+                .registered_repos
+                .iter()
+                .find(|r| r.handle == handle)
+                .is_some_and(|r| r.local),
+        };
+
+        // Durable side (skipped only in headless tests with no layout): write a `[[repo]]`
+        // block for a genuinely-new repo, then widen the project's candidate set. Bail on a
+        // write error WITHOUT touching in-session state, so disk and memory don't diverge.
+        if let Some(layout) = self.layout.clone() {
+            if let Some(draft) = &resolved.draft
+                && let Err(e) = crate::registry::register_repo(&layout, draft)
+            {
+                self.set_footer(format!("couldn't register repo {handle}: {e}"));
+                return;
+            }
+            if let Err(e) = crate::registry::add_candidate(&layout, &active, &handle) {
+                self.set_footer(format!("couldn't persist repo {handle}: {e}"));
+                return;
+            }
+        }
+
+        let choice = RepoChoice {
+            handle: handle.clone(),
+            local: local_only,
+            primary: false,
+        };
+        // In-session, no restart: a known registered repo + a project candidate, so a later
+        // `a` lists it and a plain Enter next time offers it.
+        if !self.registered_repos.iter().any(|r| r.handle == handle) {
+            self.registered_repos.push(choice.clone());
+        }
+        let cands = self.project_candidates.entry(active).or_default();
+        if !cands.iter().any(|c| c.handle == handle) {
+            cands.push(choice.clone());
+        }
+        // Check it into THIS launch and close the add-list.
+        self.repo_select
+            .as_mut()
+            .expect("Some")
+            .picker
+            .push_checked_and_close(choice);
+        self.set_footer(format!("added {handle} · ⏎ to launch"));
     }
 
     /// Open the disk-reclaim prompt (ENG-540, `Ctrl-a m`): scan for unreferenced
@@ -5373,6 +5487,134 @@ mod tests {
             vec!["api", "web"],
             "the added repo is now a durable candidate (no restart)"
         );
+    }
+
+    #[test]
+    fn typing_a_url_in_the_add_list_adds_a_brand_new_repo_and_launches_with_it() {
+        // CF-20 typed add: in the picker's add-list, typing a repo the registry doesn't
+        // know yet (here a remote URL) resolves it the wizard's way, checks it into this
+        // launch, and surfaces it in-session as a registered repo + project candidate — no
+        // restart. (The registry.toml writes are exercised by registry's own tests; this
+        // App has no layout, so only the in-session/launch wiring runs here.)
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.aim_spine("ZAP-188".into());
+        let key = a.root.clone();
+        a.project_candidates
+            .insert("proj".into(), vec![repo("api", true)]);
+        a.registered_repos = vec![repo("api", false)];
+
+        verb(&mut a, KeyCode::Char('c')); // force the select open on a single-repo project
+        assert!(a.repo_select.is_some());
+        press(&mut a, KeyCode::Char('a')); // open the add-list
+        assert!(a.repo_select.as_ref().unwrap().picker.is_adding());
+
+        // Type a brand-new remote URL the registry has never seen, then add it.
+        for c in "git@github.com:zaplar/web".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.add_input(),
+            "git@github.com:zaplar/web"
+        );
+        press(&mut a, KeyCode::Enter); // resolve + register + check it in
+        assert!(
+            !a.repo_select.as_ref().unwrap().picker.is_adding(),
+            "adding the typed repo closes the sub-list"
+        );
+        // The handle is derived from the URL (its last path segment) and checked in.
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.selected_handles(),
+            vec!["api", "web"],
+            "the new repo rides this launch alongside the primary"
+        );
+        // In-session, no restart: it's now a known registered repo AND a project candidate.
+        assert!(
+            a.registered_repos.iter().any(|r| r.handle == "web"),
+            "the typed repo is registered in-session"
+        );
+        let cands: Vec<&str> = a.project_candidates["proj"]
+            .iter()
+            .map(|c| c.handle.as_str())
+            .collect();
+        assert_eq!(cands, vec!["api", "web"], "and a durable project candidate");
+
+        press(&mut a, KeyCode::Enter); // launch with both
+        assert!(a.repo_select.is_none(), "confirming closes the modal");
+        assert!(a.pending_launch.contains_key(&key), "the launch is in flight");
+    }
+
+    #[test]
+    fn a_bad_typed_repo_footers_and_keeps_the_add_list_open() {
+        // A typo that's neither a dir, a URL, nor a registered handle must not close the
+        // add-list or add anything — it footers so the human can fix the input in place.
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.aim_spine("ZAP-188".into());
+        a.project_candidates
+            .insert("proj".into(), vec![repo("api", true)]);
+        a.registered_repos = vec![repo("api", false)];
+
+        verb(&mut a, KeyCode::Char('c'));
+        press(&mut a, KeyCode::Char('a'));
+        for c in "not-a-repo".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            a.repo_select.as_ref().unwrap().picker.is_adding(),
+            "a bad input keeps the add-list open"
+        );
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.selected_handles(),
+            vec!["api"],
+            "nothing was added"
+        );
+        assert!(
+            !a.registered_repos.iter().any(|r| r.handle == "not-a-repo"),
+            "the bad handle was not registered"
+        );
+    }
+
+    #[test]
+    fn typing_an_already_listed_repo_re_checks_it_without_duplicating() {
+        // CF-20 dedup: typing the handle of a repo already on the checklist (here the
+        // unchecked candidate `web`) just re-checks that row — it must not append a second
+        // `web`, so the launch set has no duplicate.
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.aim_spine("ZAP-188".into());
+        a.project_candidates
+            .insert("proj".into(), vec![repo("api", true), repo("web", false)]);
+        a.registered_repos = vec![repo("api", false), repo("web", false)];
+
+        // Multi-candidate → the select opens on plain Enter; `web` starts unchecked.
+        a.button();
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.selected_handles(),
+            vec!["api"],
+            "only the primary is checked up front"
+        );
+        press(&mut a, KeyCode::Char('a'));
+        for c in "web".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Enter); // typing an existing handle re-checks its row
+        assert!(!a.repo_select.as_ref().unwrap().picker.is_adding());
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.selected_handles(),
+            vec!["api", "web"],
+            "web is now checked, exactly once (no duplicate row)"
+        );
+        // The project candidate set didn't grow a duplicate either.
+        let webs = a.project_candidates["proj"]
+            .iter()
+            .filter(|c| c.handle == "web")
+            .count();
+        assert_eq!(webs, 1, "web stays a single candidate");
     }
 
     #[test]
