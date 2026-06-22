@@ -159,7 +159,12 @@ Each issue **row** carries its agent's state two ways: a whole-row colour tint
 plus a marker in a fixed left gutter — `◌` spawning · `⠋` working (an animated
 spinner) · `⚑` needs you (the row breathes) · `◦` idle · `◼` stopped (you
 cancelled it) · `✓` done · `✗` failed; the header shows a fleet summary
-(`3 agents · 1 needs you`). Live agents float to the top **NEEDS-YOU**,
+(`3 agents · 1 needs you`). A **needs-you row shows the agent's *ask* in place of
+the title** — "approve Bash: git push", "plan ready for review" — so the top
+**NEEDS-YOU** band reads as a live to-do list you can triage without attaching to
+a pane; the same ask also rides the detail bar, the <kbd>i</kbd> summary, a
+backgrounded agent's rail card, the <kbd>n</kbd> jump, and the all-agents screen.
+Live agents float to the top **NEEDS-YOU**,
 **WORKING** and **IDLE** bands of the schedule, so the spine *is* the
 agents roster — there's no separate tab. **Dispatch** is just <kbd>Enter</kbd> on
 a **READY** row (it launches the agent); a **BLOCKED** row is refused with its

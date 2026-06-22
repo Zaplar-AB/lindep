@@ -424,6 +424,19 @@ pub struct App {
     /// for the active project and `world` for the rest, so a late post-reap hook in
     /// the active project can't double-count a just-removed agent.
     pub world: HashMap<String, HashMap<String, AgentStatus>>,
+    /// The human-facing *reason* each needs-you agent last gave — "approve bash:
+    /// git push", "plan ready for review", an idle nudge — keyed `project_id` →
+    /// `issue` → reason, exactly like [`world`](Self::world). The `AgentNeedsYou`
+    /// event already carries this string, but it used to live for a single footer
+    /// paint before the next keystroke wiped it; persisting it turns "something,
+    /// somewhere needs me" into an actionable triage queue you can read off the
+    /// spine, the rail cards, the `i` summary and the global screen without
+    /// attaching to a PTY. Maintained *only* in [`update_world`](Self::update_world)
+    /// so it stays in lockstep with `world`'s NeedsYou entries across every project
+    /// (set when an agent flags, cleared the instant it resumes / changes status /
+    /// is reaped — the same mirror set `world` itself uses). Read via
+    /// [`needs_you_reason`](Self::needs_you_reason).
+    needs_you_reasons: HashMap<String, HashMap<String, String>>,
     /// The open global all-agents screen (ENG-406, `Ctrl-a a`), if any. Full modal.
     pub global_view: Option<GlobalView>,
     /// A pending cross-project landing (ENG-406): `(project_id, issue, attach, gen)`.
@@ -575,6 +588,7 @@ impl App {
             stashed_backends: HashMap::new(),
             other_needs_you: HashMap::new(),
             world: HashMap::new(),
+            needs_you_reasons: HashMap::new(),
             global_view: None,
             pending_land: None,
             switch_inbox: Arc::new(Mutex::new(None)),
@@ -3866,8 +3880,15 @@ impl App {
                         if !self.needs_you_alert && !self.confirm_pending() {
                             let name = self.project_name(&project_id);
                             let switch = self.keymap.verb_label(Action::SwitchProject);
+                            // Name the ask in the toast too (stored cross-project by
+                            // `update_world` above), so a backgrounded prompt tells you
+                            // WHAT before you spend a switch to reach it.
+                            let ask = self
+                                .needs_you_reason(&project_id, &issue)
+                                .map(|r| format!(": {r}"))
+                                .unwrap_or_default();
                             self.status_msg = Some(format!(
-                                "⚑ {issue} in {name} needs you — {switch} to switch"
+                                "⚑ {issue} in {name} needs you{ask} — {switch} to switch"
                             ));
                         }
                         repaint = true; // refresh the header "elsewhere" badge
@@ -4094,7 +4115,7 @@ impl App {
                 }
                 true
             }
-            AppEvent::AgentNeedsYou { issue, reason, .. } => {
+            AppEvent::AgentNeedsYou { issue, .. } => {
                 self.restore_ask_issue_if_needed(&issue);
                 if self.is_terminal(&issue) || self.reaped.contains(&issue) {
                     return false;
@@ -4107,7 +4128,15 @@ impl App {
                 // badge + flag still show it), so it isn't lost — it just doesn't seize the
                 // prompt slot while a confirmation owns `status_msg` and its `y`.
                 if !self.confirm_pending() {
-                    self.status_msg = Some(format!("⚑ {issue} needs you — {reason}"));
+                    // Read the ask back from the store (already sanitised to one line by
+                    // `update_world`, which ran at the top of this `apply_event`) so the
+                    // transient footer shows the identical text the spine / cards / summary
+                    // do — one source, no raw multi-line hook message corrupting the line.
+                    let ask = self
+                        .needs_you_reason(&self.active_project, &issue)
+                        .map(|r| format!(" — {r}"))
+                        .unwrap_or_default();
+                    self.status_msg = Some(format!("⚑ {issue} needs you{ask}"));
                 }
                 true
             }
@@ -4561,7 +4590,9 @@ impl App {
                     .insert(issue.clone(), AgentStatus::Spawning);
             }
             AppEvent::AgentNeedsYou {
-                project_id, issue, ..
+                project_id,
+                issue,
+                reason,
             } => {
                 if blocked(self, project_id, issue) {
                     return;
@@ -4570,6 +4601,9 @@ impl App {
                     .entry(project_id.clone())
                     .or_default()
                     .insert(issue.clone(), AgentStatus::NeedsYou);
+                // Remember WHAT it wants, in lockstep with the NeedsYou status above,
+                // so every standing surface can show the ask, not just "needs you".
+                self.set_needs_reason(project_id, issue, reason);
             }
             AppEvent::AgentStatusChanged {
                 project_id,
@@ -4583,6 +4617,11 @@ impl App {
                     .entry(project_id.clone())
                     .or_default()
                     .insert(issue.clone(), *status);
+                // Any status that isn't NeedsYou supersedes the standing ask — drop it
+                // so a resolved/finished agent never lingers under a stale reason.
+                if !status.needs_you() {
+                    self.clear_needs_reason(project_id, issue);
+                }
             }
             AppEvent::AgentAction {
                 project_id,
@@ -4607,6 +4646,8 @@ impl App {
                     && !s.is_idle()
                 {
                     *s = AgentStatus::Running;
+                    // The agent answered and resumed — its ask is satisfied.
+                    self.clear_needs_reason(project_id, issue);
                 }
             }
             AppEvent::AgentReaped { project_id, issue }
@@ -4619,9 +4660,56 @@ impl App {
                         self.world.remove(project_id);
                     }
                 }
+                // A gone agent has nothing left to ask — drop its reason too.
+                self.clear_needs_reason(project_id, issue);
+            }
+            // A discarded workspace is the definitive "this issue is gone" signal. Its
+            // reason is normally already cleared (a discardable agent is not-live, so it
+            // was reaped or reached a terminal status — both clear above), but clearing it
+            // here too keeps the store from ever outliving its workspace under any future
+            // change to discard gating. Handled in this one funnel so the field's
+            // "maintained only in update_world" contract stays true.
+            AppEvent::WorkspaceDiscarded { project_id, issue } => {
+                self.clear_needs_reason(project_id, issue);
             }
             _ => {}
         }
+    }
+
+    /// Store an agent's needs-you reason, sanitised to a single bounded line (see
+    /// [`sanitize_reason`]). Skips a reason that sanitises to nothing rather than
+    /// stamping an empty ask. Mirrors `world`'s nested keying so the two stay aligned.
+    fn set_needs_reason(&mut self, project_id: &str, issue: &str, reason: &str) {
+        let reason = sanitize_reason(reason);
+        if reason.is_empty() {
+            return;
+        }
+        self.needs_you_reasons
+            .entry(project_id.to_string())
+            .or_default()
+            .insert(issue.to_string(), reason);
+    }
+
+    /// Drop an agent's standing reason, pruning the project's map when it empties so
+    /// the store can't accrete dead project keys (mirrors `world`'s cleanup).
+    fn clear_needs_reason(&mut self, project_id: &str, issue: &str) {
+        if let Some(m) = self.needs_you_reasons.get_mut(project_id) {
+            m.remove(issue);
+            if m.is_empty() {
+                self.needs_you_reasons.remove(project_id);
+            }
+        }
+    }
+
+    /// The reason the agent on `(project_id, issue)` last said it needs you, while
+    /// that ask still stands — `None` once it resumes, changes status, or is reaped.
+    /// Maintained for *every* project (see [`needs_you_reasons`](Self::needs_you_reasons)),
+    /// so the active spine and the cross-project global screen read the same source.
+    pub fn needs_you_reason(&self, project_id: &str, issue: &str) -> Option<&str> {
+        self.needs_you_reasons
+            .get(project_id)
+            .and_then(|m| m.get(issue))
+            .map(String::as_str)
     }
 
     /// Live-agent + needs-you counts across the WHOLE workspace (ENG-406): the active
@@ -4990,8 +5078,16 @@ impl App {
     /// the cycle and needs-you spine jumps.
     fn set_jump_status(&mut self, prefix: &str, key: &str, n: usize, total: usize) {
         self.aim_spine(key.to_string());
+        // When the jump lands on an issue whose agent needs you, lead with WHAT it wants
+        // — so `n` ("next needs-you") is an actionable triage step, not just a cursor move.
+        // A reason only exists for a standing needs-you agent, so this is naturally inert
+        // for cycle / next-agent jumps that land elsewhere.
+        let ask = self
+            .needs_you_reason(&self.active_project, key)
+            .map(|r| format!(" — {r}"))
+            .unwrap_or_default();
         self.status_msg = Some(format!(
-            "{prefix} {n}/{total} — {key}{}",
+            "{prefix} {n}/{total} — {key}{}{ask}",
             self.hidden_note()
         ));
     }
@@ -5058,6 +5154,46 @@ fn reclaim_note(res: Result<(), crate::mirror::MirrorError>, handle: &str) -> St
         Ok(()) => format!("reclaimed mirror {handle}"),
         Err(e) => format!("reclaim refused: {e}"),
     }
+}
+
+/// The longest a stored needs-you reason may be, in chars. A hook's `message` is
+/// arbitrary agent text; keep it generous enough for a full permission line ("approve
+/// Bash: git push --force …") yet bounded so a runaway string can't bloat the store or
+/// the JSON the surfaces render from. Per-surface rendering truncates further to fit.
+const MAX_REASON: usize = 200;
+
+/// Collapse an agent's raw needs-you `reason` into a single, bounded, control-free
+/// line fit to render anywhere. Hook messages can carry newlines, tabs, ANSI/control
+/// bytes and trailing whitespace; a row/card/footer is a single line, so flatten all
+/// interior whitespace to single spaces, drop other control chars, trim the ends, and
+/// clamp the length. Returns an owned `String` (the caller stores it); empty in →
+/// empty out, which the setter treats as "no reason to record".
+fn sanitize_reason(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len().min(MAX_REASON));
+    let mut len = 0usize; // chars pushed so far (a running count avoids re-scanning `out`)
+    let mut pending_space = false;
+    for ch in reason.chars() {
+        if ch.is_whitespace() {
+            // Fold any run of whitespace (incl. embedded newlines/tabs) to one space,
+            // but never lead with it — so a multi-line message reads as one tidy line.
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if ch.is_control() {
+            continue; // strip stray control/ANSI bytes a PTY message can carry
+        }
+        if pending_space {
+            out.push(' ');
+            len += 1;
+            pending_space = false;
+        }
+        out.push(ch);
+        len += 1;
+        if len >= MAX_REASON {
+            break;
+        }
+    }
+    out
 }
 
 /// The most-connected non-external node — the cockpit's default root/selection
@@ -5881,6 +6017,219 @@ mod tests {
             a.workspace_summary(),
             (0, 0),
             "no phantom agent inflates the cross-project roll-up after a switch"
+        );
+    }
+
+    // ── Needs-you reason: a persistent, triageable "what does it want" store ──
+
+    #[test]
+    fn a_needs_you_event_records_its_reason() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve Bash: git push".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            Some("approve Bash: git push"),
+            "the agent's ask is stored against its issue"
+        );
+    }
+
+    #[test]
+    fn resuming_work_clears_the_needs_you_reason() {
+        // The agent answered and resumed (a working action over a NeedsYou agent) — its
+        // ask is satisfied, so the standing reason must go or it lingers under live work.
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve git push".into(),
+        });
+        a.apply_event(AppEvent::AgentAction {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            action: "ran Bash".into(),
+            working: true,
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            None,
+            "a resumed agent drops its reason"
+        );
+    }
+
+    #[test]
+    fn a_terminal_status_clears_the_needs_you_reason() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "plan ready".into(),
+        });
+        a.apply_event(AppEvent::AgentStatusChanged {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            status: AgentStatus::Done,
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            None,
+            "a finished agent drops its reason"
+        );
+    }
+
+    #[test]
+    fn reaping_an_agent_clears_its_needs_you_reason() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve write".into(),
+        });
+        a.apply_event(AppEvent::AgentReaped {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            None,
+            "a reaped agent leaves no stale reason"
+        );
+    }
+
+    #[test]
+    fn discarding_a_workspace_clears_the_needs_you_reason() {
+        // Defensive: a discardable agent is not-live (so its reason is normally already
+        // cleared), but the discard signal must leave no reason outliving the workspace.
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve push".into(),
+        });
+        a.apply_event(AppEvent::WorkspaceDiscarded {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            None,
+            "a discarded workspace leaves no standing reason"
+        );
+    }
+
+    #[test]
+    fn a_backgrounded_agents_reason_is_kept_for_the_cross_project_surfaces() {
+        // A reason from a project you've switched away from must survive (the global
+        // all-agents screen reads it), even though the scope guard drops the event from
+        // the on-screen fleet.
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            reason: "approve deploy".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj-b", "ENG-9"),
+            Some("approve deploy"),
+            "a backgrounded project's ask is retained for the global screen"
+        );
+        // And it clears on resume there too, via the same world funnel.
+        a.apply_event(AppEvent::AgentAction {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            action: "ran a tool".into(),
+            working: true,
+        });
+        assert_eq!(a.needs_you_reason("proj-b", "ENG-9"), None);
+    }
+
+    #[test]
+    fn a_second_prompt_replaces_the_standing_reason() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve push".into(),
+        });
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve force-push".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            Some("approve force-push"),
+            "the latest ask wins"
+        );
+    }
+
+    #[test]
+    fn a_reaped_issues_late_needs_you_hook_stores_no_reason() {
+        // Mirrors the world `blocked` guard: a late hook for a reaped active-project
+        // issue must not resurrect a phantom reason any more than it resurrects a status.
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.reaped.insert("ENG-1".into());
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "late".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            None,
+            "a reaped issue's late hook is dropped, reason included"
+        );
+    }
+
+    #[test]
+    fn the_needs_you_jump_footer_names_the_ask() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        let key = a.root.clone();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: key.clone(),
+            reason: "approve Bash: git push".into(),
+        });
+        a.jump_to_needs_you();
+        let msg = a.status_msg.clone().expect("the jump set a footer");
+        assert!(
+            msg.contains("needs you") && msg.contains("approve Bash: git push"),
+            "the jump footer leads to the ask, not just the issue: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_reason_flattens_to_one_bounded_line() {
+        // Hook messages can carry newlines, tabs, control bytes and padding; a row/card/
+        // footer is one line, so they must collapse to a single tidy, bounded string.
+        assert_eq!(
+            sanitize_reason("  approve\n\tBash:   git push  "),
+            "approve Bash: git push",
+            "interior whitespace folds to single spaces and the ends trim"
+        );
+        assert_eq!(
+            sanitize_reason("a\u{7}b\u{1b}c"),
+            "abc",
+            "control / ANSI bytes are stripped"
+        );
+        assert_eq!(sanitize_reason("   \n\t  "), "", "all-whitespace yields nothing");
+        let long = "x".repeat(500);
+        assert_eq!(
+            sanitize_reason(&long).chars().count(),
+            MAX_REASON,
+            "an over-long reason is clamped to MAX_REASON chars"
         );
     }
 

@@ -260,6 +260,18 @@ one, while the node still records that an agent ran there. Animation is gated:
 the loop only advances frames while something is actually live or flashing, so a
 cockpit of resting/terminal agents (or none) still never busy-repaints.
 
+**The needs-you *reason* is persistent state, not a one-shot footer.** The
+`AgentNeedsYou` hook carries a `reason` ("approve Bash: git push", "plan ready");
+`App` keeps it in `needs_you_reasons` (`project_id` → `issue` → reason), maintained
+*only* in `update_world` so it stays in lockstep with `world`'s NeedsYou entries
+across every project — set when an agent flags, cleared the instant it resumes /
+changes status / is reaped / has its workspace discarded. Every standing surface
+reads it back (`App::needs_you_reason`): a needs-you spine row shows the ask in
+place of the title, and so do the detail bar, the `i` summary, a backgrounded
+agent's rail card, the `n`-jump footer, the cross-project toast, and the global
+all-agents screen — turning "something, somewhere needs me" into a triage queue
+you read without attaching to a PTY.
+
 Every binding is remappable via a `[keys]` table (direct keys) and a `[verbs]`
 table (the `Ctrl-a` prefix verbs) in `config.toml` (`<cwd>/.lindep/config.toml`,
 then `~/.config/lindep/config.toml` — personal wins; same two-location pattern as
