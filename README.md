@@ -11,9 +11,10 @@ glance.
 
 From that same view, lindep launches and supervises real `claude` (Claude Code)
 agents, usually one per issue, each in its own git worktree and branch, so you
-can dispatch and steer a whole fleet without leaving the terminal. Linear stays
-the source of truth; lindep is the visibility and orchestration layer on top.
-With `--demo` it stays a read-only graph viewer.
+can dispatch and steer a whole fleet without leaving the terminal. The agent
+backend is tool-agnostic, so Codex, Aider, and other coding agents are on the
+way. Linear stays the source of truth; lindep is the visibility and
+orchestration layer on top. With `--demo` it stays a read-only graph viewer.
 
 <img width="1926" height="999" alt="image" src="https://github.com/user-attachments/assets/c6603ce5-01bb-4eed-b01a-73fb113d3ef4" />
 
