@@ -616,9 +616,16 @@ impl SessionStore {
             f.write_all(json)?;
             f.sync_all()
         };
-        write_tmp().map_err(|source| StateError::Write {
-            path: tmp.clone(),
-            source,
+        write_tmp().map_err(|source| {
+            // Best-effort cleanup so a failed write/fsync doesn't litter a temp file
+            // (the very condition — a wedged/full disk — makes repeated failures, and
+            // thus accumulating distinct (pid,seq) temps, likely). Mirrors the
+            // stale-seq and rename-failure branches below.
+            let _ = std::fs::remove_file(&tmp);
+            StateError::Write {
+                path: tmp.clone(),
+                source,
+            }
         })?;
 
         // Commit under the per-path gate. Holding it across the rename serializes

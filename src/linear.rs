@@ -92,21 +92,28 @@ impl Client {
             }
         };
 
-        if let Some(errors) = envelope.errors
-            && !errors.is_empty()
-        {
-            let joined = errors
-                .into_iter()
-                .map(|e| e.message)
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(format!("Linear API error: {joined}"));
-        }
-
+        // Prefer a populated `data` even when `errors` is also present. GraphQL (and
+        // Linear) can return a *partial* response: top-level `data` for the issues that
+        // resolved, plus field-level `errors` for one inaccessible relation/related
+        // issue. Treating any non-empty `errors` as fatal discarded the entire
+        // mostly-complete graph and aborted the launch over a single unreadable edge.
+        // So only treat `errors` as fatal when there is no usable `data`.
         match envelope.data {
             Some(data) => Ok(data),
-            None if status >= 400 => Err(format!("Linear API returned HTTP {status}")),
-            None => Err("Linear returned no data".to_string()),
+            None => {
+                if let Some(errors) = envelope.errors.filter(|e| !e.is_empty()) {
+                    let joined = errors
+                        .into_iter()
+                        .map(|e| e.message)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    Err(format!("Linear API error: {joined}"))
+                } else if status >= 400 {
+                    Err(format!("Linear API returned HTTP {status}"))
+                } else {
+                    Err("Linear returned no data".to_string())
+                }
+            }
         }
     }
 
@@ -143,8 +150,14 @@ impl Client {
         resolve_in(&self.list_projects()?, name)
     }
 
-    /// Fetch all issues of a project (paged) and assemble the dependency graph.
-    pub fn fetch_graph(&self, project: &ProjectRef) -> Result<Graph, String> {
+    /// Fetch all issues of a project (paged) and assemble the dependency graph, plus any
+    /// non-fatal warnings (e.g. relation pages that couldn't be topped up). Warnings are
+    /// returned rather than printed: the cockpit calls this from a `spawn_blocking` while
+    /// the ratatui alternate screen owns the terminal, so an `eprintln!` here would paint
+    /// over and corrupt the live UI. The caller decides — the cockpit surfaces them via
+    /// `AppEvent::Notification`, the CLI prints them to stderr.
+    pub fn fetch_graph(&self, project: &ProjectRef) -> Result<(Graph, Vec<String>), String> {
+        let mut warnings: Vec<String> = Vec::new();
         const Q: &str = r#"
             query($id: String!, $first: Int!, $after: String, $rel: Int!) {
               project(id: $id) {
@@ -196,19 +209,25 @@ impl Client {
         for ri in &mut raw {
             // Clone the trigger out first so the post-fetch `extend` doesn't
             // overlap the borrow of `page_info`.
-            let rel_cursor = page_cursor(&ri.relations.page_info, &ri.identifier);
+            let rel_cursor = page_cursor(&ri.relations.page_info, &ri.identifier, &mut warnings);
             if let Some(cursor) = rel_cursor {
-                let more = self.page_relations(&ri.identifier, false, Some(cursor))?;
+                let more =
+                    self.page_relations(&ri.identifier, false, Some(cursor), &mut warnings)?;
                 ri.relations.nodes.extend(more);
             }
-            let inv_cursor = page_cursor(&ri.inverse_relations.page_info, &ri.identifier);
+            let inv_cursor = page_cursor(
+                &ri.inverse_relations.page_info,
+                &ri.identifier,
+                &mut warnings,
+            );
             if let Some(cursor) = inv_cursor {
-                let more = self.page_relations(&ri.identifier, true, Some(cursor))?;
+                let more =
+                    self.page_relations(&ri.identifier, true, Some(cursor), &mut warnings)?;
                 ri.inverse_relations.nodes.extend(more);
             }
         }
 
-        Ok(build_graph(&project.name, raw))
+        Ok((build_graph(&project.name, raw), warnings))
     }
 
     /// Page the remaining relations of a single issue past the inline cap.
@@ -217,6 +236,7 @@ impl Client {
         identifier: &str,
         inverse: bool,
         mut after: Option<String>,
+        warnings: &mut Vec<String>,
     ) -> Result<Vec<RelNode>, String> {
         let (field, endpoint) = if inverse {
             ("inverseRelations", "issue { identifier title }")
@@ -235,11 +255,13 @@ impl Client {
             let Some(holder) = data.issue else {
                 // The issue vanished (archived / deleted / permissions) between the
                 // page fetch and this top-up. Don't silently drop its overflow
-                // edges — the module guarantee is that we never do that quietly.
-                eprintln!(
-                    "lindep: warning: could not page all relations for {identifier}; \
+                // edges — the module guarantee is that we never do that quietly — but
+                // collect the warning instead of writing to stderr (which would corrupt
+                // the cockpit's alternate screen); the caller surfaces it.
+                warnings.push(format!(
+                    "could not page all relations for {identifier}; \
                      some dependency edges may be missing"
-                );
+                ));
                 break;
             };
             out.extend(holder.conn.nodes);
@@ -258,17 +280,19 @@ impl Client {
 /// The cursor to top up a relation connection from, or `None` if there is
 /// nothing reliable to page. `hasNextPage` with a real `Some(cursor)` yields it;
 /// `hasNextPage` with a null cursor carries nothing to page from — paging with
-/// `after: null` would restart at page 1 and re-fetch duplicates — so it warns
-/// (overflow edges are never dropped silently) and returns `None`. The same
-/// `(true, Some)` guard the project/issue pagination uses.
-fn page_cursor(info: &PageInfo, identifier: &str) -> Option<String> {
+/// `after: null` would restart at page 1 and re-fetch duplicates — so it records a
+/// warning (overflow edges are never dropped silently) and returns `None`. The
+/// warning is collected into `warnings` rather than printed, so a cockpit fetch
+/// can't corrupt the alternate screen. The same `(true, Some)` guard the project/
+/// issue pagination uses.
+fn page_cursor(info: &PageInfo, identifier: &str, warnings: &mut Vec<String>) -> Option<String> {
     match (info.has_next_page, &info.end_cursor) {
         (true, Some(cursor)) => Some(cursor.clone()),
         (true, None) => {
-            eprintln!(
-                "lindep: warning: could not page all relations for {identifier} \
+            warnings.push(format!(
+                "could not page all relations for {identifier} \
                  (no cursor); some dependency edges may be missing"
-            );
+            ));
             None
         }
         (false, _) => None,
@@ -601,14 +625,27 @@ mod tests {
     #[test]
     fn page_cursor_yields_a_real_cursor() {
         let info = page_info(true, Some("cur-42"));
-        assert_eq!(page_cursor(&info, "ENG-1"), Some("cur-42".to_string()));
+        let mut warnings = Vec::new();
+        assert_eq!(
+            page_cursor(&info, "ENG-1", &mut warnings),
+            Some("cur-42".to_string())
+        );
+        assert!(warnings.is_empty(), "a real cursor warns nothing");
     }
 
     #[test]
     fn page_cursor_stops_when_there_is_no_next_page() {
         // The common case: relations fit inline. No top-up, regardless of cursor.
-        assert_eq!(page_cursor(&page_info(false, None), "ENG-1"), None);
-        assert_eq!(page_cursor(&page_info(false, Some("x")), "ENG-1"), None);
+        let mut warnings = Vec::new();
+        assert_eq!(
+            page_cursor(&page_info(false, None), "ENG-1", &mut warnings),
+            None
+        );
+        assert_eq!(
+            page_cursor(&page_info(false, Some("x")), "ENG-1", &mut warnings),
+            None
+        );
+        assert!(warnings.is_empty(), "the common case warns nothing");
     }
 
     #[test]
@@ -616,7 +653,15 @@ mod tests {
         // The bug guarded here: `hasNextPage: true` with `endCursor: null` must
         // NOT page (which would `after: null` → re-fetch page 1 and duplicate
         // every relation). Returning None leaves the inline page as-is.
-        assert_eq!(page_cursor(&page_info(true, None), "ENG-1"), None);
+        let mut warnings = Vec::new();
+        assert_eq!(
+            page_cursor(&page_info(true, None), "ENG-1", &mut warnings),
+            None
+        );
+        // The warning is collected for the caller to surface, NOT printed to stderr
+        // (which would corrupt the cockpit's alternate screen).
+        assert_eq!(warnings.len(), 1, "the dropped-edges warning is captured");
+        assert!(warnings[0].contains("ENG-1"));
     }
 
     #[test]

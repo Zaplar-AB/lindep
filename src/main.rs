@@ -173,7 +173,11 @@ fn real_main() -> Result<(), String> {
                 .project
                 .as_deref()
                 .ok_or("for --snapshot, name a project (or use --demo)")?;
-            client.fetch_graph(&client.resolve_project(name)?)?
+            let (graph, warnings) = client.fetch_graph(&client.resolve_project(name)?)?;
+            for w in warnings {
+                eprintln!("lindep: warning: {w}");
+            }
+            graph
         };
         if graph.is_empty() {
             return Err("no issues found for that project".into());
@@ -204,7 +208,12 @@ fn real_main() -> Result<(), String> {
             return Ok(()); // user quit the picker
         };
         eprintln!("Loading {}…", project.name);
-        let graph = client.fetch_graph(&project)?;
+        // Still pre-TUI here, so stderr is safe; the cockpit switch path (app.rs)
+        // routes its warnings through AppEvent::Notification instead.
+        let (graph, warnings) = client.fetch_graph(&project)?;
+        for w in warnings {
+            eprintln!("lindep: warning: {w}");
+        }
         // The full project list powers the in-cockpit switcher (Ctrl-a s).
         // Best-effort: if it fails we still run, just without switching.
         let projects = client.list_projects().unwrap_or_default();
@@ -504,6 +513,11 @@ impl ControlPlaneGuard<'_> {
             let _ = self
                 .runtime
                 .block_on(async { tokio::time::timeout(SHUTDOWN_GRACE, join).await });
+            // Drain any auto-push still publishing a just-committed branch, so a
+            // quit mid-push doesn't strand the commit locally with no outcome event
+            // (each push is itself GIT_NET_TIMEOUT-capped, so this returns fast).
+            self.runtime
+                .block_on(notify::drain_auto_pushes(SHUTDOWN_GRACE));
         }
     }
 }

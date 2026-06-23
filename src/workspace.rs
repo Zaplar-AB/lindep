@@ -385,6 +385,22 @@ fn teardown_issue(
     }
 }
 
+/// Per-(handle, issue) lock serializing the durable-set commit + WORKSPACE.md
+/// regeneration in [`materialize_repo_request`], so concurrent same-issue lazy-pulls
+/// can't leave the manifest reflecting a stale subset of the durable repo set. Keyed by
+/// both handle and issue (issue ids collide across projects), distinct from the
+/// SessionStore mutex (which it must not widen) and the worktree `git_lock`.
+fn issue_manifest_lock(handle: &str, issue: &str) -> Arc<Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    // NUL can't appear in a handle or issue id, so it's an unambiguous key separator.
+    let key = format!("{handle}\u{0}{issue}");
+    let mut locks = LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(locks.entry(key).or_default())
+}
+
 /// Materialise a fenced + confirmed lazy-pull (ENG-542): the agent requested an
 /// extra repo and the human confirmed it. **Re-fence** the handle to the project's
 /// candidate set (the loopback POST is forgeable, so we never trust the CLI's fence
@@ -457,6 +473,18 @@ fn materialize_repo_request(
     if let Err(e) = mgr.create(issue, "", &base) {
         return notify(format!("pulling `{handle}` into {issue}: {e}"));
     }
+
+    // Serialize the commit + manifest regeneration per issue. The store lock makes the
+    // repo-set union atomic, but the manifest (built and written below) is regenerated
+    // from a snapshot AFTER that lock is released and is last-writer-wins — so two
+    // concurrent same-issue pulls could otherwise leave WORKSPACE.md naming fewer repos
+    // than the durable set. Holding this guard across the re-read + manifest build +
+    // write makes the last manifest reflect the freshest set, without holding the
+    // SessionStore mutex across the slow git `find()` loop below.
+    let manifest_lock = issue_manifest_lock(&descriptor.handle, issue);
+    let _manifest_guard = manifest_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Commit the new repo set to the store, then regenerate the manifest over it —
     // the "tell" step strictly last. The set is unioned with the CURRENT durable set

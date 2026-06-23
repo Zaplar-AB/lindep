@@ -550,9 +550,32 @@ fn kill_orphan(pid: Option<u32>, killer: &mut Box<dyn ChildKiller + Send + Sync>
     // The child is not yet reaped on this path, so the pid is unambiguously ours.
     #[cfg(unix)]
     if let Some(pid) = pid {
+        let pid = pid as libc::pid_t;
         // SAFETY: signalling our own just-spawned child's process group.
         unsafe {
-            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            libc::killpg(pid, libc::SIGKILL);
+        }
+        // Reap the just-killed child. Nothing else ever will on these paths: the
+        // wait thread either never started (its spawn is what failed) or owns a
+        // `child` handle that is dropped without waiting (`Child::drop` doesn't
+        // reap), so without this the SIGKILLed process lingers as a zombie holding a
+        // PID slot for the whole cockpit lifetime — and the trigger is fd/thread
+        // exhaustion, exactly when leaking PIDs hurts most. SIGKILL is unblockable
+        // so the child exits promptly: poll with WNOHANG, then block as a backstop.
+        // SAFETY: `pid` is our own direct child (the setsid group leader).
+        unsafe {
+            let mut status = 0;
+            let mut reaped = false;
+            for _ in 0..100 {
+                if libc::waitpid(pid, &mut status, libc::WNOHANG) != 0 {
+                    reaped = true; // reaped (==pid) or already gone (ECHILD, -1)
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if !reaped {
+                let _ = libc::waitpid(pid, &mut status, 0);
+            }
         }
     }
     #[cfg(not(unix))]

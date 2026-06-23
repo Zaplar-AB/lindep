@@ -245,6 +245,18 @@ pub struct App {
     /// `AgentSpawned`, so it never blocks a fresh agent.
     reaped: HashSet<String>,
 
+    /// The cross-project generalisation of [`Self::reaped`]: per project, the issues
+    /// reaped/exited this session. Unlike `reaped` (active-only, cleared on every
+    /// switch) this is keyed by project and SURVIVES switches, because a late hook for
+    /// a *backgrounded* project's killed agent arrives after we've switched away — when
+    /// `reaped` is both wrong-project and already cleared — and would otherwise resurrect
+    /// a dead agent as a phantom "needs you" in `world`/`other_needs_you` that nothing
+    /// ever clears (the workspace roll-up, header "⚑N elsewhere" badge and switcher all
+    /// over-count). Maintained in `update_world` (the one funnel every event flows
+    /// through): set on reap/exit, cleared on a genuine relaunch (`AgentSpawned`) and on
+    /// discard, so it can't grow unbounded.
+    reaped_by_project: HashMap<String, HashSet<String>>,
+
     /// The repo handles each live agent materialised, keyed by issue (primary
     /// first), as reported by the supervisor on `AgentSpawned` (ENG-536). Lets the
     /// agent window/coin headers show *which* repos/worktrees an agent spans — a
@@ -270,6 +282,12 @@ pub struct App {
     /// visual settle window so an otherwise-idle agent does not read as quiet while
     /// buffered output is still painting.
     last_output: HashMap<String, u64>,
+    /// Latched true while the last `save_ledgers` pass had a write failure, so a
+    /// *persistent* inability to persist run history (read-only FS, full disk, a
+    /// vanished parent dir) is surfaced once instead of silently swallowed — and
+    /// cleared again the moment a save fully succeeds. Run history is view-only, so
+    /// this never aborts the session; it only makes the failure visible.
+    ledger_save_failed: bool,
     /// An issue whose agent we just launched and are waiting to come up, so the
     /// agent's window opens+focuses the moment it spawns (a user-initiated launch
     /// is the only `AgentSpawned` that steals focus — background/resume spawns
@@ -548,12 +566,14 @@ impl App {
             needs_you_alert: false,
             pending_launch: HashMap::new(),
             reaped: HashSet::new(),
+            reaped_by_project: HashMap::new(),
             agent_repos: HashMap::new(),
             fleet: HashMap::new(),
             backends: HashMap::new(),
             copy: HashMap::new(),
             pending_clipboard: None,
             last_output: HashMap::new(),
+            ledger_save_failed: false,
             pending_attach: None,
             frame: 0,
             flash: HashMap::new(),
@@ -1558,13 +1578,18 @@ impl App {
         self.set_footer(format!("loading {}…", target.name));
         let inbox = Arc::clone(&self.switch_inbox);
         runtime.spawn_blocking(move || match linear.fetch_graph(&target) {
-            Ok(graph) => {
+            Ok((graph, warnings)) => {
                 if let Ok(mut slot) = inbox.lock() {
                     // Keep only the highest generation seen, so an older fetch
                     // landing late can't clobber a newer one.
                     if slot.as_ref().is_none_or(|(g, _, _)| generation >= *g) {
                         *slot = Some((generation, target, graph));
                     }
+                }
+                // Surface non-fatal fetch warnings (dropped relation pages) through the
+                // event channel — the alternate screen is live, so stderr would corrupt it.
+                for w in warnings {
+                    let _ = events.send(AppEvent::Notification(format!("lindep: {w}")));
                 }
                 let _ = events.send(AppEvent::ProjectActivated);
             }
@@ -1628,6 +1653,16 @@ impl App {
         self.resuming.clear();
         self.flash.clear();
         self.preview_size.clear();
+        // These three maps are keyed by issue WITHOUT a project scope, and issue keys
+        // collide across projects (see `pending_land`'s doc). They must be cleared on a
+        // switch or a stale entry latches onto the new project's same-keyed issue:
+        // `copy` in particular gates raw key forwarding to the PTY, so a leftover entry
+        // routes every keystroke into copy-mode scroll/select and the chat looks frozen.
+        // `agent_repos`/`last_output` would otherwise paint the previous project's repo
+        // set / quiet-overlay state on the new project's matching issue.
+        self.copy.clear();
+        self.agent_repos.clear();
+        self.last_output.clear();
         self.search_active = false;
         self.search_query.clear();
         // The filter PERSISTS across the switch (unlike search above, which is a
@@ -3696,17 +3731,27 @@ impl App {
     /// sees events from every project before the active-project scoping guard; saving
     /// the whole thing to `ledger_path` would leak background project history into
     /// whichever project happened to be active when the app booted.
-    pub fn save_ledgers(&self) {
+    pub fn save_ledgers(&mut self) {
+        let mut failed = false;
         if let Some(layout) = &self.layout {
             for project_id in self.ledger.project_ids() {
                 if let Some(handle) = self.project_handles.get(&project_id) {
                     let path = layout.ledger_path(handle);
-                    let _ = self.ledger.save_project(&path, &project_id);
+                    failed |= self.ledger.save_project(&path, &project_id).is_err();
                 }
             }
         } else if let Some(path) = self.ledger_path.as_deref() {
-            let _ = self.ledger.save(path);
+            failed |= self.ledger.save(path).is_err();
         }
+        // Surface a *persistent* failure exactly once (on the false→true edge), not on
+        // every save — and clear the latch when a pass fully succeeds, so a transient
+        // hiccup that recovers doesn't leave a stale warning standing.
+        if failed && !self.ledger_save_failed {
+            self.set_footer(
+                "couldn't save run history (disk full or read-only?) — agents keep running".into(),
+            );
+        }
+        self.ledger_save_failed = failed;
     }
 
     /// Rebuild the window strip from a persisted layout, pruning windows whose
@@ -3983,11 +4028,22 @@ impl App {
                 AppEvent::AgentNeedsYou {
                     project_id, issue, ..
                 } => {
-                    let newly = self
-                        .other_needs_you
-                        .entry(project_id.clone())
-                        .or_default()
-                        .insert(issue.clone());
+                    // Same tombstone guard `update_world` applies to `world`: a late hook
+                    // for an already-reaped backgrounded agent must not re-raise a phantom
+                    // "needs you" in `other_needs_you` (the header/switcher count) that
+                    // nothing will ever clear until you switch into that project.
+                    let newly = if self
+                        .reaped_by_project
+                        .get(&project_id)
+                        .is_some_and(|s| s.contains(&issue))
+                    {
+                        false
+                    } else {
+                        self.other_needs_you
+                            .entry(project_id.clone())
+                            .or_default()
+                            .insert(issue.clone())
+                    };
                     if newly {
                         // Toast once, but never bury a *local* standing alert or an armed
                         // confirmation's prompt (H4).
@@ -4692,12 +4748,29 @@ impl App {
         // arrives as AgentSpawned (which clears the reaped tombstone in the main match),
         // so that variant is never blocked.
         let blocked = |this: &Self, pid: &str, issue: &str| -> bool {
-            pid == this.active_project && (this.reaped.contains(issue) || this.is_terminal(issue))
+            // Active project: the live `reaped`/terminal-fleet guards. ANY project
+            // (including backgrounded ones, where `reaped` doesn't apply and was cleared
+            // on switch): the durable per-project tombstone, so a late hook can't
+            // resurrect a dead backgrounded agent into the cross-project roll-up.
+            (pid == this.active_project && (this.reaped.contains(issue) || this.is_terminal(issue)))
+                || this
+                    .reaped_by_project
+                    .get(pid)
+                    .is_some_and(|s| s.contains(issue))
         };
         match ev {
             AppEvent::AgentSpawned {
                 project_id, issue, ..
             } => {
+                // A genuine relaunch revives the issue — lift its cross-project tombstone
+                // (mirrors the active `reaped.remove` on spawn), and prune the project's
+                // set when empty so the map can't grow without bound.
+                if let Some(s) = self.reaped_by_project.get_mut(project_id) {
+                    s.remove(issue);
+                    if s.is_empty() {
+                        self.reaped_by_project.remove(project_id);
+                    }
+                }
                 self.world
                     .entry(project_id.clone())
                     .or_default()
@@ -4774,6 +4847,14 @@ impl App {
                         self.world.remove(project_id);
                     }
                 }
+                // Tombstone it per-project so a late NeedsYou/Running hook (the forwarder
+                // is a slower path than the supervisor's reap) can't re-insert a phantom
+                // live/needs-you status — for a backgrounded project too, where `reaped`
+                // doesn't reach. Lifted again on a real relaunch (AgentSpawned, above).
+                self.reaped_by_project
+                    .entry(project_id.clone())
+                    .or_default()
+                    .insert(issue.clone());
                 // A gone agent has nothing left to ask — drop its reason too.
                 self.clear_needs_reason(project_id, issue);
             }
@@ -4785,6 +4866,14 @@ impl App {
             // "maintained only in update_world" contract stays true.
             AppEvent::WorkspaceDiscarded { project_id, issue } => {
                 self.clear_needs_reason(project_id, issue);
+                // The issue is definitively gone; drop its tombstone so the map stays
+                // bounded (a re-add would arrive as a fresh AgentSpawned anyway).
+                if let Some(s) = self.reaped_by_project.get_mut(project_id) {
+                    s.remove(issue);
+                    if s.is_empty() {
+                        self.reaped_by_project.remove(project_id);
+                    }
+                }
             }
             _ => {}
         }

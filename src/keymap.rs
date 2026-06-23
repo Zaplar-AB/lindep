@@ -401,14 +401,20 @@ fn parse_binding(spec: &str) -> Result<Binding, String> {
             if chars.next().is_some() {
                 return Err(format!("unknown key '{spec}'"));
             }
-            if ctrl && !c.is_ascii_alphabetic() {
-                return Err(format!(
-                    "'{spec}' isn't a reliable Ctrl combo (only ctrl-a..ctrl-z work)"
-                ));
-            }
             KeyCode::Char(c)
         }
     };
+    // The reliability gate must cover *named* keys too, not just single chars: most
+    // terminals never report CONTROL with `ctrl-up`/`ctrl-enter`/`ctrl-space`/
+    // `ctrl-tab`/`ctrl-home`/`ctrl-F*`, so such a rebind installs a chord that can
+    // never match (the silent-never-matches failure this is meant to prevent). Only
+    // `ctrl-a`..`ctrl-z` are dependable — reject everything else loudly so the
+    // caller surfaces a warning and keeps the default binding.
+    if ctrl && !matches!(code, KeyCode::Char(c) if c.is_ascii_alphabetic()) {
+        return Err(format!(
+            "'{spec}' isn't a reliable Ctrl combo (only ctrl-a..ctrl-z work)"
+        ));
+    }
     Ok(Binding { code, ctrl, alt })
 }
 

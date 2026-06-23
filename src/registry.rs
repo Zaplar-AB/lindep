@@ -470,6 +470,17 @@ pub fn is_safe_handle(handle: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
+/// Whether a string is safe to feed to `git clone` as a positional source: rejects a
+/// leading `-` (read as an option even after a `--`) and the `ext::`/`fd::` remote-helper
+/// transports, which execute arbitrary shell commands and which lindep never legitimately
+/// clones from. Standard URLs and local paths pass untouched. Applied to BOTH a repo's
+/// `remote` and `local` (which becomes the clone source for a local-only repo), so the
+/// two can never drift apart and let `local` smuggle a transport the `remote` path blocks.
+pub fn is_safe_git_source(s: &str) -> bool {
+    let s = s.trim();
+    !(s.starts_with('-') || s.starts_with("ext::") || s.starts_with("fd::"))
+}
+
 /// Derive a [`is_safe_handle`]-safe repo handle from a remote URL or local path:
 /// the last path segment, with any `.git` suffix dropped and every byte that isn't
 /// handle-safe collapsed to `-`. `"core"` for `git@github.com:org/core.git`,
@@ -572,8 +583,11 @@ fn render_binding(
         })?;
 
     // The first block we append gets a provenance marker; subsequent ones just a
-    // blank-line separator. (`first_new` is threaded so the marker lands once.)
-    let mut first_new = true;
+    // blank-line separator. (`first_new` is threaded so the marker lands once.) Seed it
+    // from whether the file already carries the marker — mirroring `register_repo` — so
+    // re-running the wizard to add another repo/project doesn't accrete a duplicate
+    // `# ── added by lindep ──` line on every edit.
+    let mut first_new = !existing.contains("# ── added by lindep ──");
     fn mark(t: &mut Table, first_new: &mut bool) {
         t.decor_mut().set_prefix(if *first_new {
             "\n# ── added by lindep ──\n"
@@ -600,6 +614,17 @@ fn render_binding(
             .as_array_of_tables_mut()
             .ok_or_else(|| not_aot(&path, "repo"))?;
         for d in new_repos {
+            // Never append a second `[[repo]]` for a handle the file already defines —
+            // a duplicate block makes the loader keep the first and silently drop this
+            // one, binding the project to the wrong repo. `register_repo` already guards
+            // this for the single-add path; this is the same guard for the wizard's
+            // batch write (defense-in-depth behind `resolve_repo_input`'s collision check).
+            if repos
+                .iter()
+                .any(|t| t.get("handle").and_then(|v| v.as_str()) == Some(d.handle.as_str()))
+            {
+                continue;
+            }
             let mut t = Table::new();
             t["handle"] = value(d.handle.clone());
             if let Some(r) = &d.remote {
@@ -711,6 +736,9 @@ pub fn write_binding(
     project: &ProjectDraft,
     scratch: &[ScratchDraft],
 ) -> Result<bool, RegistryError> {
+    // Hold the cross-process lock across the render (which reads the file) AND the write,
+    // so a concurrent instance can't slip an edit between our read and rename.
+    let _lock = RegistryLock::acquire(&layout.registry_path())?;
     let (out, existing) = render_binding(layout, new_repos, project, scratch)?;
     // `existing` is "" when the file is absent, which never equals a non-empty `out`,
     // so a first-time write always proceeds.
@@ -749,6 +777,8 @@ pub fn register_repo(layout: &Layout, draft: &RepoDraft) -> Result<bool, Registr
     use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
     let path = layout.registry_path();
+    // Lock across the whole read-modify-write so a concurrent instance's append isn't lost.
+    let _lock = RegistryLock::acquire(&path)?;
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -821,6 +851,8 @@ pub fn add_candidate(
     use toml_edit::{Array, DocumentMut, value};
 
     let path = layout.registry_path();
+    // Lock across the whole read-modify-write so a concurrent instance's edit isn't lost.
+    let _lock = RegistryLock::acquire(&path)?;
     let existing = std::fs::read_to_string(&path).map_err(|source| RegistryError::Write {
         path: path.clone(),
         source,
@@ -877,6 +909,72 @@ pub fn add_candidate(
 
     write_registry_atomic(&path, &doc.to_string())?;
     Ok(true)
+}
+
+/// Cross-process advisory lock over the user-global `registry.toml`, held for an entire
+/// read-modify-write so two lindep instances editing the shared registry can't
+/// last-rename-wins and silently drop one's appended repo/candidate. [`write_registry_atomic`]
+/// (temp + rename) prevents *corruption*; this prevents *lost updates* — the module's own
+/// "two lindep instances both writing" scenario. Advisory `flock` on a sibling
+/// `registry.toml.lock`, held for the whole RMW (acquire BEFORE the read, release on drop
+/// AFTER the rename), so each writer observes the prior writer's append before mutating.
+/// Unix-only; a no-op elsewhere (lindep's control plane is unix-only anyway).
+#[cfg(unix)]
+struct RegistryLock(std::fs::File);
+
+#[cfg(unix)]
+impl RegistryLock {
+    fn acquire(registry_path: &Path) -> Result<Self, RegistryError> {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = registry_path.with_extension("toml.lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| RegistryError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| RegistryError::Write {
+                path: lock_path.clone(),
+                source,
+            })?;
+        // SAFETY: `file` owns a valid fd for the lock's whole lifetime; LOCK_EX blocks
+        // until this process holds the exclusive lock, which `Drop` then releases.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(RegistryError::Write {
+                path: lock_path,
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(RegistryLock(file))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: our own still-open lock fd; releasing keeps the held window tight
+        // (the fd also drops here, which would release anyway).
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct RegistryLock;
+
+#[cfg(not(unix))]
+impl RegistryLock {
+    fn acquire(_registry_path: &Path) -> Result<Self, RegistryError> {
+        Ok(RegistryLock)
+    }
 }
 
 /// Durably replace `registry.toml` with `out`, matching `SessionStore::write_snapshot`:
@@ -1089,16 +1187,22 @@ impl RepoFile {
                 self.handle
             ));
         }
-        // The source is fed to `git clone` as a positional argument. We pass it after
-        // a `--` separator (see `mirror::ensure_*`), so a leading `-` can't be parsed
-        // as an option — but reject one here too (mirroring `is_safe_handle`) and the
-        // arbitrary-command `ext::`/`fd::` transports, which lindep never legitimately
-        // clones from. Standard URLs and local paths pass untouched.
-        if let Some(r) = &remote {
-            let r = r.trim();
-            if r.starts_with('-') || r.starts_with("ext::") || r.starts_with("fd::") {
-                return Err(format!("repo `{}` has an unsafe `remote`", self.handle));
-            }
+        // Both `remote` and `local` are fed to `git clone` as the positional source
+        // (a local-only repo clones from its `local` path; see `RepoEntry::mirror_source`
+        // / `mirror::ensure_*`). We pass it after a `--` separator so a leading `-`
+        // can't be read as an option — but reject the arbitrary-command `ext::`/`fd::`
+        // transports here too, which lindep never legitimately clones from. Screening
+        // ONLY `remote` left `local` as an equivalent command-injection vector, so both
+        // go through the same guard.
+        if let Some(r) = &remote
+            && !is_safe_git_source(r)
+        {
+            return Err(format!("repo `{}` has an unsafe `remote`", self.handle));
+        }
+        if let Some(l) = &local
+            && !is_safe_git_source(&l.to_string_lossy())
+        {
+            return Err(format!("repo `{}` has an unsafe `local`", self.handle));
         }
         Ok(RepoEntry {
             handle: self.handle,
