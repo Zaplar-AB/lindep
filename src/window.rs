@@ -835,8 +835,13 @@ impl WindowSet {
 // ── Dependency-tree construction (lifted verbatim from the v2 App lens) ───────
 
 /// Build the flattened upstream/downstream forest for `root`, honouring the
-/// per-root `collapsed` set. A faithful port of the v2 `App::build_forest` /
-/// `walk`, now a free function so every coin can build its own.
+/// per-root `collapsed` set. Behaviourally a faithful port of the v2
+/// `App::build_forest` / `walk`, but driven by an explicit heap work-stack rather
+/// than recursion: a deep `blocked_by`/`blocks` chain comes straight from live
+/// Linear data, so a recursive descent (one call frame per node) would overflow the
+/// call stack and abort the whole TUI — the exact hazard `model.rs` engineered out
+/// of every other traversal ("Iterative DFS so deep graphs cannot overflow the
+/// stack"). This rebuilds on every re-root / collapse-toggle / cursor-build.
 fn build_forest(
     graph: &Graph,
     root: &str,
@@ -852,92 +857,95 @@ fn build_forest(
     let mut path = HashSet::new();
     path.insert(root.to_string());
 
-    let children = graph.neighbours(root, dir);
-    for (i, child) in children.iter().enumerate() {
-        walk(
-            graph,
-            child,
-            dir,
-            tag,
-            &mut Vec::new(),
-            i + 1 == children.len(),
-            collapsed,
-            &mut path,
-            &mut drawn,
-            &mut rows,
-        );
+    // Pre-order DFS over an explicit stack. `Visit` does the per-node work a recursive
+    // call would; `PopPath` is the post-order bookkeeping the recursion did after its
+    // child loop (`path.remove(key)`), so cycle detection stays scoped to the live
+    // root→node path. Children are pushed in reverse so they pop in original order, and
+    // each node's children push ABOVE its own `PopPath`, so a whole subtree is processed
+    // before the node leaves `path` — identical ordering (and output) to the recursion.
+    enum Step {
+        Visit {
+            key: String,
+            is_last: bool,
+            ancestors: Vec<bool>,
+        },
+        PopPath(String),
+    }
+
+    let mut stack: Vec<Step> = Vec::new();
+    let top = graph.neighbours(root, dir);
+    for (i, child) in top.iter().enumerate().rev() {
+        stack.push(Step::Visit {
+            key: child.clone(),
+            is_last: i + 1 == top.len(),
+            ancestors: Vec::new(),
+        });
+    }
+
+    while let Some(step) = stack.pop() {
+        let (key, is_last, ancestors) = match step {
+            Step::PopPath(key) => {
+                path.remove(&key);
+                continue;
+            }
+            Step::Visit {
+                key,
+                is_last,
+                ancestors,
+            } => (key, is_last, ancestors),
+        };
+
+        let mut prefix = String::new();
+        for &last in ancestors.iter() {
+            prefix.push_str(if last { "   " } else { "│  " });
+        }
+        prefix.push_str(if is_last { "└─ " } else { "├─ " });
+
+        // Classify before deciding whether to descend.
+        let kind = if path.contains(&key) {
+            NodeKind::Cycle
+        } else if drawn.contains(&key) {
+            NodeKind::Ref
+        } else if graph.get(&key).is_some_and(|i| i.external) {
+            NodeKind::External
+        } else {
+            NodeKind::Normal
+        };
+
+        let children = graph.neighbours(&key, dir);
+        let has_children = kind == NodeKind::Normal && !children.is_empty();
+        let collapsed_here = has_children && collapsed.contains(&format!("{tag}:{key}"));
+
+        rows.push(TreeRow {
+            key: key.clone(),
+            prefix,
+            kind,
+            has_children,
+            collapsed: collapsed_here,
+        });
+
+        if kind != NodeKind::Normal {
+            continue; // Cycle / Ref / External are terminal
+        }
+        drawn.insert(key.clone());
+        if !has_children || collapsed_here {
+            continue;
+        }
+
+        // Descend: enter `path`, schedule the matching leave, then push children.
+        path.insert(key.clone());
+        stack.push(Step::PopPath(key.clone()));
+        let mut child_ancestors = ancestors;
+        child_ancestors.push(is_last);
+        for (i, child) in children.iter().enumerate().rev() {
+            stack.push(Step::Visit {
+                key: child.clone(),
+                is_last: i + 1 == children.len(),
+                ancestors: child_ancestors.clone(),
+            });
+        }
     }
     rows
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk(
-    graph: &Graph,
-    key: &str,
-    dir: Direction,
-    tag: &str,
-    ancestors: &mut Vec<bool>,
-    is_last: bool,
-    collapsed: &HashSet<String>,
-    path: &mut HashSet<String>,
-    drawn: &mut HashSet<String>,
-    rows: &mut Vec<TreeRow>,
-) {
-    let mut prefix = String::new();
-    for &last in ancestors.iter() {
-        prefix.push_str(if last { "   " } else { "│  " });
-    }
-    prefix.push_str(if is_last { "└─ " } else { "├─ " });
-
-    // Classify before deciding whether to recurse.
-    let kind = if path.contains(key) {
-        NodeKind::Cycle
-    } else if drawn.contains(key) {
-        NodeKind::Ref
-    } else if graph.get(key).is_some_and(|i| i.external) {
-        NodeKind::External
-    } else {
-        NodeKind::Normal
-    };
-
-    let children = graph.neighbours(key, dir);
-    let has_children = kind == NodeKind::Normal && !children.is_empty();
-    let collapsed_here = has_children && collapsed.contains(&format!("{tag}:{key}"));
-
-    rows.push(TreeRow {
-        key: key.to_string(),
-        prefix,
-        kind,
-        has_children,
-        collapsed: collapsed_here,
-    });
-
-    if kind != NodeKind::Normal {
-        return; // Cycle / Ref / External are terminal
-    }
-    drawn.insert(key.to_string());
-    if !has_children || collapsed_here {
-        return;
-    }
-
-    path.insert(key.to_string());
-    ancestors.push(is_last);
-    for (i, child) in children.iter().enumerate() {
-        walk(
-            graph,
-            child,
-            dir,
-            tag,
-            ancestors,
-            i + 1 == children.len(),
-            collapsed,
-            path,
-            drawn,
-            rows,
-        );
-    }
-    ancestors.pop();
-    path.remove(key);
 }
 
 /// Step a `ListState` selection by `delta`, wrapping; empties select nothing.
@@ -1317,5 +1325,50 @@ mod tests {
         assert!(ws.zoomed);
         ws.toggle_zoom();
         assert!(!ws.zoomed);
+    }
+
+    #[test]
+    fn build_forest_does_not_overflow_the_stack_on_a_deep_chain() {
+        // A deep blocker chain comes straight from live Linear data; the old recursive
+        // `walk` consumed one call frame per node and would overflow on a long chain,
+        // aborting the whole TUI mid-render. The iterative DFS must place every node
+        // with depth bounded by the heap, not the call stack — mirroring model.rs's
+        // `levels_do_not_overflow_the_stack_on_a_deep_chain`.
+        // The per-row tree prefix is O(depth), so a chain's total row memory is O(N²);
+        // 5_000 keeps that to tens of MB while being far deeper than any call stack a
+        // debug-build recursion would survive.
+        use crate::model::{Issue, Priority, Status};
+        const N: usize = 5_000;
+        let node = |key: &str| Issue {
+            key: key.into(),
+            title: key.into(),
+            status: Status::Started,
+            priority: Priority::None,
+            assignee: None,
+            external: false,
+        };
+        let mut g = Graph::new("t");
+        for i in 0..N {
+            g.add_issue(node(&format!("I-{i}")));
+        }
+        for i in 0..N - 1 {
+            // I-i blocks I-(i+1): a single chain N deep.
+            g.add_edge(&format!("I-{i}"), &format!("I-{}", i + 1));
+        }
+        g.finalize();
+
+        // Downstream from the head walks the entire chain; one row per descendant.
+        let rows = build_forest(&g, "I-0", Direction::Downstream, &HashSet::new());
+        assert_eq!(
+            rows.len(),
+            N - 1,
+            "every descendant is flattened, no overflow"
+        );
+        assert_eq!(rows[0].key, "I-1", "first descendant is the next link");
+        assert_eq!(rows[N - 2].key, format!("I-{}", N - 1), "down to the tail");
+        assert!(
+            rows.iter().all(|r| r.kind == NodeKind::Normal),
+            "an acyclic chain has no Cycle/Ref/External nodes"
+        );
     }
 }

@@ -335,11 +335,29 @@ pub fn probe_remote(remote: &str, timeout: std::time::Duration) -> Result<(), Mi
     // and the wizard owns the raw terminal — a hang there is unescapable. ls-remote's
     // stderr is a few lines at most, well under the pipe buffer, so leaving it unread
     // until the child exits can't deadlock.
+    // Drain stderr on a side thread so a verbose remote (ssh/credential chatter, or
+    // a misconfigured server) that writes past the ~64 KiB pipe buffer can't block
+    // git on its stderr write and never exit — which would otherwise burn the full
+    // timeout and misreport a real ls-remote failure as a generic "timed out". Same
+    // concurrent-drain pattern git_inner uses.
+    let stderr_reader = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = pipe.read_to_string(&mut s);
+            s
+        })
+    });
     let start = std::time::Instant::now();
     let status = loop {
-        match child.try_wait().map_err(MirrorError::Stream)? {
-            Some(status) => break status,
-            None if start.elapsed() >= timeout => {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            // A try_wait error still kills+reaps so we never leave a zombie.
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MirrorError::Stream(e));
+            }
+            Ok(None) if start.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(MirrorError::Git {
@@ -348,16 +366,15 @@ pub fn probe_remote(remote: &str, timeout: std::time::Duration) -> Result<(), Mi
                     stderr: format!("timed out after {}s", timeout.as_secs()),
                 });
             }
-            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     };
     if status.success() {
         return Ok(());
     }
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let stderr = stderr_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     Err(MirrorError::Git {
         command: format!("git ls-remote {remote}"),
         code: status.code(),
@@ -834,9 +851,18 @@ fn git_clone_streaming(args: &[&str], progress: Option<ProgressFn>) -> Result<()
     // (EOF) but BEFORE it exits — a post-close repack/checkout that wedges — so the
     // final reap can't block forever (CF-7).
     let status = loop {
-        match child.try_wait().map_err(MirrorError::Stream)? {
-            Some(status) => break status,
-            None => {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            // A try_wait error (e.g. EINTR/ECHILD) must still kill+reap the child
+            // before returning, like every other early-exit in this fn — otherwise
+            // the just-spawned git is left unreaped holding the half-built
+            // `*.partial` dir, diverging from the function's kill+reap discipline (CF-7).
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MirrorError::Stream(e));
+            }
+            Ok(None) => {
                 if clone_start.elapsed() >= GIT_NET_TIMEOUT {
                     let _ = child.kill();
                     let _ = child.wait();

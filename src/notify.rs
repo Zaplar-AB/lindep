@@ -179,6 +179,21 @@ pub async fn serve(events: AppEventTx, stores: StoreRegistry) -> std::io::Result
     Ok(Endpoint { port, token })
 }
 
+/// Constant-time byte-slice equality for secret comparison: never short-circuits
+/// on the first mismatching byte, so a timing side-channel can't reveal the token
+/// one byte at a time. Length difference is allowed to leak (the bearer token is a
+/// fixed-width UUID, so its length is not a secret).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Read one request, route it, and reply `200 OK`. Requests missing or
 /// mismatching the bearer token are acked but never routed.
 async fn handle_conn(
@@ -190,8 +205,12 @@ async fn handle_conn(
     if let Some(req) = read_request(&mut stream).await
         // Gate on the bearer token *before* doing anything else, so an
         // unauthenticated/forged request is acked but never routed and can't
-        // even trigger a diagnostic line.
-        && req.token.as_deref() == Some(token)
+        // even trigger a diagnostic line. Compared in constant time so the secret
+        // gating hook forgery can't be recovered byte-by-byte via loopback timing.
+        && req
+            .token
+            .as_deref()
+            .is_some_and(|t| ct_eq(t.as_bytes(), token.as_bytes()))
     {
         match serde_json::from_slice::<HookPayload>(&req.body) {
             Ok(payload) => route(&payload, &stores, &events).await,
@@ -845,24 +864,42 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Write `contents` to `path` (truncating) executable (`0o755`) on Unix — unlike
-/// the owner-only settings file, a git hook must be executable to run.
+/// Write `contents` to `path` executable (`0o755`) on Unix — unlike the owner-only
+/// settings file, a git hook must be executable to run. Written atomically via a
+/// sibling temp + fsync + rename so a crash mid-write can never leave a truncated,
+/// still-executable `post-commit` that `/bin/sh` would run on the next commit
+/// (a partial hook silently drops auto-push). An executor sees either the old
+/// complete hook or the new complete hook, never a half-written one.
 fn write_executable(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o755);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("hook"),
+        std::process::id()
+    ));
+    let write_tmp = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o755);
+        }
+        let mut file = opts.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        }
+        file.write_all(contents)?;
+        file.sync_all()
+    };
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    let mut file = opts.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
-    }
-    file.write_all(contents)
+    std::fs::rename(&tmp, path)
 }
 
 /// Per-repo-handle push serialization. Two commits in different worktrees of one
@@ -895,6 +932,30 @@ pub fn push_head_serialized(
     crate::mirror::push_head(worktree)
 }
 
+/// Tracks the detached auto-push tasks so a clean shutdown can await any commit's
+/// publish that is still in flight, instead of dropping the runtime mid-`git`. The
+/// supervisor's `tracker.wait()` only covers per-agent supervise tasks and has no
+/// visibility into these; without this, quitting during an in-flight push strands
+/// the commit locally with no `AgentCommitted`/`PushOutcome` event ever delivered
+/// (no "pushed", no "unpushed" chip) — the exact data-loss `PushOutcome` exists to
+/// prevent, reached via a shutdown race rather than a reject.
+fn auto_push_tracker() -> &'static tokio_util::task::TaskTracker {
+    static TRACKER: std::sync::LazyLock<tokio_util::task::TaskTracker> =
+        std::sync::LazyLock::new(tokio_util::task::TaskTracker::new);
+    &TRACKER
+}
+
+/// Await every in-flight auto-push (bounded by `grace`) so a commit's publish either
+/// completes or is surfaced via its `AgentCommitted` event before the runtime is
+/// dropped on quit. Best-effort: if `grace` elapses the remaining pushes are
+/// abandoned (each is already capped by `mirror::GIT_NET_TIMEOUT`, so they drain
+/// fast and a single wedged push can't freeze quit). Call from the shutdown path.
+pub async fn drain_auto_pushes(grace: Duration) {
+    let tracker = auto_push_tracker();
+    tracker.close();
+    let _ = tokio::time::timeout(grace, tracker.wait()).await;
+}
+
 /// Push a committed branch to its true remote in the background, then emit ONE
 /// [`AppEvent::AgentCommitted`] carrying the push's true [`PushOutcome`]. Folding the
 /// outcome into the single event is the fix for the data-integrity bug where a reject
@@ -909,7 +970,7 @@ fn spawn_auto_push(
     branch: String,
     worktree: PathBuf,
 ) {
-    tokio::spawn(async move {
+    auto_push_tracker().spawn(async move {
         let lock = push_mutex(&repo_handle);
         let handle = repo_handle.clone();
         let outcome = tokio::task::spawn_blocking(move || push_committed(&handle, &worktree, lock))

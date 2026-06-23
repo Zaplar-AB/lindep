@@ -222,11 +222,16 @@ fn sh_quote(s: &str) -> String {
 
 /// Parse `KEY=VALUE` lines from a provision command's stdout (other lines ignored).
 /// `KEY` must be a valid env identifier (`[A-Za-z_][A-Za-z0-9_]*`); the value is the
-/// rest of the line as-is (the newline already stripped by `lines()`).
+/// rest of the line as-is, except a trailing `\r` — `lines()` strips `\n` but not the
+/// `\r` of a CRLF, and a CRLF-emitting provision command (a Windows-authored tool, a
+/// DOS-line-ending script) would otherwise inject a corrupted value like `"5432\r"`
+/// into the agent's env. (Interior/leading value whitespace is kept verbatim, per the
+/// `KEY=VALUE`/`.env` convention, so tokens and quoted values survive intact.)
 fn parse_env_lines(stdout: &str) -> Vec<(String, String)> {
     stdout
         .lines()
         .filter_map(|line| {
+            let line = line.trim_end_matches('\r');
             let (key, value) = line.split_once('=')?;
             let key = key.trim();
             let valid = !key.is_empty()
@@ -406,6 +411,19 @@ mod tests {
             vec![
                 ("DATABASE_URL".to_string(), "postgres:///x".to_string()),
                 ("PORT".to_string(), "5432".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_env_lines_strips_a_crlf_trailing_carriage_return() {
+        // A CRLF-emitting provision command must not inject `"5432\r"` as the value.
+        let env = parse_env_lines("PORT=5432\r\nDATABASE_URL=postgres:///x\r\n");
+        assert_eq!(
+            env,
+            vec![
+                ("PORT".to_string(), "5432".to_string()),
+                ("DATABASE_URL".to_string(), "postgres:///x".to_string()),
             ]
         );
     }

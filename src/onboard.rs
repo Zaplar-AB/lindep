@@ -618,6 +618,20 @@ pub(crate) fn resolve_repo_input(raw: &str, registered: &[String]) -> Result<Res
         if !registry::is_safe_handle(&handle) {
             return Err("couldn't derive a name from that path — try another".into());
         }
+        // A *derived* handle that collides with an already-registered repo must not
+        // silently produce a fresh draft: the wizard's batch writer appends it as a
+        // second `[[repo]]` block under the same handle, the loader then keeps the
+        // pre-existing one and drops this one, and the project ends up bound to a
+        // *different* repo of the same name. Only an EXACT typed handle (path 1) is a
+        // safe reuse — a path/URL is too ambiguous to auto-reuse, so make the user
+        // disambiguate. (The exact-handle reuse `registered.contains(input)` already
+        // ran above, so reaching here means the input was a path, not that handle.)
+        if registered.iter().any(|h| h == &handle) {
+            return Err(format!(
+                "a repo named '{handle}' is already registered — type '{handle}' to reuse it, \
+                 or point at a differently-named repo"
+            ));
+        }
         let label = remote
             .clone()
             .unwrap_or_else(|| "local-only (no origin remote)".to_string());
@@ -646,6 +660,15 @@ pub(crate) fn resolve_repo_input(raw: &str, registered: &[String]) -> Result<Res
         let handle = registry::handle_from_source(input);
         if !registry::is_safe_handle(&handle) {
             return Err("couldn't derive a name from that URL — try another".into());
+        }
+        // Same collision guard as the directory branch: a URL whose last segment
+        // derives an already-registered handle would otherwise silently bind the
+        // project to a different repo of the same name (see the dir branch above).
+        if registered.iter().any(|h| h == &handle) {
+            return Err(format!(
+                "a repo named '{handle}' is already registered — type '{handle}' to reuse it, \
+                 or point at a differently-named repo"
+            ));
         }
         return Ok(ResolvedRepo {
             handle: handle.clone(),
@@ -723,16 +746,49 @@ fn default_remote_probe(remote: &str) -> Result<(), String> {
 /// The `origin` remote URL of a git clone, or `None` if it isn't a repo or has no
 /// origin (a local-only repo lindep mirrors from the clone itself).
 fn git_origin(dir: &Path) -> Option<String> {
-    let out = Command::new("git")
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    // `git remote get-url origin` is a local config read (no network), but `resolve_repo_input`
+    // can run on the cockpit's synchronous render thread (CF-20 typed add). Bound the
+    // subprocess so a wedged filesystem (NFS) or a stuck git can never freeze the UI
+    // indefinitely; `GIT_TERMINAL_PROMPT=0` keeps it from ever blocking on a prompt. The
+    // cap is generous enough never to trip for a healthy repo (the call is normally sub-ms).
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(["remote", "get-url", "origin"])
-        .output()
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if start.elapsed() >= TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // One short line, well under the pipe buffer, so reading after exit can't deadlock.
+    let mut url = String::new();
+    child.stdout.take()?.read_to_string(&mut url).ok()?;
+    let url = url.trim().to_string();
     (!url.is_empty()).then_some(url)
 }
 

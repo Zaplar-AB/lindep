@@ -30,8 +30,15 @@ use crate::theme::{AMBER_400, GREEN_100, GREEN_400, INK, MUTED, RED_400, VIOLET_
 /// alternate screen; the caller restores nothing.
 pub fn prompt_for_key() -> Result<Option<String>, String> {
     let mut terminal = ratatui::init();
-    let outcome = run_loop(&mut terminal);
+    let mut warn = None;
+    let outcome = run_loop(&mut terminal, &mut warn);
     ratatui::restore();
+    // Surface a best-effort-persistence failure now that the alternate screen is
+    // gone — otherwise a key that "saved" but didn't reach disk re-prompts next
+    // run with no explanation (the UI promised "save to ~/.config/lindep/.env").
+    if let Some(msg) = warn {
+        eprintln!("lindep: {msg}");
+    }
     outcome
 }
 
@@ -43,7 +50,10 @@ struct KeyPrompt {
     checking: bool,
 }
 
-fn run_loop(terminal: &mut DefaultTerminal) -> Result<Option<String>, String> {
+fn run_loop(
+    terminal: &mut DefaultTerminal,
+    warn: &mut Option<String>,
+) -> Result<Option<String>, String> {
     let mut state = KeyPrompt {
         input: String::new(),
         error: None,
@@ -94,8 +104,15 @@ fn run_loop(terminal: &mut DefaultTerminal) -> Result<Option<String>, String> {
                     Ok(_) => {
                         // Best-effort persistence — a working key shouldn't fail the
                         // launch just because the disk write hiccupped; worst case the
-                        // next run prompts again.
-                        let _ = persist_key(&candidate);
+                        // next run prompts again. But a *persistent* failure must not be
+                        // invisible (the status line promised a save), so capture it for
+                        // the caller to print once the alternate screen is restored.
+                        if let Err(e) = persist_key(&candidate) {
+                            *warn = Some(format!(
+                                "key validated but couldn't be saved to ~/.config/lindep/.env \
+                                 ({e}); it works this run but you may be prompted again next time"
+                            ));
+                        }
                         // Use it for the rest of this run. Safe: we're single-threaded
                         // here (pre-TUI, before any tokio runtime spawns).
                         unsafe { std::env::set_var("LINEAR_API_KEY", &candidate) };
@@ -188,17 +205,52 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 /// Upsert `LINEAR_API_KEY=<key>` into `~/.config/lindep/.env`, preserving every other
-/// line. Atomic (tmp + rename). Returns the written path.
+/// line. Atomic and crash-durable (owner-only tmp → fsync → rename → fsync parent)
+/// and owner-only (`0o600` on Unix) — the same discipline the crate's other secret/
+/// state writers use (`registry::write_registry_atomic`, `SessionStore::write_snapshot`,
+/// `notify::write_owner_only`). A long-lived personal API key is at least as sensitive
+/// as the per-run hook token those guard, so it must not land world-readable, and the
+/// "Atomic" promise must hold against power loss. Returns the written path.
 fn persist_key(key: &str) -> io::Result<PathBuf> {
+    use std::io::Write;
     let home = std::env::var_os("HOME")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "$HOME is not set"))?;
     let dir = Path::new(&home).join(".config/lindep");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(".env");
     let body = upsert_env(&std::fs::read_to_string(&path).unwrap_or_default(), key);
-    let tmp = dir.join(".env.tmp");
-    std::fs::write(&tmp, body.as_bytes())?;
+
+    // Process-unique temp so a stray writer can't collide and a failed write leaves
+    // an unambiguously-ours file to remove.
+    let tmp = dir.join(format!(".env.tmp.{}", std::process::id()));
+    let write_tmp = || -> io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // `mode` only applies on create; tighten a pre-existing temp too.
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(body.as_bytes())?;
+        f.sync_all() // fsync data before the rename publishes it
+    };
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp); // don't litter on a wedged/full disk
+        return Err(e);
+    }
     std::fs::rename(&tmp, &path)?;
+    // fsync the directory so the rename metadata itself survives a crash; the rename
+    // replaces any stale 0o644 `.env` inode, so the final file inherits the tmp's mode.
+    if let Ok(d) = std::fs::File::open(&dir) {
+        let _ = d.sync_all();
+    }
     Ok(path)
 }
 

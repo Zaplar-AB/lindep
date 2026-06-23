@@ -32,7 +32,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Hardened ssh for git network ops: fail fast on an unknown host key or a dead host
+/// rather than prompting on a no-tty (which would hang forever holding `git_lock`).
+const GIT_SSH_HARDENED: &str = "ssh -o BatchMode=yes -o ConnectTimeout=8";
+
+/// Wall-clock cap on a worktree network fetch, so a black-holed remote can't pin the
+/// cross-clone `git_lock` indefinitely (mirrors `mirror::GIT_NET_TIMEOUT`'s intent).
+const GIT_NET_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Anything that can go wrong driving `git`.
 #[derive(Debug, thiserror::Error)]
@@ -386,9 +394,11 @@ impl WorktreeManager {
         if base == "HEAD" {
             return "HEAD".to_string();
         }
-        // Best-effort: offline / a missing remote just leaves the chain to fall
-        // through to a local ref or HEAD. Never fatal to a launch.
-        let _ = self.git(&["fetch", "--prune", "origin"]);
+        // Best-effort and wall-clock-bounded: offline / a missing remote / a slow or
+        // black-holed remote just leaves the chain to fall through to a local ref or
+        // HEAD. Never fatal to a launch — and the timeout bounds how long this can hold
+        // the cross-clone `git_lock` (see `git_network`).
+        let _ = self.git_network(&["fetch", "--prune", "origin"]);
         let mut candidates: Vec<String> = Vec::new();
         if !base.starts_with("origin/") {
             candidates.push(format!("origin/{base}"));
@@ -485,12 +495,19 @@ impl WorktreeManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Run `git -C <repo_root> <args>`, returning stdout on success.
+    /// Run `git -C <repo_root> <args>`, returning stdout on success. Every invocation
+    /// disables interactive prompts: a credential or unknown-host-key prompt on a no-tty
+    /// would otherwise block on stdin forever — and since `create` holds the cross-clone
+    /// `git_lock` across `resolve_base`'s network fetch, that hang would wedge every other
+    /// agent's create/remove on the same clone. `GIT_SSH_COMMAND` adds `BatchMode`/
+    /// `ConnectTimeout` so ssh fails fast; both are harmless for local ops and https.
     fn git(&self, args: &[&str]) -> Result<String, WorktreeError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.repo_root)
             .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", GIT_SSH_HARDENED)
             .output()
             .map_err(WorktreeError::Spawn)?;
         if !output.status.success() {
@@ -501,6 +518,70 @@ impl WorktreeManager {
             });
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Like [`Self::git`] but caps the wall-clock so a black-holed remote can't run
+    /// forever. `BatchMode`/`ConnectTimeout` catch an auth prompt or a refused connect,
+    /// but not a connection that stalls *mid-transfer*; only a wall-clock kill bounds
+    /// that. Used for `resolve_base`'s network fetch, which runs under `git_lock` — an
+    /// unbounded hang there pins every other agent's create/remove on the same clone.
+    /// Best-effort: a timeout is reported like any other git failure and `resolve_base`
+    /// falls through to HEAD, so a launch never fails because the fetch was slow.
+    fn git_network(&self, args: &[&str]) -> Result<String, WorktreeError> {
+        use std::io::Read;
+        use std::process::Stdio;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", GIT_SSH_HARDENED)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()) // fetch output is unused; null avoids a stdout-buffer stall
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(WorktreeError::Spawn)?;
+        // Drain stderr on a side thread so a chatty remote writing past the pipe buffer
+        // can't block git on its stderr write past the timeout (cf. mirror::probe_remote).
+        let stderr_reader = child.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = pipe.read_to_string(&mut s);
+                s
+            })
+        });
+        let start = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(WorktreeError::Spawn(e));
+                }
+                Ok(None) if start.elapsed() >= GIT_NET_TIMEOUT => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(WorktreeError::Git {
+                        command: format!("git {}", args.join(" ")),
+                        code: None,
+                        stderr: format!("timed out after {}s", GIT_NET_TIMEOUT.as_secs()),
+                    });
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        };
+        let stderr = stderr_reader
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        if !status.success() {
+            return Err(WorktreeError::Git {
+                command: format!("git {}", args.join(" ")),
+                code: status.code(),
+                stderr: stderr.trim().to_string(),
+            });
+        }
+        Ok(String::new())
     }
 
     /// The local branch pinned to `issue`, if one already exists, regardless of
