@@ -424,6 +424,19 @@ pub struct App {
     /// for the active project and `world` for the rest, so a late post-reap hook in
     /// the active project can't double-count a just-removed agent.
     pub world: HashMap<String, HashMap<String, AgentStatus>>,
+    /// The human-facing *reason* each needs-you agent last gave — "approve bash:
+    /// git push", "plan ready for review", an idle nudge — keyed `project_id` →
+    /// `issue` → reason, exactly like [`world`](Self::world). The `AgentNeedsYou`
+    /// event already carries this string, but it used to live for a single footer
+    /// paint before the next keystroke wiped it; persisting it turns "something,
+    /// somewhere needs me" into an actionable triage queue you can read off the
+    /// spine, the rail cards, the `i` summary and the global screen without
+    /// attaching to a PTY. Maintained *only* in [`update_world`](Self::update_world)
+    /// so it stays in lockstep with `world`'s NeedsYou entries across every project
+    /// (set when an agent flags, cleared the instant it resumes / changes status /
+    /// is reaped — the same mirror set `world` itself uses). Read via
+    /// [`needs_you_reason`](Self::needs_you_reason).
+    needs_you_reasons: HashMap<String, HashMap<String, String>>,
     /// The open global all-agents screen (ENG-406, `Ctrl-a a`), if any. Full modal.
     pub global_view: Option<GlobalView>,
     /// A pending cross-project landing (ENG-406): `(project_id, issue, attach, gen)`.
@@ -575,6 +588,7 @@ impl App {
             stashed_backends: HashMap::new(),
             other_needs_you: HashMap::new(),
             world: HashMap::new(),
+            needs_you_reasons: HashMap::new(),
             global_view: None,
             pending_land: None,
             switch_inbox: Arc::new(Mutex::new(None)),
@@ -2202,7 +2216,8 @@ impl App {
             });
             self.open_agent_window(&key);
             self.set_footer(
-                "select repos for ad-hoc agent · space toggles · ⏎ launch · esc cancel".into(),
+                "select repos for ad-hoc agent · space toggles · a add repo · ⏎ launch · esc cancel"
+                    .into(),
             );
             return;
         }
@@ -2489,19 +2504,54 @@ impl App {
         if self.repo_select.is_none() {
             return;
         }
-        // While the add-list is open, keys drive IT: ↑↓ move, Enter pulls the repo into
-        // the checklist, Esc backs out to the main checklist (not the whole modal).
+        // While the add-list is open, keys drive IT: type a URL/path into the field,
+        // ↑↓ move the pick-list, Esc backs out to the main checklist (not the whole modal).
+        // Enter with text typed resolves+registers the new repo; Enter with an empty field
+        // picks the highlighted registered repo (the original CF-20 reuse path).
         if self
             .repo_select
             .as_ref()
             .is_some_and(|s| s.picker.is_adding())
         {
-            let picker = &mut self.repo_select.as_mut().expect("Some").picker;
+            // Ctrl-c still aborts the whole launch from inside the add-list (matches the
+            // main checklist), so a half-typed repo doesn't trap the human in the modal.
+            if let KeyCode::Char('c') = key.code
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                self.repo_select = None;
+                self.set_footer("launch cancelled".into());
+                return;
+            }
             match key.code {
-                KeyCode::Esc => picker.cancel_add(),
-                KeyCode::Down => picker.move_by(1),
-                KeyCode::Up => picker.move_by(-1),
-                KeyCode::Enter => picker.confirm_add(),
+                KeyCode::Esc => self.repo_select.as_mut().expect("Some").picker.cancel_add(),
+                KeyCode::Down => self.repo_select.as_mut().expect("Some").picker.move_by(1),
+                KeyCode::Up => self.repo_select.as_mut().expect("Some").picker.move_by(-1),
+                KeyCode::Backspace => {
+                    self.repo_select.as_mut().expect("Some").picker.add_input_pop()
+                }
+                KeyCode::Enter => {
+                    let typed = self
+                        .repo_select
+                        .as_ref()
+                        .expect("Some")
+                        .picker
+                        .add_input()
+                        .to_string();
+                    if typed.is_empty() {
+                        // Empty field → pick the highlighted registered repo (CF-20 reuse).
+                        self.repo_select.as_mut().expect("Some").picker.confirm_add();
+                    } else {
+                        self.add_typed_repo(&typed);
+                    }
+                }
+                // Any other printable char (no CONTROL/ALT) is input for the URL/path field.
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.repo_select.as_mut().expect("Some").picker.add_input_push(c)
+                }
                 _ => {}
             }
             return;
@@ -2517,18 +2567,19 @@ impl App {
             }
             KeyCode::Char(' ') => self.repo_select.as_mut().expect("Some").picker.toggle(),
             KeyCode::Char('a') => {
-                // Open the add-list over registered repos this project doesn't yet list.
-                // Disjoint fields (`repo_select` mut, `registered_repos` shared), so this
-                // borrow pair is fine; footer the empty case after releasing the borrow.
-                let opened = self
-                    .repo_select
+                // Open the add-list: registered repos this project doesn't yet list, ABOVE
+                // a text field for typing a brand-new repo (a URL or path) the registry
+                // doesn't know yet — the in-cockpit equivalent of the wizard's Repos step
+                // (CF-20). Disjoint fields (`repo_select` mut, `registered_repos` shared).
+                self.repo_select
                     .as_mut()
                     .expect("Some")
                     .picker
                     .open_add(&self.registered_repos);
-                if !opened {
-                    self.set_footer("no other registered repos to add".into());
-                }
+                self.set_footer(
+                    "add a repo · type a URL/path for a new one · ↑↓ pick · ⏎ add · esc back"
+                        .into(),
+                );
             }
             KeyCode::Down => self.repo_select.as_mut().expect("Some").picker.move_by(1),
             KeyCode::Up => self.repo_select.as_mut().expect("Some").picker.move_by(-1),
@@ -2617,6 +2668,83 @@ impl App {
                 self.set_footer(format!("couldn't persist repo {handle}: {e}"));
             }
         }
+    }
+
+    /// Resolve a typed repo input (a URL / local path / existing handle) from the picker's
+    /// add-list and fold it in — the in-cockpit twin of the onboarding wizard's Repos step
+    /// (CF-20). It runs the SAME resolution ([`crate::onboard::resolve_repo_input`]) the
+    /// wizard does, so a repo added here obeys identical rules. A genuinely-new repo gets a
+    /// `[[repo]]` block written and is widened into the project's candidates durably; an
+    /// exact existing handle is just added as a candidate. Either way it's checked into
+    /// THIS launch and surfaced in-session (`registered_repos` + `project_candidates`) so
+    /// it's usable with no restart. A resolve/write error footers and leaves the add-list
+    /// open (input intact) so the human can fix it. No network probe runs here — unlike the
+    /// wizard's Confirm step — so the cockpit's render thread never blocks on a remote; an
+    /// unreachable remote surfaces later as a non-fatal clone failure at materialize time.
+    fn add_typed_repo(&mut self, input: &str) {
+        let registered: Vec<String> = self
+            .registered_repos
+            .iter()
+            .map(|r| r.handle.clone())
+            .collect();
+        let resolved = match crate::onboard::resolve_repo_input(input, &registered) {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_footer(e);
+                return;
+            }
+        };
+        let active = self.active_project.clone();
+        let handle = resolved.handle.clone();
+        // Local-only when a new repo has no remote (a typed local path with no origin), or
+        // — for a reuse — whatever the registered repo already is (drives the `(local)` tag,
+        // and the agent's PR/auto-push gating downstream).
+        let local_only = match &resolved.draft {
+            Some(d) => d.remote.is_none(),
+            None => self
+                .registered_repos
+                .iter()
+                .find(|r| r.handle == handle)
+                .is_some_and(|r| r.local),
+        };
+
+        // Durable side (skipped only in headless tests with no layout): write a `[[repo]]`
+        // block for a genuinely-new repo, then widen the project's candidate set. Bail on a
+        // write error WITHOUT touching in-session state, so disk and memory don't diverge.
+        if let Some(layout) = self.layout.clone() {
+            if let Some(draft) = &resolved.draft
+                && let Err(e) = crate::registry::register_repo(&layout, draft)
+            {
+                self.set_footer(format!("couldn't register repo {handle}: {e}"));
+                return;
+            }
+            if let Err(e) = crate::registry::add_candidate(&layout, &active, &handle) {
+                self.set_footer(format!("couldn't persist repo {handle}: {e}"));
+                return;
+            }
+        }
+
+        let choice = RepoChoice {
+            handle: handle.clone(),
+            local: local_only,
+            primary: false,
+        };
+        // In-session, no restart: a known registered repo + a project candidate, so a later
+        // `a` lists it and a plain Enter next time offers it.
+        if !self.registered_repos.iter().any(|r| r.handle == handle) {
+            self.registered_repos.push(choice.clone());
+        }
+        let cands = self.project_candidates.entry(active).or_default();
+        if !cands.iter().any(|c| c.handle == handle) {
+            cands.push(choice.clone());
+        }
+        // Check it into THIS launch and close the add-list.
+        self.repo_select
+            .as_mut()
+            .expect("Some")
+            .picker
+            .push_checked_and_close(choice);
+        self.set_footer(format!("added {handle} · ⏎ to launch"));
     }
 
     /// Open the disk-reclaim prompt (ENG-540, `Ctrl-a m`): scan for unreferenced
@@ -3866,8 +3994,15 @@ impl App {
                         if !self.needs_you_alert && !self.confirm_pending() {
                             let name = self.project_name(&project_id);
                             let switch = self.keymap.verb_label(Action::SwitchProject);
+                            // Name the ask in the toast too (stored cross-project by
+                            // `update_world` above), so a backgrounded prompt tells you
+                            // WHAT before you spend a switch to reach it.
+                            let ask = self
+                                .needs_you_reason(&project_id, &issue)
+                                .map(|r| format!(": {r}"))
+                                .unwrap_or_default();
                             self.status_msg = Some(format!(
-                                "⚑ {issue} in {name} needs you — {switch} to switch"
+                                "⚑ {issue} in {name} needs you{ask} — {switch} to switch"
                             ));
                         }
                         repaint = true; // refresh the header "elsewhere" badge
@@ -4094,7 +4229,7 @@ impl App {
                 }
                 true
             }
-            AppEvent::AgentNeedsYou { issue, reason, .. } => {
+            AppEvent::AgentNeedsYou { issue, .. } => {
                 self.restore_ask_issue_if_needed(&issue);
                 if self.is_terminal(&issue) || self.reaped.contains(&issue) {
                     return false;
@@ -4107,7 +4242,15 @@ impl App {
                 // badge + flag still show it), so it isn't lost — it just doesn't seize the
                 // prompt slot while a confirmation owns `status_msg` and its `y`.
                 if !self.confirm_pending() {
-                    self.status_msg = Some(format!("⚑ {issue} needs you — {reason}"));
+                    // Read the ask back from the store (already sanitised to one line by
+                    // `update_world`, which ran at the top of this `apply_event`) so the
+                    // transient footer shows the identical text the spine / cards / summary
+                    // do — one source, no raw multi-line hook message corrupting the line.
+                    let ask = self
+                        .needs_you_reason(&self.active_project, &issue)
+                        .map(|r| format!(" — {r}"))
+                        .unwrap_or_default();
+                    self.status_msg = Some(format!("⚑ {issue} needs you{ask}"));
                 }
                 true
             }
@@ -4561,7 +4704,9 @@ impl App {
                     .insert(issue.clone(), AgentStatus::Spawning);
             }
             AppEvent::AgentNeedsYou {
-                project_id, issue, ..
+                project_id,
+                issue,
+                reason,
             } => {
                 if blocked(self, project_id, issue) {
                     return;
@@ -4570,6 +4715,9 @@ impl App {
                     .entry(project_id.clone())
                     .or_default()
                     .insert(issue.clone(), AgentStatus::NeedsYou);
+                // Remember WHAT it wants, in lockstep with the NeedsYou status above,
+                // so every standing surface can show the ask, not just "needs you".
+                self.set_needs_reason(project_id, issue, reason);
             }
             AppEvent::AgentStatusChanged {
                 project_id,
@@ -4583,6 +4731,11 @@ impl App {
                     .entry(project_id.clone())
                     .or_default()
                     .insert(issue.clone(), *status);
+                // Any status that isn't NeedsYou supersedes the standing ask — drop it
+                // so a resolved/finished agent never lingers under a stale reason.
+                if !status.needs_you() {
+                    self.clear_needs_reason(project_id, issue);
+                }
             }
             AppEvent::AgentAction {
                 project_id,
@@ -4607,6 +4760,8 @@ impl App {
                     && !s.is_idle()
                 {
                     *s = AgentStatus::Running;
+                    // The agent answered and resumed — its ask is satisfied.
+                    self.clear_needs_reason(project_id, issue);
                 }
             }
             AppEvent::AgentReaped { project_id, issue }
@@ -4619,9 +4774,56 @@ impl App {
                         self.world.remove(project_id);
                     }
                 }
+                // A gone agent has nothing left to ask — drop its reason too.
+                self.clear_needs_reason(project_id, issue);
+            }
+            // A discarded workspace is the definitive "this issue is gone" signal. Its
+            // reason is normally already cleared (a discardable agent is not-live, so it
+            // was reaped or reached a terminal status — both clear above), but clearing it
+            // here too keeps the store from ever outliving its workspace under any future
+            // change to discard gating. Handled in this one funnel so the field's
+            // "maintained only in update_world" contract stays true.
+            AppEvent::WorkspaceDiscarded { project_id, issue } => {
+                self.clear_needs_reason(project_id, issue);
             }
             _ => {}
         }
+    }
+
+    /// Store an agent's needs-you reason, sanitised to a single bounded line (see
+    /// [`sanitize_reason`]). Skips a reason that sanitises to nothing rather than
+    /// stamping an empty ask. Mirrors `world`'s nested keying so the two stay aligned.
+    fn set_needs_reason(&mut self, project_id: &str, issue: &str, reason: &str) {
+        let reason = sanitize_reason(reason);
+        if reason.is_empty() {
+            return;
+        }
+        self.needs_you_reasons
+            .entry(project_id.to_string())
+            .or_default()
+            .insert(issue.to_string(), reason);
+    }
+
+    /// Drop an agent's standing reason, pruning the project's map when it empties so
+    /// the store can't accrete dead project keys (mirrors `world`'s cleanup).
+    fn clear_needs_reason(&mut self, project_id: &str, issue: &str) {
+        if let Some(m) = self.needs_you_reasons.get_mut(project_id) {
+            m.remove(issue);
+            if m.is_empty() {
+                self.needs_you_reasons.remove(project_id);
+            }
+        }
+    }
+
+    /// The reason the agent on `(project_id, issue)` last said it needs you, while
+    /// that ask still stands — `None` once it resumes, changes status, or is reaped.
+    /// Maintained for *every* project (see [`needs_you_reasons`](Self::needs_you_reasons)),
+    /// so the active spine and the cross-project global screen read the same source.
+    pub fn needs_you_reason(&self, project_id: &str, issue: &str) -> Option<&str> {
+        self.needs_you_reasons
+            .get(project_id)
+            .and_then(|m| m.get(issue))
+            .map(String::as_str)
     }
 
     /// Live-agent + needs-you counts across the WHOLE workspace (ENG-406): the active
@@ -4990,8 +5192,16 @@ impl App {
     /// the cycle and needs-you spine jumps.
     fn set_jump_status(&mut self, prefix: &str, key: &str, n: usize, total: usize) {
         self.aim_spine(key.to_string());
+        // When the jump lands on an issue whose agent needs you, lead with WHAT it wants
+        // — so `n` ("next needs-you") is an actionable triage step, not just a cursor move.
+        // A reason only exists for a standing needs-you agent, so this is naturally inert
+        // for cycle / next-agent jumps that land elsewhere.
+        let ask = self
+            .needs_you_reason(&self.active_project, key)
+            .map(|r| format!(" — {r}"))
+            .unwrap_or_default();
         self.status_msg = Some(format!(
-            "{prefix} {n}/{total} — {key}{}",
+            "{prefix} {n}/{total} — {key}{}{ask}",
             self.hidden_note()
         ));
     }
@@ -5058,6 +5268,46 @@ fn reclaim_note(res: Result<(), crate::mirror::MirrorError>, handle: &str) -> St
         Ok(()) => format!("reclaimed mirror {handle}"),
         Err(e) => format!("reclaim refused: {e}"),
     }
+}
+
+/// The longest a stored needs-you reason may be, in chars. A hook's `message` is
+/// arbitrary agent text; keep it generous enough for a full permission line ("approve
+/// Bash: git push --force …") yet bounded so a runaway string can't bloat the store or
+/// the JSON the surfaces render from. Per-surface rendering truncates further to fit.
+const MAX_REASON: usize = 200;
+
+/// Collapse an agent's raw needs-you `reason` into a single, bounded, control-free
+/// line fit to render anywhere. Hook messages can carry newlines, tabs, ANSI/control
+/// bytes and trailing whitespace; a row/card/footer is a single line, so flatten all
+/// interior whitespace to single spaces, drop other control chars, trim the ends, and
+/// clamp the length. Returns an owned `String` (the caller stores it); empty in →
+/// empty out, which the setter treats as "no reason to record".
+fn sanitize_reason(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len().min(MAX_REASON));
+    let mut len = 0usize; // chars pushed so far (a running count avoids re-scanning `out`)
+    let mut pending_space = false;
+    for ch in reason.chars() {
+        if ch.is_whitespace() {
+            // Fold any run of whitespace (incl. embedded newlines/tabs) to one space,
+            // but never lead with it — so a multi-line message reads as one tidy line.
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if ch.is_control() {
+            continue; // strip stray control/ANSI bytes a PTY message can carry
+        }
+        if pending_space {
+            out.push(' ');
+            len += 1;
+            pending_space = false;
+        }
+        out.push(ch);
+        len += 1;
+        if len >= MAX_REASON {
+            break;
+        }
+    }
+    out
 }
 
 /// The most-connected non-external node — the cockpit's default root/selection
@@ -5373,6 +5623,134 @@ mod tests {
             vec!["api", "web"],
             "the added repo is now a durable candidate (no restart)"
         );
+    }
+
+    #[test]
+    fn typing_a_url_in_the_add_list_adds_a_brand_new_repo_and_launches_with_it() {
+        // CF-20 typed add: in the picker's add-list, typing a repo the registry doesn't
+        // know yet (here a remote URL) resolves it the wizard's way, checks it into this
+        // launch, and surfaces it in-session as a registered repo + project candidate — no
+        // restart. (The registry.toml writes are exercised by registry's own tests; this
+        // App has no layout, so only the in-session/launch wiring runs here.)
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.aim_spine("ZAP-188".into());
+        let key = a.root.clone();
+        a.project_candidates
+            .insert("proj".into(), vec![repo("api", true)]);
+        a.registered_repos = vec![repo("api", false)];
+
+        verb(&mut a, KeyCode::Char('c')); // force the select open on a single-repo project
+        assert!(a.repo_select.is_some());
+        press(&mut a, KeyCode::Char('a')); // open the add-list
+        assert!(a.repo_select.as_ref().unwrap().picker.is_adding());
+
+        // Type a brand-new remote URL the registry has never seen, then add it.
+        for c in "git@github.com:zaplar/web".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.add_input(),
+            "git@github.com:zaplar/web"
+        );
+        press(&mut a, KeyCode::Enter); // resolve + register + check it in
+        assert!(
+            !a.repo_select.as_ref().unwrap().picker.is_adding(),
+            "adding the typed repo closes the sub-list"
+        );
+        // The handle is derived from the URL (its last path segment) and checked in.
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.selected_handles(),
+            vec!["api", "web"],
+            "the new repo rides this launch alongside the primary"
+        );
+        // In-session, no restart: it's now a known registered repo AND a project candidate.
+        assert!(
+            a.registered_repos.iter().any(|r| r.handle == "web"),
+            "the typed repo is registered in-session"
+        );
+        let cands: Vec<&str> = a.project_candidates["proj"]
+            .iter()
+            .map(|c| c.handle.as_str())
+            .collect();
+        assert_eq!(cands, vec!["api", "web"], "and a durable project candidate");
+
+        press(&mut a, KeyCode::Enter); // launch with both
+        assert!(a.repo_select.is_none(), "confirming closes the modal");
+        assert!(a.pending_launch.contains_key(&key), "the launch is in flight");
+    }
+
+    #[test]
+    fn a_bad_typed_repo_footers_and_keeps_the_add_list_open() {
+        // A typo that's neither a dir, a URL, nor a registered handle must not close the
+        // add-list or add anything — it footers so the human can fix the input in place.
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.aim_spine("ZAP-188".into());
+        a.project_candidates
+            .insert("proj".into(), vec![repo("api", true)]);
+        a.registered_repos = vec![repo("api", false)];
+
+        verb(&mut a, KeyCode::Char('c'));
+        press(&mut a, KeyCode::Char('a'));
+        for c in "not-a-repo".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            a.repo_select.as_ref().unwrap().picker.is_adding(),
+            "a bad input keeps the add-list open"
+        );
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.selected_handles(),
+            vec!["api"],
+            "nothing was added"
+        );
+        assert!(
+            !a.registered_repos.iter().any(|r| r.handle == "not-a-repo"),
+            "the bad handle was not registered"
+        );
+    }
+
+    #[test]
+    fn typing_an_already_listed_repo_re_checks_it_without_duplicating() {
+        // CF-20 dedup: typing the handle of a repo already on the checklist (here the
+        // unchecked candidate `web`) just re-checks that row — it must not append a second
+        // `web`, so the launch set has no duplicate.
+        let mut a = app();
+        a.workspace = Some(crate::workspace::WorkspaceHandle::detached());
+        a.active_project = "proj".into();
+        a.aim_spine("ZAP-188".into());
+        a.project_candidates
+            .insert("proj".into(), vec![repo("api", true), repo("web", false)]);
+        a.registered_repos = vec![repo("api", false), repo("web", false)];
+
+        // Multi-candidate → the select opens on plain Enter; `web` starts unchecked.
+        a.button();
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.selected_handles(),
+            vec!["api"],
+            "only the primary is checked up front"
+        );
+        press(&mut a, KeyCode::Char('a'));
+        for c in "web".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Enter); // typing an existing handle re-checks its row
+        assert!(!a.repo_select.as_ref().unwrap().picker.is_adding());
+        assert_eq!(
+            a.repo_select.as_ref().unwrap().picker.selected_handles(),
+            vec!["api", "web"],
+            "web is now checked, exactly once (no duplicate row)"
+        );
+        // The project candidate set didn't grow a duplicate either.
+        let webs = a.project_candidates["proj"]
+            .iter()
+            .filter(|c| c.handle == "web")
+            .count();
+        assert_eq!(webs, 1, "web stays a single candidate");
     }
 
     #[test]
@@ -5881,6 +6259,219 @@ mod tests {
             a.workspace_summary(),
             (0, 0),
             "no phantom agent inflates the cross-project roll-up after a switch"
+        );
+    }
+
+    // ── Needs-you reason: a persistent, triageable "what does it want" store ──
+
+    #[test]
+    fn a_needs_you_event_records_its_reason() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve Bash: git push".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            Some("approve Bash: git push"),
+            "the agent's ask is stored against its issue"
+        );
+    }
+
+    #[test]
+    fn resuming_work_clears_the_needs_you_reason() {
+        // The agent answered and resumed (a working action over a NeedsYou agent) — its
+        // ask is satisfied, so the standing reason must go or it lingers under live work.
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve git push".into(),
+        });
+        a.apply_event(AppEvent::AgentAction {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            action: "ran Bash".into(),
+            working: true,
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            None,
+            "a resumed agent drops its reason"
+        );
+    }
+
+    #[test]
+    fn a_terminal_status_clears_the_needs_you_reason() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "plan ready".into(),
+        });
+        a.apply_event(AppEvent::AgentStatusChanged {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            status: AgentStatus::Done,
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            None,
+            "a finished agent drops its reason"
+        );
+    }
+
+    #[test]
+    fn reaping_an_agent_clears_its_needs_you_reason() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve write".into(),
+        });
+        a.apply_event(AppEvent::AgentReaped {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            None,
+            "a reaped agent leaves no stale reason"
+        );
+    }
+
+    #[test]
+    fn discarding_a_workspace_clears_the_needs_you_reason() {
+        // Defensive: a discardable agent is not-live (so its reason is normally already
+        // cleared), but the discard signal must leave no reason outliving the workspace.
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve push".into(),
+        });
+        a.apply_event(AppEvent::WorkspaceDiscarded {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            None,
+            "a discarded workspace leaves no standing reason"
+        );
+    }
+
+    #[test]
+    fn a_backgrounded_agents_reason_is_kept_for_the_cross_project_surfaces() {
+        // A reason from a project you've switched away from must survive (the global
+        // all-agents screen reads it), even though the scope guard drops the event from
+        // the on-screen fleet.
+        let mut a = app();
+        a.active_project = "proj-a".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            reason: "approve deploy".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj-b", "ENG-9"),
+            Some("approve deploy"),
+            "a backgrounded project's ask is retained for the global screen"
+        );
+        // And it clears on resume there too, via the same world funnel.
+        a.apply_event(AppEvent::AgentAction {
+            project_id: "proj-b".into(),
+            issue: "ENG-9".into(),
+            action: "ran a tool".into(),
+            working: true,
+        });
+        assert_eq!(a.needs_you_reason("proj-b", "ENG-9"), None);
+    }
+
+    #[test]
+    fn a_second_prompt_replaces_the_standing_reason() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve push".into(),
+        });
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "approve force-push".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            Some("approve force-push"),
+            "the latest ask wins"
+        );
+    }
+
+    #[test]
+    fn a_reaped_issues_late_needs_you_hook_stores_no_reason() {
+        // Mirrors the world `blocked` guard: a late hook for a reaped active-project
+        // issue must not resurrect a phantom reason any more than it resurrects a status.
+        let mut a = app();
+        a.active_project = "proj".into();
+        a.reaped.insert("ENG-1".into());
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: "ENG-1".into(),
+            reason: "late".into(),
+        });
+        assert_eq!(
+            a.needs_you_reason("proj", "ENG-1"),
+            None,
+            "a reaped issue's late hook is dropped, reason included"
+        );
+    }
+
+    #[test]
+    fn the_needs_you_jump_footer_names_the_ask() {
+        let mut a = app();
+        a.active_project = "proj".into();
+        let key = a.root.clone();
+        a.apply_event(AppEvent::AgentNeedsYou {
+            project_id: "proj".into(),
+            issue: key.clone(),
+            reason: "approve Bash: git push".into(),
+        });
+        a.jump_to_needs_you();
+        let msg = a.status_msg.clone().expect("the jump set a footer");
+        assert!(
+            msg.contains("needs you") && msg.contains("approve Bash: git push"),
+            "the jump footer leads to the ask, not just the issue: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_reason_flattens_to_one_bounded_line() {
+        // Hook messages can carry newlines, tabs, control bytes and padding; a row/card/
+        // footer is one line, so they must collapse to a single tidy, bounded string.
+        assert_eq!(
+            sanitize_reason("  approve\n\tBash:   git push  "),
+            "approve Bash: git push",
+            "interior whitespace folds to single spaces and the ends trim"
+        );
+        assert_eq!(
+            sanitize_reason("a\u{7}b\u{1b}c"),
+            "abc",
+            "control / ANSI bytes are stripped"
+        );
+        assert_eq!(sanitize_reason("   \n\t  "), "", "all-whitespace yields nothing");
+        let long = "x".repeat(500);
+        assert_eq!(
+            sanitize_reason(&long).chars().count(),
+            MAX_REASON,
+            "an over-long reason is clamped to MAX_REASON chars"
         );
     }
 

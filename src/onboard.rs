@@ -126,6 +126,18 @@ struct RepoRow {
     label: String,
 }
 
+/// The result of resolving a typed repo input (a path / URL / existing handle) into a
+/// concrete repo to add. Shared by the onboarding [`Wizard`] and the cockpit's at-launch
+/// repo picker (CF-20's typed add) so both intake surfaces behave identically — the same
+/// "exact handle → reuse, dir → derive origin, URL-shaped → remote" rules. `draft` is
+/// `Some` for a genuinely new repo that needs a `[[repo]]` block written, `None` for a
+/// reuse of an already-registered handle (a candidate-only add).
+pub(crate) struct ResolvedRepo {
+    pub handle: String,
+    pub draft: Option<RepoDraft>,
+    pub label: String,
+}
+
 /// A scratch-datastore entry being filled in on [`Step::Scratch`]. Seven navigable
 /// fields: four text (`name`, `provision`, `teardown`, `env`) then three flags.
 #[derive(Default)]
@@ -338,81 +350,15 @@ impl Wizard {
 
     /// Resolve a typed repo input into a [`RepoRow`]: an exact existing handle is
     /// reused; a directory is probed for its `origin` remote; anything URL-shaped is
-    /// taken as a remote. The only impure method (filesystem + `git`).
+    /// taken as a remote. Delegates to the shared [`resolve_repo_input`] so the cockpit's
+    /// at-launch picker resolves identically. The only impure method (filesystem + `git`).
     fn resolve(&self, raw: &str) -> Result<RepoRow, String> {
-        let input = raw.trim();
-        if input.is_empty() {
-            return Err("type a path or a remote URL".into());
-        }
-        // 1. An exact existing registered handle → reuse (candidate only, no block).
-        if self.registered_repos.iter().any(|h| h == input) {
-            return Ok(RepoRow {
-                handle: input.to_string(),
-                draft: None,
-                label: "already registered".into(),
-            });
-        }
-        // 2. A local directory → derive the remote from its `origin`, the handle from
-        // the remote (else the path). No remote is fine: a local-only repo.
-        let expanded = expand_tilde(input);
-        if expanded.is_dir() {
-            let remote = git_origin(&expanded);
-            let handle = registry::handle_from_source(remote.as_deref().unwrap_or(input));
-            if !registry::is_safe_handle(&handle) {
-                return Err("couldn't derive a name from that path — try another".into());
-            }
-            let label = remote
-                .clone()
-                .unwrap_or_else(|| "local-only (no origin remote)".to_string());
-            // Store an ABSOLUTE path: `is_dir()` resolved a relative input (`./core`,
-            // `../sibling`) against the wizard's cwd, but the loader and `git clone`
-            // run later from a different cwd, so a verbatim relative `local` would
-            // resolve elsewhere or vanish. `canonicalize` can't fail here (the dir
-            // just existed); fall back to the expanded path if it somehow does.
-            let local = expanded
-                .canonicalize()
-                .unwrap_or(expanded)
-                .to_string_lossy()
-                .into_owned();
-            return Ok(RepoRow {
-                handle: handle.clone(),
-                draft: Some(RepoDraft {
-                    handle,
-                    remote,
-                    local: Some(local),
-                }),
-                label,
-            });
-        }
-        // 3. Otherwise it must look like a remote URL.
-        if looks_like_url(input) {
-            let handle = registry::handle_from_source(input);
-            if !registry::is_safe_handle(&handle) {
-                return Err("couldn't derive a name from that URL — try another".into());
-            }
-            return Ok(RepoRow {
-                handle: handle.clone(),
-                draft: Some(RepoDraft {
-                    handle,
-                    remote: Some(input.to_string()),
-                    local: None,
-                }),
-                label: input.to_string(),
-            });
-        }
-        // It looks like a path the user meant (tilde / dot / a separator) but no dir is
-        // there — name *that* (a typo to fix), not the generic "not a path/URL/repo".
-        if input.starts_with('~')
-            || input.starts_with('.')
-            || input.starts_with('/')
-            || input.contains(std::path::MAIN_SEPARATOR)
-        {
-            return Err(format!(
-                "no directory at {} — check the path",
-                expanded.display()
-            ));
-        }
-        Err("not a directory, a URL, or a registered repo — give a path or remote URL".into())
+        let r = resolve_repo_input(raw, &self.registered_repos)?;
+        Ok(RepoRow {
+            handle: r.handle,
+            draft: r.draft,
+            label: r.label,
+        })
     }
 
     /// Add the current input as a repo (deduped by handle). A no-op on empty input.
@@ -635,6 +581,95 @@ fn unreachable_warning(bad: &[(String, String)]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("can't reach {names}: {reason} — ⏎ writes it anyway, esc to fix")
+}
+
+/// Resolve a typed repo input — a path, a remote URL, or an exact existing handle —
+/// into a [`ResolvedRepo`]. The shared intake rule behind both the onboarding [`Wizard`]
+/// and the cockpit's at-launch repo picker (CF-20's typed add), so a repo added either
+/// way obeys the same precedence:
+///
+/// 1. an exact registered handle → reuse (candidate only, `draft: None`);
+/// 2. a local directory → derive its `origin` remote and a handle, an absolute `local`
+///    path, and a fresh `[[repo]]` draft (a missing origin is fine — a local-only repo);
+/// 3. anything URL-shaped → a remote-only draft.
+///
+/// Impure: it touches the filesystem (`is_dir`, `canonicalize`) and shells `git` for the
+/// origin remote — but never the network, so it's cheap enough to call on the cockpit's
+/// render thread (reachability is a separate, opt-in probe the wizard runs at Confirm).
+pub(crate) fn resolve_repo_input(raw: &str, registered: &[String]) -> Result<ResolvedRepo, String> {
+    let input = raw.trim();
+    if input.is_empty() {
+        return Err("type a path or a remote URL".into());
+    }
+    // 1. An exact existing registered handle → reuse (candidate only, no block).
+    if registered.iter().any(|h| h == input) {
+        return Ok(ResolvedRepo {
+            handle: input.to_string(),
+            draft: None,
+            label: "already registered".into(),
+        });
+    }
+    // 2. A local directory → derive the remote from its `origin`, the handle from
+    // the remote (else the path). No remote is fine: a local-only repo.
+    let expanded = expand_tilde(input);
+    if expanded.is_dir() {
+        let remote = git_origin(&expanded);
+        let handle = registry::handle_from_source(remote.as_deref().unwrap_or(input));
+        if !registry::is_safe_handle(&handle) {
+            return Err("couldn't derive a name from that path — try another".into());
+        }
+        let label = remote
+            .clone()
+            .unwrap_or_else(|| "local-only (no origin remote)".to_string());
+        // Store an ABSOLUTE path: `is_dir()` resolved a relative input (`./core`,
+        // `../sibling`) against the caller's cwd, but the loader and `git clone`
+        // run later from a different cwd, so a verbatim relative `local` would
+        // resolve elsewhere or vanish. `canonicalize` can't fail here (the dir
+        // just existed); fall back to the expanded path if it somehow does.
+        let local = expanded
+            .canonicalize()
+            .unwrap_or(expanded)
+            .to_string_lossy()
+            .into_owned();
+        return Ok(ResolvedRepo {
+            handle: handle.clone(),
+            draft: Some(RepoDraft {
+                handle,
+                remote,
+                local: Some(local),
+            }),
+            label,
+        });
+    }
+    // 3. Otherwise it must look like a remote URL.
+    if looks_like_url(input) {
+        let handle = registry::handle_from_source(input);
+        if !registry::is_safe_handle(&handle) {
+            return Err("couldn't derive a name from that URL — try another".into());
+        }
+        return Ok(ResolvedRepo {
+            handle: handle.clone(),
+            draft: Some(RepoDraft {
+                handle,
+                remote: Some(input.to_string()),
+                local: None,
+            }),
+            label: input.to_string(),
+        });
+    }
+    // It looks like a path the user meant (tilde / dot / a separator) but no dir is
+    // there — name *that* (a typo to fix), not the generic "not a path/URL/repo".
+    if input.starts_with('~')
+        || input.starts_with('.')
+        || input.starts_with('/')
+        || input.contains(std::path::MAIN_SEPARATOR)
+    {
+        return Err(format!(
+            "no directory at {} — check the path",
+            expanded.display()
+        ));
+    }
+    Err("not a directory, a URL, or a registered repo — give a path or remote URL".into())
 }
 
 /// Whether `s` looks like a git remote rather than a bare word — so a typo doesn't

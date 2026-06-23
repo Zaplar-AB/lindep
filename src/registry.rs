@@ -735,6 +735,75 @@ pub fn binding_differs(
     Ok(out != existing)
 }
 
+/// Append one fresh `[[repo]]` block for `draft` to `registry.toml`, preserving the
+/// file's existing comments and ordering (format-preserving `toml_edit`, atomic write).
+/// A no-op returning `Ok(false)` when a `[[repo]]` with the same `handle` already exists
+/// — so a typed add of an already-registered repo never duplicates its block. This is
+/// the single-repo sibling of [`write_binding`]'s batch repo append: the cockpit's
+/// at-launch picker uses it to register a brand-new repo a human typed in (a URL or
+/// path), then widens the project via [`add_candidate`] — together they bring the
+/// onboarding wizard's repo intake into the running cockpit with no restart (CF-20).
+/// The first block lindep ever appends to a file carries a provenance comment, matching
+/// [`write_binding`].
+pub fn register_repo(layout: &Layout, draft: &RepoDraft) -> Result<bool, RegistryError> {
+    use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
+
+    let path = layout.registry_path();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => return Err(RegistryError::Write { path, source }),
+    };
+    let mut doc = existing
+        .parse::<DocumentMut>()
+        .map_err(|source| RegistryError::EditParse {
+            path: path.clone(),
+            source: Box::new(source),
+        })?;
+
+    let item = doc
+        .entry("repo")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+    let repos = item
+        .as_array_of_tables_mut()
+        .ok_or_else(|| RegistryError::Write {
+            path: path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "`repo` in registry.toml is not an array of tables",
+            ),
+        })?;
+    // Already registered → leave the existing block untouched (the caller still adds the
+    // candidate). Mirrors `Wizard::resolve` treating an exact handle as a reuse.
+    if repos
+        .iter()
+        .any(|t| t.get("handle").and_then(|v| v.as_str()) == Some(draft.handle.as_str()))
+    {
+        return Ok(false);
+    }
+
+    let mut t = Table::new();
+    t["handle"] = value(draft.handle.clone());
+    if let Some(r) = &draft.remote {
+        t["remote"] = value(r.clone());
+    }
+    if let Some(l) = &draft.local {
+        t["local"] = value(l.clone());
+    }
+    // Tag the first lindep-appended block with the same provenance comment `write_binding`
+    // uses; a file that already has lindep blocks just gets a blank-line separator.
+    let virgin = !existing.contains("# ── added by lindep ──");
+    t.decor_mut().set_prefix(if virgin {
+        "\n# ── added by lindep ──\n"
+    } else {
+        "\n"
+    });
+    repos.push(t);
+
+    write_registry_atomic(&path, &doc.to_string())?;
+    Ok(true)
+}
+
 /// Append `handle` to a project's `candidates` set in `registry.toml`, preserving the
 /// file's comments, ordering, and every other field (scratch datastores, other
 /// projects, the `[[repo]]` blocks). This is the durable side of the at-launch repo
@@ -1760,6 +1829,63 @@ mod tests {
             2,
             "the multi-select modal is offered both repos (its gate is >1 candidate)"
         );
+    }
+
+    #[test]
+    fn register_repo_appends_a_new_block_and_is_idempotent_by_handle() {
+        // CF-20 typed add: registering a brand-new repo a human typed into the at-launch
+        // picker appends one loadable `[[repo]]` block; registering the same handle again
+        // (or one already present) is a no-op, so a re-type never duplicates the block.
+        let root = temp_root("register-repo");
+        let layout = write_registry(
+            &root,
+            r#"
+            [[repo]]
+            handle = "api"
+            remote = "git@github.com:zaplar/api"
+
+            [[project]]
+            id = "p1"
+            handle = "platform"
+            primary = "api"
+            "#,
+        );
+
+        // A brand-new local-only repo (no remote) — exactly a freshly-typed local path.
+        let draft = RepoDraft {
+            handle: "scratchpad".into(),
+            remote: None,
+            local: Some("/home/felix/code/scratchpad".into()),
+        };
+        assert!(
+            register_repo(&layout, &draft).unwrap(),
+            "a new handle is written"
+        );
+        assert!(
+            !register_repo(&layout, &draft).unwrap(),
+            "re-registering the same handle is a no-op (no duplicate block)"
+        );
+
+        // An already-registered handle is left untouched (the caller still adds it as a
+        // candidate) — mirrors `Wizard::resolve` treating an exact handle as reuse.
+        let dup = RepoDraft {
+            handle: "api".into(),
+            remote: Some("git@github.com:zaplar/api".into()),
+            local: None,
+        };
+        assert!(
+            !register_repo(&layout, &dup).unwrap(),
+            "an existing handle is not re-appended"
+        );
+
+        let (reg, warnings) = Registry::load_at(Layout::new(&root));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let repo = reg.repo("scratchpad").unwrap();
+        assert!(repo.is_local_only(), "no remote → a local-only repo");
+        assert_eq!(repo.local, Some(PathBuf::from("/home/felix/code/scratchpad")));
+        // The pre-existing repo and project survive the append untouched.
+        assert!(reg.repo("api").is_some());
+        assert_eq!(reg.project("p1").unwrap().primary, "api");
     }
 
     #[test]
