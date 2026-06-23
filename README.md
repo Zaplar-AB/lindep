@@ -7,7 +7,8 @@ Linear lets you mark that one issue *blocks* another, but there's no good way to
 see the whole dependency web at a glance. `lindep` pulls a project's issues and
 their `blocks` relations and renders them as a clean, navigable graph.
 
-<img width="2522" height="1362" alt="image" src="https://github.com/user-attachments/assets/2f4bb253-b24a-4c1b-8a6d-a54f98cb86c0" />
+<img width="1928" height="1003" alt="image" src="https://github.com/user-attachments/assets/d88828c2-f4bf-40ec-aac3-bd6cb7283b1f" />
+
 
 ## Install
 
